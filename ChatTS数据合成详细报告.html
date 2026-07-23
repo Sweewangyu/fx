@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChatTS 数据合成详细报告</title>
+<style>
+:root{
+  --bg:#f6f8fb; --panel:#ffffff; --ink:#1c2733; --muted:#5b6b7c;
+  --line:#e3e9f0; --accent:#2f6df6; --accent2:#0aa678; --warn:#e0781a;
+  --code-bg:#0f1b2d; --code-ink:#d6e2f2; --chip:#eef3fb;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  line-height:1.7;font-size:15px}
+.wrap{max-width:960px;margin:0 auto;padding:40px 24px 80px}
+header.hero{background:linear-gradient(135deg,#2f6df6,#0aa678);color:#fff;border-radius:18px;
+  padding:34px 34px 30px;box-shadow:0 12px 30px rgba(47,109,246,.18)}
+header.hero h1{margin:0 0 8px;font-size:26px;letter-spacing:.3px}
+header.hero p{margin:4px 0;opacity:.95;font-size:14px}
+.hero .tags{margin-top:14px;display:flex;flex-wrap:wrap;gap:8px}
+.hero .tags span{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.35);
+  padding:4px 11px;border-radius:20px;font-size:12.5px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:26px 28px;margin-top:22px;box-shadow:0 2px 8px rgba(20,40,70,.04)}
+h2{font-size:20px;margin:0 0 16px;padding-bottom:10px;border-bottom:2px solid var(--line);
+  display:flex;align-items:center;gap:10px}
+h2 .n{background:var(--accent);color:#fff;width:28px;height:28px;border-radius:8px;
+  display:inline-flex;align-items:center;justify-content:center;font-size:15px;flex:0 0 auto}
+h3{font-size:16px;margin:22px 0 10px;color:var(--ink)}
+h4{font-size:14px;margin:16px 0 8px;color:var(--accent)}
+p{margin:8px 0}
+.muted{color:var(--muted)}
+ul,ol{margin:8px 0;padding-left:22px}
+li{margin:5px 0}
+code{background:var(--chip);padding:2px 6px;border-radius:5px;font-size:13px;
+  font-family:"SF Mono",Menlo,Consolas,monospace;color:#22467d}
+pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:16px 18px;
+  overflow-x:auto;font-size:12.5px;line-height:1.6;
+  font-family:"SF Mono",Menlo,Consolas,monospace}
+pre .cm{color:#7fa7d4}
+pre .kw{color:#e5a0ff}
+pre .st{color:#9be29b}
+table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+th{background:var(--chip);font-weight:600}
+tr:nth-child(even) td{background:#fafcff}
+.callout{border-left:4px solid var(--accent);background:#f2f7ff;border-radius:8px;
+  padding:12px 16px;margin:14px 0}
+.callout.warn{border-left-color:var(--warn);background:#fff6ec}
+.callout.ok{border-left-color:var(--accent2);background:#eefaf5}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:720px){.grid2{grid-template-columns:1fr}}
+.card{border:1px solid var(--line);border-radius:10px;padding:14px 16px;background:#fbfdff}
+.card b{color:var(--accent)}
+.pill{display:inline-block;background:var(--chip);border:1px solid var(--line);
+  border-radius:6px;padding:1px 8px;font-size:12px;margin:2px 3px}
+.kpi{display:flex;flex-wrap:wrap;gap:12px;margin:6px 0}
+.kpi .box{flex:1 1 130px;background:#fbfdff;border:1px solid var(--line);border-radius:10px;
+  padding:12px 14px;text-align:center}
+.kpi .box .v{font-size:22px;font-weight:700;color:var(--accent)}
+.kpi .box .l{font-size:12px;color:var(--muted);margin-top:2px}
+.flow{display:flex;flex-direction:column;gap:0}
+.toc a{color:var(--accent);text-decoration:none}
+.toc a:hover{text-decoration:underline}
+footer{margin-top:30px;text-align:center;color:var(--muted);font-size:12.5px}
+a{color:var(--accent)}
+.mono{font-family:"SF Mono",Menlo,Consolas,monospace}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>ChatTS 数据合成方法与 Pipeline 详细报告</h1>
+  <p><b>论文：</b>ChatTS: Aligning Time Series with LLMs via Synthetic Data for Enhanced Understanding and Reasoning</p>
+  <p><b>会议：</b>VLDB'25 &nbsp;·&nbsp; <b>arXiv：</b>2412.03104 (v3, 2025-04-16) &nbsp;·&nbsp; <b>作者：</b>Zhe Xie, Zeyan Li, Xiao He 等（清华 NetMan / 字节跳动）</p>
+  <p><b>代码：</b>github.com/NetManAIOps/ChatTS &nbsp;·&nbsp; <b>模型：</b>ChatTS-14B / 8B (基座 Qwen2.5)</p>
+  <div class="tags">
+    <span>纯合成数据训练</span><span>属性驱动生成</span><span>Time Series Evol-Instruct</span>
+    <span>多元时间序列 MLLM</span><span>MIT License</span>
+  </div>
+</header>
+
+<section class="toc">
+  <h2><span class="n">·</span>目录</h2>
+  <ol>
+    <li><a href="#s1">核心结论一句话</a></li>
+    <li><a href="#s2">为什么要合成数据</a></li>
+    <li><a href="#s3">数据合成总体 Pipeline</a></li>
+    <li><a href="#s4">阶段一：属性驱动的时间序列合成</a></li>
+    <li><a href="#s5">属性 → 文本描述（对齐语料）</a></li>
+    <li><a href="#s6">阶段二：QA 合成与 TSEvol</a></li>
+    <li><a href="#s7">数据集规模统计</a></li>
+    <li><a href="#s8">GitHub 仓库结构映射</a></li>
+    <li><a href="#s9">一键复现命令</a></li>
+    <li><a href="#s10">要点评析</a></li>
+  </ol>
+</section>
+
+<section id="s1">
+  <h2><span class="n">1</span>核心结论一句话</h2>
+  <p>ChatTS 的训练数据 <b>100% 由程序合成</b>，不依赖任何真实标注。它的关键创新在于把"生成时间序列"和"生成标签"这两个通常割裂的环节 <b>合二为一</b>：</p>
+  <div class="callout ok">
+    <b>先定属性，再生成波形。</b> 系统先用规则 + LLM 随机采样出一组"属性池"（趋势/周期/噪声/局部变化及其精确数值），再用规则化函数按属性池<b>确定性地</b>合成出对应波形。因此每条时间序列都<b>自带一份 100% 准确、可精确到数值的文本标签</b> —— 从根本上绕开了"给真实时间序列做人工标注既贵又不准"的瓶颈。
+  </div>
+  <p>在此之上，再用 <b>Time Series Evol-Instruct (TSEvol)</b> 把简单标签演化成多样、复杂的问答对，用于提升推理能力。</p>
+</section>
+
+<section id="s2">
+  <h2><span class="n">2</span>为什么要合成数据</h2>
+  <p>时间序列多模态大模型（TS-MLLM）落地的最大障碍是<b>缺少"时间序列↔文本"对齐的高质量数据集</b>。真实数据存在三大问题：</p>
+  <ul>
+    <li><b>标注昂贵</b>：让人描述一条曲线的趋势、周期、异常点，成本高、主观性强。</li>
+    <li><b>标注不精确</b>：人无法说出"第 137 个点有一个幅度 4.2 的向上尖峰"这类数值级细节。</li>
+    <li><b>模式覆盖不全</b>：真实数据的形态分布长尾且不可控，难以系统覆盖各种模式组合。</li>
+  </ul>
+  <p>ChatTS 的解法是<b>反过来做</b>：不去标注既有数据，而是先决定"要什么属性"，再生成"符合属性的数据"，标签天然精确、模式可控、数量无限。</p>
+</section>
+
+<section id="s3">
+  <h2><span class="n">3</span>数据合成总体 Pipeline</h2>
+  <p>整个数据工厂分为两大阶段、五条产线，最终汇成对齐（Alignment）+ 微调（SFT）两套训练集：</p>
+  <div class="flow">
+    <div class="card" style="margin-bottom:12px">
+      <b>阶段 A · 属性驱动的时间序列合成</b>（<code>chatts/ts_generator/</code>）
+      <p class="muted" style="margin:6px 0 0">Metric 采样 → GPT 选属性子集 → 属性采样器赋数值 → 规则生成器造波形 → 输出「波形 + 属性池 + 精确文本标签」</p>
+    </div>
+    <div class="card" style="margin-bottom:12px">
+      <b>阶段 B · 问答对合成</b>（<code>chatts/align/</code> + <code>chatts/sft/</code>）
+      <p class="muted" style="margin:6px 0 0">① 模板 QA ② LLM 种子 QA ③ TSEvol 演化 QA ④ IFT 指令跟随 ⑤ 增强推理 QA</p>
+    </div>
+  </div>
+
+  <h3>数据流全景图</h3>
+  <pre>
+<span class="cm"># ============ 阶段 A：时间序列 + 精确标签 ============</span>
+ metric_set.json (567 个真实指标名)
+        │  随机采样一个指标 (如 "CPU 使用率")
+        ▼
+ GPT Selector ── 依据指标物理含义，从"全属性集"挑选合理的<span class="kw">属性子集</span>
+        │        (例: CPU→可能有周期+突增, 不太可能是负值)
+        ▼
+ Attribute Sampler ── 在子集内随机<span class="kw">采样属性组合</span>并赋<span class="kw">具体数值</span>
+        │             (类型 / 位置 position / 幅度 amplitude / 周期 period)
+        ▼
+ ┌─────────────── Attribute Pool（属性池，记录全部细节）───────────────┐
+ │  seasonal / trend / frequency / noise / local[] / statistics       │
+ └────────────────────────────┬──────────────────────────────────────┘
+        │ rule-based 确定性生成            │ 模板 + LLM 精修
+        ▼                                 ▼
+   Time Series (np.ndarray)         Precise Text Label（100% 准确）
+        │                                 │
+        └──────────────┬──────────────────┘
+                       ▼
+<span class="cm"># ============ 阶段 B：问答对 ============</span>
+   ├── 模板 QA   (uts/mts_template_qa)  ── 规则填模板，海量、精确
+   ├── LLM 种子 QA (generate_llm_qa)    ── LLM 基于属性池生成初始 Q&A
+   │        ▼
+   ├── TSEvol   (generate_tsevol_dataset) ── 深度/广度演化 + 属性消除器去重
+   ├── IFT      (generate_ift_dataset)   ── 指令跟随（需对齐标签）
+   └── 增强推理  (uts/mts_reason, rewrite) ── 单/多变量推理 + 重写增广
+                       ▼
+        Alignment 数据集 + SFT 数据集 → 两阶段训练 ChatTS
+  </pre>
+  <div class="callout">
+    对应论文 <b>Figure 3（整体流水线）</b> 与 <b>Figure 4（属性生成器）</b>。GitHub 的 <code>demo/demo_ts_generator.ipynb</code> 是这套生成器的交互式演示。
+  </div>
+</section>
+
+<section id="s4">
+  <h2><span class="n">4</span>阶段一：属性驱动的时间序列合成</h2>
+  <p>这是整套方法的基石。核心思想：<b>时间序列 = 全局趋势 + 周期项 + 局部变化 + 噪声</b> 的叠加，每一项都由可枚举的"属性"控制。源码见 <code>chatts/ts_generator/generate.py</code>。</p>
+
+  <h3>4.1 全属性集（All Attribute Set）</h3>
+  <p>论文口径为「4 趋势 + 7 周期 + 3 噪声 + 19 局部波动」。源码中的真实定义（含被选中概率）如下：</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h4>① 趋势 Trend（4 类）</h4>
+      <span class="pill">increase 0.3</span><span class="pill">decrease 0.3</span>
+      <span class="pill">keep steady 0.3</span><span class="pill">multiple 0.1</span>
+      <p class="muted" style="margin-top:8px">multiple = 多段拼接的分段趋势（先升后降等）。</p>
+    </div>
+    <div class="card">
+      <h4>② 周期 Seasonal（波形 × 频率 = 7 类）</h4>
+      <span class="pill">no periodic 0.7</span><span class="pill">sin 0.25</span>
+      <span class="pill">square 0.02</span><span class="pill">triangle 0.03</span>
+      <p class="muted" style="margin-top:8px">3 种波形 × {高频, 低频} 组合 + 无周期 ≈ 论文所述 7 类。</p>
+    </div>
+    <div class="card">
+      <h4>③ 噪声 Noise（3 类）</h4>
+      <span class="pill">almost no noise 0.8</span><span class="pill">noisy 0.2</span>
+      <p class="muted" style="margin-top:8px">noisy 内部再分「高斯随机噪声」与「正弦不规则噪声」两种实现。</p>
+    </div>
+    <div class="card">
+      <h4>④ 局部波动 Local Change（19 类）</h4>
+      <span class="pill">upward/downward spike</span><span class="pill">wide spike</span>
+      <span class="pill">continuous spike</span><span class="pill">sudden increase/decrease</span>
+      <span class="pill">shake</span><span class="pill">upward/downward convex</span>
+      <span class="pill">rapid rise + slow decline …</span><span class="pill">decrease after spike …</span>
+      <p class="muted" style="margin-top:8px">数字为被采样权重（如 upward spike=12, sudden increase=10）。</p>
+    </div>
+  </div>
+
+  <h4>19 种局部波动完整清单</h4>
+  <table>
+    <tr><th>类别</th><th>类型（英文原名）</th></tr>
+    <tr><td>尖峰类</td><td>upward spike / downward spike / wide upward spike / wide downward spike / continuous upward spike / continuous downward spike</td></tr>
+    <tr><td>阶跃类</td><td>sudden increase / sudden decrease</td></tr>
+    <tr><td>凸起类</td><td>upward convex / downward convex</td></tr>
+    <tr><td>抖动类</td><td>shake</td></tr>
+    <tr><td>快慢组合</td><td>rapid rise followed by slow decline / slow rise followed by rapid decline / rapid decline followed by slow rise / slow decline followed by rapid rise</td></tr>
+    <tr><td>尖峰后趋势</td><td>decrease after upward spike / increase after downward spike / increase after upward spike / decrease after downward spike</td></tr>
+  </table>
+
+  <h3>4.2 两种属性采样模式</h3>
+  <div class="grid2">
+    <div class="card">
+      <b>随机模式</b> <code>generate_random_attributes()</code>
+      <p class="muted" style="margin:6px 0 0">纯随机按概率采样，用于覆盖广泛形态。会依据 <code>seq_len</code> 做安全约束（如序列 &lt;24 强制无周期、&lt;=32 无噪声、&lt;=8 去掉 shake/突变）。</p>
+    </div>
+    <div class="card">
+      <b>受控模式</b> <code>generate_controlled_attributes()</code>
+      <p class="muted" style="margin:6px 0 0">由 GPT 依据 metric 语义给出属性子集与数值范围（min/max），再在范围内采样。这就是"让曲线符合真实物理含义"的关键（对应 <code>config/metric_set.json</code>）。</p>
+    </div>
+  </div>
+
+  <h3>4.3 波形是怎么"算"出来的（关键数学）</h3>
+  <p>核心函数 <code>generate_time_series(attribute_pool, seq_len)</code> 按固定顺序叠加各分量，最终 <b>y = 周期项 + 局部变化 + 趋势项 + 噪声项</b>。</p>
+
+  <h4>① 周期项：多谐波正弦叠加</h4>
+  <p>并非单一正弦，而是<b>随机数量的谐波叠加</b>，且幅度随时间轻微漂移，从而生成丰富的周期形态：</p>
+  <pre>
+<span class="cm"># generate_seasonal_wave() —— sin 波形核心</span>
+base_frequency = 1 / period
+num_harmonics  = randint(1, min(period//6, 10))      <span class="cm"># 谐波个数随机</span>
+for n in 1..num_harmonics:
+    phase = uniform(0, 2π)
+    A_n   = amplitude_series / n * (1 + 微小漂移·sin(...))   <span class="cm"># 第 n 谐波幅度 ∝ 1/n</span>
+    data += A_n · sin(2π · base_frequency · n · t + phase)
+data = data / (max-min) · 目标幅度; data -= mean(data)   <span class="cm"># 归一到目标振幅、去均值</span>
+  </pre>
+  <p class="muted">square（方波）与 triangle（三角波）则按周期内相位 <code>cycle_pos = (t mod period)/period</code> 逐点判定，落在 [start, start+duration] 区间内赋幅值。</p>
+
+  <h4>② 频率：由 period 大小决定高/低频</h4>
+  <pre>
+high frequency: period ∈ [seq_len/16, seq_len/8]
+low  frequency: period ∈ [seq_len/8,  seq_len/3]
+</pre>
+
+  <h4>③ 趋势项：4 种趋势的构造</h4>
+  <pre>
+increase / decrease : generate_ts_change(seq_len, ±amplitude) + bias   <span class="cm"># 平滑单调曲线</span>
+keep steady         : y += bias                                        <span class="cm"># 常量</span>
+multiple            : 随机分段点 → generate_trend_curve() 拼多段斜率     <span class="cm"># 分段趋势</span>
+amplitude = uniform(0.8, 3.0) · overall_amplitude                      <span class="cm"># 趋势幅度</span>
+</pre>
+
+  <h4>④ 噪声项：两种实现</h4>
+  <pre>
+noisy 分支：
+  · 随机高斯噪声  : std = uniform(0.03, 0.15) · overall_amplitude; noise~N(0, std)
+  · 正弦不规则噪声: 200 个随机频率/相位正弦叠加，模拟不规则抖动
+  · 再对分段乘以 uniform(0.1, 5.0) 放大 → 局部噪声强弱不均
+almost no noise 分支：std ≈ 0（uniform(0, 0.001)·amplitude），曲线基本光滑
+</pre>
+
+  <h4>⑤ 整体幅度与偏置：跨数量级采样</h4>
+  <p>为让模型见过各种量级（0.x ~ 百万级），幅度指数按概率分布采样：</p>
+  <pre>
+e ~ choice([-2,-1,0,1,2,3,4,5,6,7], p=[.1,.2,.2,.3,.1,.04,.03,.02,.008,.002])
+overall_amplitude = uniform(10^(e-1), 10^(e+1))
+overall_bias      = uniform(-10^(e+1), 10^(e+1))
+</pre>
+
+  <div class="callout ok">
+    <b>为什么标签一定准？</b> 因为波形是<b>由属性池按规则确定性生成</b>的（而非先有波形再去猜属性）。生成时同步把每个属性的 <code>detail</code> 文本、位置、幅度、以及最终统计量（mean/std/max/min/max_pos/min_pos）写回属性池。局部变化的数值甚至用占位符 <code>&lt;|137|&gt;</code> 在生成后回填为该点真实值，做到<b>数值级精确对齐</b>。
+  </div>
+</section>
+
+<section id="s5">
+  <h2><span class="n">5</span>属性 → 文本描述（对齐语料）</h2>
+  <p>属性池通过两个函数转成自然语言标签，构成对齐训练的"答案"：</p>
+  <table>
+    <tr><th>函数</th><th>风格</th><th>用途</th></tr>
+    <tr><td><code>attribute_to_text()</code></td><td>结构化罗列各属性（长度/趋势/周期/频率/噪声/局部/统计）</td><td>属性描述任务</td></tr>
+    <tr><td><code>attribute_to_caption()</code></td><td>更自然流畅，把趋势与局部变化按时间顺序串成一段叙述</td><td>整体 caption 描述</td></tr>
+  </table>
+  <h4>生成的文本长这样（节选自源码模板）</h4>
+  <pre>
+"The length of the time series is 256. From the perspective of the slope, the overall
+ trend is increasing. The value starts from around 12.3 and ends at around 48.7 ...
+ The time series is showing sin periodic fluctuation: the amplitude ... is 5.2 between
+ point 0 and point 255. Each fluctuation period is approximately 32.0 points ...
+ In terms of local characteristics, there is an upward spike with amplitude 8.4 near
+ point 137, forming a upward spike. Specific data details: divided into 32 segments,
+ the approximate mean values are [...]. The maximum is 51.2, the minimum is 10.8."
+</pre>
+  <div class="callout">
+    <b>Value-Preserved Encoding：</b>文本里同时保留了分段均值、最大/最小值、起止值、随机抽点数值，让模型不仅懂"形状"还能答"数值"。这对应论文的<b>数值保留归一化</b>——每条序列独立 min-max 归一，缩放/偏移参数以文本形式注入 prompt。
+  </div>
+
+  <h4>三类对齐语料（<code>chatts/align/</code>）</h4>
+  <table>
+    <tr><th>产线</th><th>文件</th><th>侧重</th></tr>
+    <tr><td>UTS</td><td><code>uts_template_qa.py</code> / <code>uts_llm_qa.py</code></td><td>单变量全局+局部属性</td></tr>
+    <tr><td>MTS-Shape</td><td><code>mts_shape_template_qa.py</code> / <code>..._llm_qa.py</code></td><td>多变量全局趋势相关性</td></tr>
+    <tr><td>MTS-Local</td><td><code>mts_local_template_qa.py</code> / <code>..._llm_qa.py</code></td><td>多变量局部波动相关性</td></tr>
+  </table>
+  <p class="muted">每类都有「template（规则填模板，海量且 100% 准确）」和「llm（LLM 改写，更自然多样）」两条子产线。</p>
+</section>
+
+<section id="s6">
+  <h2><span class="n">6</span>阶段二：QA 合成与 TSEvol 详解</h2>
+  <p>对齐语料让模型"看懂"时间序列，但要"会推理"还需多样、复杂的问答。ChatTS 借鉴 <b>Evol-Instruct / MMEvol</b>，提出时序版 <b>TSEvol</b>（源码 <code>chatts/sft/generate_tsevol_dataset.py</code> + <code>utils/evol_prompt.py</code>）。</p>
+
+  <h3>6.1 三步走</h3>
+  <ol>
+    <li><b>种子 QA</b>（<code>generate_llm_qa.py</code>）：LLM 基于属性池，先生成一批初始简单问答作为演化起点。</li>
+    <li><b>演化 QA</b>（<code>generate_tsevol_dataset.py</code>）：对每条种子做 DFS 深度演化（<code>DFS_K=3</code>），每步随机挑一种演化算子把问题变难/变新。</li>
+    <li><b>去重校验</b>：用"属性消除器"（comparison eliminator）判断新 QA 是否与旧 QA 等价/是否可从上下文推出，剔除重复与幻觉。</li>
+  </ol>
+
+  <h3>6.2 演化算子（源码里的 7 种 prompt）</h3>
+  <table>
+    <tr><th>算子</th><th>方向</th><th>作用</th></tr>
+    <tr><td>Constraints</td><td>深度</td><td>依据属性再加一条约束/条件</td></tr>
+    <tr><td>Deepen</td><td>深度</td><td>加大问题的深度与广度</td></tr>
+    <tr><td>Concretizing</td><td>深度</td><td>把泛化概念替换成更具体概念</td></tr>
+    <tr><td>Complex Reasoning</td><td>广度</td><td>改写成需多步推理的难题</td></tr>
+    <tr><td>Situation</td><td>广度</td><td>构造真实业务情境（电商大促/工厂能耗等）+ 提问</td></tr>
+    <tr><td>Deductive Reasoning</td><td>广度</td><td>Yes/No 演绎推理（给定阈值规则判断是否异常）</td></tr>
+    <tr><td>Causal Reasoning</td><td>广度</td><td>因果多选（成因识别/效应预测/异常解释/时序关联）</td></tr>
+  </table>
+
+  <h3>6.3 属性字段演化机制（evol 的巧妙处）</h3>
+  <p>每条种子 QA 记录它当前"用到了哪些属性字段"（<code>fields</code>）。每次 <code>evol()</code> 会从<b>尚未用到的字段</b>中随机拉入一个新属性作为上下文，逼迫问题覆盖新维度：</p>
+  <pre>
+all_fields = {trend, seasonal, noise, local, statistic, correlation}
+evol(): 从 (all_fields − 已用 fields) 中随机选一个新字段加入上下文
+        → 保证问答逐步覆盖更多属性、避免总问同一个点
+</pre>
+  <div class="callout">
+    <b>correlation pool（相关性池）：</b>多变量场景下，系统额外记录"哪些序列之间具有相关属性"，作为一个特殊字段参与演化，专门训练模型的<b>跨序列关联分析</b>能力。
+  </div>
+
+  <h3>6.4 关键约束（防止数据污染）</h3>
+  <ul>
+    <li><b>问题里不能泄露具体属性</b>：像"noise=0.5""spike at point 100"这类细节<b>只能出现在答案</b>，问题需用泛化语言 —— 逼模型自己从序列里读出来。</li>
+    <li><b>只能用 CONTEXT 里的属性</b>：禁止 LLM 编造上下文外的信息，从源头压制幻觉。</li>
+    <li><b>交叉校验 + 等价消除</b>：生成后与属性池比对、与前一条 QA 比对，判定 Equal/Invalid/Valid。</li>
+  </ul>
+
+  <h3>6.5 其它 SFT 增强产线</h3>
+  <table>
+    <tr><th>脚本</th><th>作用</th></tr>
+    <tr><td><code>generate_ift_dataset.py</code></td><td>指令跟随（IFT）数据，需先有对齐标签</td></tr>
+    <tr><td><code>generate_uts_reason.py</code> / <code>_cn.py</code></td><td>单变量推理增强（英 / 中文，中文含一致性检查）</td></tr>
+    <tr><td><code>generate_mts_reason.py</code></td><td>多变量推理增强</td></tr>
+    <tr><td><code>generate_rewrite_dataset.py</code></td><td>通过重写做数据增广</td></tr>
+  </table>
+</section>
+
+<section id="s7">
+  <h2><span class="n">7</span>数据集规模统计</h2>
+  <h3>论文口径（实际训练用量）</h3>
+  <div class="kpi">
+    <div class="box"><div class="v">567</div><div class="l">真实指标名</div></div>
+    <div class="box"><div class="v">33+</div><div class="l">属性类型 (4+7+3+19)</div></div>
+    <div class="box"><div class="v">105k</div><div class="l">对齐样本 (UTS/MTS各35k)</div></div>
+    <div class="box"><div class="v">24,270</div><div class="l">TSEvol 指令</div></div>
+    <div class="box"><div class="v">5,050</div><div class="l">Follow 指令</div></div>
+    <div class="box"><div class="v">64–1024</div><div class="l">序列长度范围</div></div>
+  </div>
+  <table>
+    <tr><th>阶段</th><th>子集</th><th>样本数</th></tr>
+    <tr><td rowspan="3">Alignment 对齐</td><td>UTS</td><td>35,000</td></tr>
+    <tr><td>MTS-Shape</td><td>35,000</td></tr>
+    <tr><td>MTS-Local</td><td>35,000</td></tr>
+    <tr><td rowspan="2">SFT 微调</td><td>TSEvol Instruct</td><td>24,270</td></tr>
+    <tr><td>Instruction Following</td><td>5,050</td></tr>
+  </table>
+  <p class="muted">MTS:UTS 数据量约 2:1；序列长度混合 256 与随机长度。基座 Qwen2.5-14B-Instruct，8×A800，DeepSpeed + LLaMA-Factory 全参微调。</p>
+
+  <h3>开源仓库默认配置口径（<code>config/datagen_config.yaml</code>，可自行放大）</h3>
+  <table>
+    <tr><th>配置项</th><th>默认值</th><th>含义</th></tr>
+    <tr><td>num_data_template_qa</td><td>20000</td><td>模板 QA</td></tr>
+    <tr><td>num_data_llm_qa</td><td>15000</td><td>LLM 种子 QA</td></tr>
+    <tr><td>num_data_tsevol</td><td>10000</td><td>TSEvol 演化</td></tr>
+    <tr><td>num_data_ift</td><td>10000</td><td>指令跟随</td></tr>
+    <tr><td>num_data_uts/mts_reason</td><td>各 10000</td><td>推理增强</td></tr>
+    <tr><td>num_data_rewrite</td><td>10000</td><td>重写增广</td></tr>
+    <tr><td>seq_len</td><td>256（可设 null 随机）</td><td>序列长度</td></tr>
+  </table>
+</section>
+
+<section id="s8">
+  <h2><span class="n">8</span>GitHub 仓库结构映射（数据合成相关）</h2>
+  <pre>
+ChatTS/
+├── config/
+│   ├── datagen_config.yaml        <span class="cm"># ★ 数据生成总配置（LLM 路径/数量/长度）</span>
+│   └── metric_set.json            <span class="cm"># ★ 567 个真实指标名 + 属性约束</span>
+├── chatts/
+│   ├── ts_generator/              <span class="cm"># ★★ 阶段A：时间序列合成器</span>
+│   │   ├── generate.py            <span class="cm">#   主逻辑：属性采样 + 波形生成 + 属性转文本</span>
+│   │   ├── trend_utils.py         <span class="cm">#   分段趋势曲线</span>
+│   │   ├── local_changes.py       <span class="cm">#   19 种局部波动的类实现</span>
+│   │   └── change_utils.py        <span class="cm">#   基础变化/尖峰工具</span>
+│   ├── align/                     <span class="cm"># ★ 阶段B-①：对齐 QA（template + llm）</span>
+│   │   ├── uts_template_qa.py / uts_llm_qa.py
+│   │   ├── mts_shape_template_qa.py / mts_shape_llm_qa.py
+│   │   └── mts_local_template_qa.py / mts_local_llm_qa.py
+│   └── sft/                       <span class="cm"># ★★ 阶段B-②~⑤：SFT 数据</span>
+│       ├── generate_llm_qa.py         <span class="cm"># 种子 QA</span>
+│       ├── generate_tsevol_dataset.py <span class="cm"># TSEvol 演化（核心）</span>
+│       ├── generate_ift_dataset.py    <span class="cm"># 指令跟随</span>
+│       ├── generate_uts_reason.py / _cn.py / generate_mts_reason.py
+│       ├── generate_rewrite_dataset.py
+│       └── utils/
+│           ├── evol_prompt.py     <span class="cm"># ★ 7 种演化算子 + EvolPrompt 类</span>
+│           ├── evol_attributes.py  <span class="cm"># 属性→prompt（含 correlation）</span>
+│           └── rewrite_prompt.py
+├── scripts/
+│   ├── generate_align_datasets.sh          <span class="cm"># 一键生成对齐集</span>
+│   └── generate_enhanced_sft_datasets.sh   <span class="cm"># 一键生成增强 SFT</span>
+└── demo/
+    └── demo_ts_generator.ipynb    <span class="cm"># ★ 生成器交互演示（最适合上手）</span>
+  </pre>
+  <div class="callout">
+    实际模型微调在<b>独立仓库</b> <a href="https://github.com/xiezhe-24/ChatTS-Training">ChatTS-Training</a>（改自 LLaMA-Factory）；官方合成训练集已开源在 <a href="https://huggingface.co/datasets/ChatTSRepo/ChatTS-Training-Dataset">HuggingFace</a>。
+  </div>
+</section>
+
+<section id="s9">
+  <h2><span class="n">9</span>一键复现命令</h2>
+  <pre>
+<span class="cm"># 0. 环境（推理需 python==3.11）</span>
+pip install -r requirements.txt
+
+<span class="cm"># 1. 配置：编辑 config/datagen_config.yaml</span>
+<span class="cm">#    local_llm_path: 指向本地 LLM（推荐 Qwen2.5-32B-Instruct）</span>
+<span class="cm">#    num_gpus / seq_len / num_data_* 按需设置</span>
+
+<span class="cm"># 2. 生成对齐数据集（阶段 A + 对齐 QA）</span>
+bash scripts/generate_align_datasets.sh
+
+<span class="cm"># 3. 生成 SFT 数据集</span>
+python3 -m chatts.sft.generate_llm_qa          <span class="cm"># ① LLM 种子 QA</span>
+python3 -m chatts.sft.generate_tsevol_dataset  <span class="cm"># ② TSEvol 演化（本地 LLM 或远程 API）</span>
+python3 -m chatts.sft.generate_ift_dataset     <span class="cm"># ③ 指令跟随（需先有对齐标签）</span>
+
+<span class="cm"># 4.（可选）增强 SFT：单/多变量推理 + 重写</span>
+bash scripts/generate_enhanced_sft_datasets.sh
+
+<span class="cm"># 5. 只想看时间序列生成器？打开：</span>
+demo/demo_ts_generator.ipynb
+</pre>
+  <div class="callout warn">
+    <b>注意：</b>TSEvol / LLM QA 需要一个本地或远程 LLM 作为"数据生成器"（论文用 Qwen2.5-32B）。生成阶段与训练阶段解耦：数据生成产物为 <code>.jsonl</code>，再喂给 ChatTS-Training 微调。
+  </div>
+</section>
+
+<section id="s10">
+  <h2><span class="n">10</span>要点评析</h2>
+  <div class="grid2">
+    <div class="card">
+      <h4>✅ 方法的高明之处</h4>
+      <ul>
+        <li><b>标签零成本且 100% 精确</b>：先属性后波形，天然对齐到数值级。</li>
+        <li><b>模式可控可枚举</b>：33+ 属性自由组合 + 正弦谐波叠加 → 理论上无限形态。</li>
+        <li><b>GPT 注入语义</b>：567 指标让合成曲线符合真实物理含义，缩小 sim-to-real gap。</li>
+        <li><b>TSEvol 保证多样性与难度</b>：字段演化 + 去重消除器，避免同质化。</li>
+        <li><b>数值保留编码</b>：能答"尖峰多大"这类定量问题，超越纯视觉 MLLM。</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>⚠️ 潜在局限</h4>
+      <ul>
+        <li>合成分布与真实分布仍有差距，极端真实场景可能未覆盖。</li>
+        <li>合成 QA 质量受"数据生成器 LLM"能力上限约束。</li>
+        <li>波形是"加性叠加"模型，难以刻画强非线性耦合的复杂系统。</li>
+        <li>聚焦理解与推理，<b>不做</b>预测/异常检测/分类。</li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout ok" style="margin-top:16px">
+    <b>一句话总结：</b>ChatTS 用"属性驱动的确定性生成"把标注问题变成了生成问题，再用 TSEvol 把简单标签演化成复杂推理数据，从而<b>完全靠合成数据</b>训出一个能理解并推理多元时间序列的原生多模态大模型——在对齐任务上比 GPT-4o 提升约 46%，推理任务提升约 26%。
+  </div>
+</section>
+
+<footer>
+  报告基于 arXiv:2412.03104 (VLDB'25) 论文与 github.com/NetManAIOps/ChatTS 源码整理 · 数值以论文与源码为准
+</footer>
+
+</div>
+</body>
+</html>
