@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>ChatTS Time Encoder 架构更新调研</title>
+  <style>
+    :root{--ink:#10213b;--muted:#586980;--line:#dbe4ef;--bg:#eef4fb;--paper:#fff;--blue:#3278e8;--green:#168b67;--violet:#7357d9;--orange:#e47a2b;--red:#d64a5b}
+    *{box-sizing:border-box} html{scroll-behavior:smooth}
+    body{margin:0;background:linear-gradient(180deg,#eaf2fc 0,#f6f9fd 420px,#edf3f9 100%);color:var(--ink);font-family:Inter,"SF Pro Display","PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;line-height:1.72}
+    a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+    .shell{display:grid;grid-template-columns:260px minmax(0,1120px);gap:32px;max-width:1460px;margin:auto;padding:24px 28px 72px}
+    nav{position:sticky;top:24px;height:calc(100vh - 48px);background:rgba(255,255,255,.9);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:22px;padding:22px 18px;box-shadow:0 18px 50px rgba(24,53,91,.08);overflow:auto}
+    nav .brand{font-size:13px;font-weight:800;letter-spacing:.12em;color:var(--blue);margin:2px 10px 18px}
+    nav a{display:block;color:#41536b;padding:8px 10px;border-radius:9px;font-size:14px}nav a:hover{background:#edf4ff;color:var(--blue);text-decoration:none}
+    nav .meta{border-top:1px solid var(--line);margin:18px 10px 0;padding-top:16px;color:#7d8b9d;font-size:12px}
+    main{min-width:0}
+    .hero{background:linear-gradient(135deg,#142c4d,#1d4675 62%,#315fa1);color:white;border-radius:30px;padding:54px 58px;box-shadow:0 24px 70px rgba(19,50,88,.22);position:relative;overflow:hidden}
+    .hero:after{content:"";position:absolute;width:420px;height:420px;border-radius:50%;right:-120px;top:-180px;background:radial-gradient(circle,rgba(108,181,255,.36),transparent 68%)}
+    .eyebrow{font-size:13px;letter-spacing:.16em;font-weight:800;color:#a9d0ff;margin-bottom:14px}.hero h1{font-size:44px;line-height:1.15;margin:0 0 18px;max-width:790px}.hero p{font-size:18px;color:#dbeaff;max-width:790px;margin:0}
+    .verdict{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:30px;position:relative;z-index:1}.verdict .v{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);border-radius:16px;padding:16px}.v b{display:block;font-size:17px}.v span{display:block;color:#c9ddf6;font-size:13px;margin-top:3px}
+    section{scroll-margin-top:24px;background:var(--paper);border:1px solid var(--line);border-radius:24px;margin-top:24px;padding:34px 40px;box-shadow:0 15px 45px rgba(24,53,91,.06)}
+    h2{font-size:29px;line-height:1.25;margin:0 0 16px}h3{font-size:21px;margin:30px 0 10px}.lead{font-size:18px;color:#334a66}
+    .callout{border-left:4px solid var(--blue);background:#eef5ff;border-radius:0 14px 14px 0;padding:15px 18px;margin:18px 0;color:#294663}.warning{border-left-color:var(--orange);background:#fff5eb}
+    .figure{margin:24px -12px 8px;border:1px solid var(--line);border-radius:20px;background:#f4f8fd;padding:10px;overflow:hidden}.figure img{display:block;width:100%;height:auto;border-radius:14px}.caption{text-align:center;color:#7a899b;font-size:13px;margin-top:8px}
+    table{width:100%;border-collapse:separate;border-spacing:0;margin:20px 0;border:1px solid var(--line);border-radius:14px;overflow:hidden;font-size:14px}th{background:#eef4fb;text-align:left;color:#41536b;font-weight:750}th,td{padding:12px 11px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border-bottom:0}.rank{font-weight:850;color:var(--green)}
+    code,pre{font-family:"SFMono-Regular","Cascadia Code",monospace}pre{white-space:pre-wrap;background:#12253f;color:#dbeaff;border-radius:15px;padding:18px 20px;overflow:auto;font-size:14px;line-height:1.55}
+    .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{border:1px solid var(--line);border-radius:16px;padding:17px;background:#fbfdff}.card strong{display:block;margin-bottom:4px}.card small{color:var(--muted)}
+    .source{font-size:13px;color:#738297;border-top:1px dashed var(--line);margin-top:20px;padding-top:13px}
+    footer{text-align:center;color:#7d8b9d;padding:28px 0 10px;font-size:13px}
+    @media(max-width:980px){.shell{display:block;padding:14px}nav{display:none}.hero{padding:38px 30px}.hero h1{font-size:35px}.verdict,.cards{grid-template-columns:1fr}section{padding:28px 23px}.figure{margin-left:-8px;margin-right:-8px}}
+    @media print{body{background:#fff}.shell{display:block;padding:0}nav{display:none}.hero,section{box-shadow:none;break-inside:avoid}.hero{-webkit-print-color-adjust:exact;print-color-adjust:exact}.figure{break-inside:avoid}a{color:inherit}}
+  </style>
+</head>
+<body>
+<div class="shell">
+  <nav>
+    <div class="brand">CHATTS · ARCHITECTURE RADAR</div>
+    <a href="#verdict">00 · 结论</a>
+    <a href="#baseline">01 · ChatTS MLP-Patch</a>
+    <a href="#modern">02 · ModernTCN-lite</a>
+    <a href="#slstm">03 · P-sLSTM</a>
+    <a href="#mamba">04 · Bi-Mamba+</a>
+    <a href="#patchtst">05 · PatchTST</a>
+    <a href="#boundaries">06 · 边界方案</a>
+    <a href="#experiment">07 · 最小实验矩阵</a>
+    <a href="#evidence">08 · 证据包</a>
+    <div class="meta">调研截止 2026-07-25<br/>所有架构图均为重新绘制的解释图。</div>
+  </nav>
+  <main>
+    <header class="hero">
+      <div class="eyebrow">TIME-SERIES NATIVE · ARCHITECTURE-ONLY UPDATE</div>
+      <h1>ChatTS Time Encoder<br/>架构更新调研</h1>
+      <p>目标不是堆复杂机制，而是在保持 patch、token 数与 LLM 接口不变的前提下，让时序在进入 LLM 前真正发生跨 patch 信息交换。</p>
+      <div class="verdict">
+        <div class="v"><b>① ModernTCN-lite</b><span>最务实 · 纯 Conv1d · 主方案</span></div>
+        <div class="v"><b>② P-sLSTM</b><span>2025 原生时序 · 递归状态</span></div>
+        <div class="v"><b>③ Bi-Mamba+</b><span>高潜力 · preprint/CUDA 风险</span></div>
+      </div>
+    </header>
+
+    <section id="verdict">
+      <h2>结论先行</h2>
+      <p class="lead">ChatTS 的现有模块是<strong>时序输入的 patch 投影器</strong>，但不是显式跨 patch 的时序编码器。最合理的更新不是增加 MLP 层数，而是在 d<sub>ts</sub> 的窄空间中加入一种清晰的 temporal mixer，再一次性投影到 d<sub>LLM</sub>。</p>
+      <table>
+        <thead><tr><th>排位</th><th>架构</th><th>时间信息流</th><th>保持 N token</th><th>复杂度</th><th>状态</th><th>建议</th></tr></thead>
+        <tbody>
+          <tr><td class="rank">1</td><td>ModernTCN-lite</td><td>大核 DWConv1d</td><td>是</td><td>低</td><td>ICLR 2024 Spotlight</td><td><b>主方案</b></td></tr>
+          <tr><td class="rank">2</td><td>P-sLSTM</td><td>patch 级递归状态</td><td>是</td><td>中</td><td>AAAI 2025</td><td><b>现代替代</b></td></tr>
+          <tr><td class="rank">3</td><td>Bi-Mamba+</td><td>双向 selective scan</td><td>是</td><td>中高</td><td>arXiv v3</td><td><b>高潜力/有风险</b></td></tr>
+          <tr><td>C</td><td>PatchTST-style</td><td>全局 self-attention</td><td>是</td><td>低中</td><td>ICLR 2023</td><td>必须对照</td></tr>
+          <tr><td>—</td><td>TimeMixer++</td><td>多尺度时频混合</td><td>需额外对齐</td><td>高</td><td>ICLR 2025</td><td>本轮排除</td></tr>
+          <tr><td>—</td><td>ITFormer</td><td>问题条件化融合</td><td>改融合接口</td><td>中高</td><td>ICML 2025</td><td>下一阶段</td></tr>
+        </tbody>
+      </table>
+      <div class="callout">这里是“在当前 ChatTS 约束下的适配排序”，不是论文性能排行榜。没有现成文献直接证明某个候选在相同 ChatTS QA/推理设置中优于 MLP。</div>
+    </section>
+
+    <section id="baseline">
+      <h2>01 · 先把 ChatTS 原版画清楚</h2>
+      <p><a href="https://www.vldb.org/pvldb/vol18/p2385-xie.pdf">ChatTS, PVLDB 2025</a> 在 §3.4.1 明确使用 fixed-size patches 与每 patch 的 5-layer MLP。公开代码计算 Nᵢ=⌈Lᵢ/p⌉、对尾 patch 补值，再把所有 patch 独立送入共享 MLP，最后返回 features 与 patch_cnt。</p>
+      <div class="callout"><a href="https://huggingface.co/bytedance-research/ChatTS-8B/blob/main/config.json">官方 ChatTS-8B 配置</a>为 p=8、5 层、hidden=4096、position embedding 开启。按公开维度计算，time encoder（含位置表）约 67.8M 参数：机制简单，但并不“小”。这也是本报告建议先在 d<sub>ts</sub>≈512 建模、最后再投影到 d<sub>LLM</sub> 的原因。</div>
+      <div class="figure"><img src="figures/01-chatts-mlp-patch.svg" alt="ChatTS MLP-Patch encoder"/></div>
+      <div class="caption">关键不是它“不能接收时序”，而是跨 patch 依赖直到 LLM 内才开始建模。</div>
+    </section>
+
+    <section id="modern">
+      <h2>02 · 推荐 ① ModernTCN-lite</h2>
+      <p>它最贴合“只换架构、别搞复杂”的要求：用大核 depthwise Conv1d 在 patch 轴建模时间依赖，计算随 N 近似线性，且可用标准 PyTorch 实现。</p>
+      <div class="figure"><img src="figures/02-moderntcn-lite.svg" alt="ModernTCN-lite adapter"/></div>
+      <div class="cards">
+        <div class="card"><strong>保留</strong><small>patch=8、stride=8、N token、patch_cnt、LLM merge</small></div>
+        <div class="card"><strong>新增</strong><small>Linear→d_ts 后的 4 个大核 temporal blocks</small></div>
+        <div class="card"><strong>删除</strong><small>完整 ModernTCN 的多 stage 下采样与上采样融合</small></div>
+      </div>
+      <pre>Patchify(p=8)
+→ Linear(p → d_ts=512)
+→ [DWConv1d(k=7/9) → Norm → ConvFFN → Residual] × 4
+→ Linear(512 → d_LLM)
+→ 原 token replacement</pre>
+      <p class="source">来源：<a href="https://proceedings.iclr.cc/paper_files/paper/2024/hash/86b1437c1e4c3b3c4debff98234a67e7-Abstract-Conference.html">ModernTCN — ICLR 2024 Spotlight</a>。报告中的 lite 是明确适配，不是声称原论文使用了该精简结构。</p>
+    </section>
+
+    <section id="slstm">
+      <h2>03 · 推荐 ② P-sLSTM</h2>
+      <p><a href="https://ojs.aaai.org/index.php/AAAI/article/view/33303">P-sLSTM, AAAI 2025</a> 是 fixed patch + channel-independent + stacked sLSTM 的原生时序结构。它和 MLP 最直观的差异，是每个 patch 都接收上一时刻的 (c,n,h) 状态。</p>
+      <div class="figure"><img src="figures/03-p-slstm.svg" alt="P-sLSTM encoder"/></div>
+      <div class="callout warning">优点是 2025 正式论文、时序含义清楚；代价是 xLSTM/sLSTM 依赖、递归路径并行性与指数门控数值稳定性。若工程风险优先，它仍排在 ModernTCN-lite 后。</div>
+    </section>
+
+    <section id="mamba">
+      <h2>04 · 推荐 ③ Bi-Mamba+ Patch Encoder</h2>
+      <p><a href="https://arxiv.org/abs/2404.15772">Bi-Mamba+ v3</a> 的 channel-independent 路径沿 temporal patches 做正、反向 selective scan，输出仍是 N×d，接口几乎天然适合 ChatTS。</p>
+      <div class="figure"><img src="figures/04-bi-mamba-plus-patch.svg" alt="Bi-Mamba+ patch encoder"/></div>
+      <div class="callout warning">报告没有掩盖证据风险：截至调研日它仍是 preprint；忠实 Mamba+ 依赖修改后的 CUDA selective scan。若改用标准双向 Mamba，应明确写成 style/adaptation，而非完整复现。</div>
+    </section>
+
+    <section id="patchtst">
+      <h2>05 · 必须对照 PatchTST-style Encoder</h2>
+      <p><a href="https://iclr.cc/virtual/2023/poster/10876">PatchTST, ICLR 2023</a> 与 ChatTS 的接口最贴。它不够新，却是回答“仅加入全局跨 patch interaction 是否已经足够”的最干净强基线。</p>
+      <div class="figure"><img src="figures/05-patchtst-transformer.svg" alt="PatchTST encoder"/></div>
+    </section>
+
+    <section id="boundaries">
+      <h2>06 · 两个边界：新，不等于适合现在做</h2>
+      <h3>TimeMixer++：能力上限</h3>
+      <p><a href="https://proceedings.iclr.cc/paper_files/paper/2025/hash/2b187165e28fdfdc0ffb34d1bfff2b0c-Abstract-Conference.html">TimeMixer++, ICLR 2025</a> 的优势来自 MRTI、TID、MCM、MRM 整套多尺度时频系统。接入 ChatTS 必须新增 FFT/Top-K、2D time image、尺度融合和 token 重对齐，已经不是“换掉几层 MLP”。</p>
+      <div class="figure"><img src="figures/06-timemixer-plus-plus.svg" alt="TimeMixer++ boundary"/></div>
+      <h3>ITFormer：最近邻 TS-QA，但改的是桥接</h3>
+      <p><a href="https://proceedings.mlr.press/v267/wang25av.html">ITFormer, ICML 2025</a> 用文本 instruct tokens 指导 channel/time fusion，是正式发表的直接 TS-QA 最近邻。它适合下一阶段研究 cross-modal bridge；本轮同时改 encoder 和 bridge 会破坏归因。</p>
+      <div class="figure"><img src="figures/07-itformer-bridge.svg" alt="ITFormer bridge"/></div>
+    </section>
+
+    <section id="experiment">
+      <h2>07 · 最小、清楚、可归因的实验矩阵</h2>
+      <pre>ChatTS-MLP
+vs PatchTST-style
+vs ModernTCN-lite
+vs P-sLSTM
+(资源允许时再加 Bi-Mamba+)</pre>
+      <p>全部固定 patch/stride=8、输出 Nᵢ=⌈Lᵢ/8⌉、d_ts、最终 projector、数据、训练步数、LLM、token replacement 与损失。不要让某个模型直接在 d_LLM 宽度堆很多层；先在 d_ts≈512 的窄空间建模，再投影一次。</p>
+      <div class="cards">
+        <div class="card"><strong>No mixing</strong><small>ChatTS MLP：每 patch 独立</small></div>
+        <div class="card"><strong>Local → long field</strong><small>ModernTCN-lite：大核卷积</small></div>
+        <div class="card"><strong>Global / state</strong><small>PatchTST、P-sLSTM、可选 Mamba</small></div>
+      </div>
+      <div class="callout">最稳的主张不是“我们换了一个更新的 backbone”，而是：<b>在 LLM 之前显式建模跨 patch temporal dependencies，是否比独立 patch projection 更适合时序理解与推理。</b></div>
+    </section>
+
+    <section id="evidence">
+      <h2>08 · 证据包与边界声明</h2>
+      <ul>
+        <li><a href="literature-search-20260725-chatts-time-encoder/papers.md">20 篇候选论文筛选表</a></li>
+        <li><a href="literature-search-20260725-chatts-time-encoder/papers.csv">机器可读 papers.csv</a></li>
+        <li><a href="literature-search-20260725-chatts-time-encoder/search-notes.md">检索、证据核对与排除记录</a></li>
+        <li><a href="report.md">Markdown 版完整报告</a></li>
+      </ul>
+      <p>所有 SVG 均为根据论文与公开实现重新绘制的结构解释图，不复制原论文图。绿色模块表示 ChatTS-specific adaptation。报告没有编造候选在 ChatTS 上的准确率、延迟或参数结果。</p>
+    </section>
+    <footer>ChatTS Time Encoder Architecture Radar · 2026-07-25</footer>
+  </main>
+</div>
+</body>
+</html>
