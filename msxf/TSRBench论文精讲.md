@@ -35,7 +35,9 @@
 
 TSRBench 希望一次性评估这四层能力。
 
-![TSRBench 的四层能力与 15 项任务](https://tsrbench.github.io/website/img/main_arch.png)
+![图 1：TSRBench 的四层能力与 15 项任务](images/TSRBench-Figure1.png)
+
+*图 1：TSRBench 从感知、推理、预测和决策四个维度评估通用模型，共包含 15 项时间序列任务。*
 
 ## Benchmark 设计
 
