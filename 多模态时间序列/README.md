@@ -2,6 +2,13 @@
 
 本目录收录时间序列与大语言模型、多模态问答及跨模态编码相关的调研与设计材料。
 
+## ChatTS × TimesFM 2.5 适配实现
+
+基于 TS-Reasoner 的“冻结时间序列基础模型 + 可训练 projector + 两阶段训练”思路，
+将 ChatTS 原生 MLP-Patch 编码器替换为 `google/timesfm-2.5-200m-pytorch`。
+
+- [适配说明、完整 Git 补丁与训练方法](./ChatTS-TimesFM2.5适配/README.md)
+
 ## ChatTS Time Encoder 架构更新调研
 
 目标：在不修改 ChatTS tokenizer、patch 数量、LLM token merge 和训练任务的前提下，寻找能够替换原始 MLP-Patch 的原生时间序列编码架构。

@@ -1,0 +1,808 @@
+From 9e245614830a7a3e457b905501594d65c6138484 Mon Sep 17 00:00:00 2001
+From: swee <2385455860@qq.com>
+Date: Wed, 29 Jul 2026 11:16:56 +0800
+Subject: [PATCH] feat: add frozen TimesFM 2.5 encoder for ChatTS
+
+---
+ README.md                                     |  46 +++
+ scripts/full/train_timesfm2_5_stage1.sh       |  35 ++
+ scripts/full/train_timesfm2_5_stage2.sh       |  34 ++
+ setup.py                                      |   1 +
+ src/llamafactory/hparams/model_args.py        |  13 +
+ src/llamafactory/model/loader.py              |   2 +
+ .../model/model_utils/timeseries.py           |  37 +-
+ .../model/model_utils/timesfm2_5.py           | 367 ++++++++++++++++++
+ tests/model/test_timesfm2_5.py                | 140 +++++++
+ 9 files changed, 669 insertions(+), 6 deletions(-)
+ create mode 100755 scripts/full/train_timesfm2_5_stage1.sh
+ create mode 100755 scripts/full/train_timesfm2_5_stage2.sh
+ create mode 100644 src/llamafactory/model/model_utils/timesfm2_5.py
+ create mode 100644 tests/model/test_timesfm2_5.py
+
+diff --git a/README.md b/README.md
+index c5080df..bdc33ea 100644
+--- a/README.md
++++ b/README.md
+@@ -16,6 +16,52 @@ Make sure that `flash-attention` and `DeepSpeed` are installed.
+ 2. Replace `*.py`, `added_tokens.json`, `config.json`, `special_tokens_map.json`, `tokenizer_config.json` in the base model folder with the files in the[ChatTS-8B](https://huggingface.co/bytedance-research/ChatTS-8B) or [ChatTS-14B](https://huggingface.co/bytedance-research/ChatTS-14B) repo according to type of your base model.
+ 3. **Initialization:** To ensure training stability, we strongly recommend using Xavier normal initialization for the parameters of `ts_encoder`. You can first load the model created in the previous steps using `AutoModelForCausalLM.from_pretrained` in Python, then apply Xavier normal initialization to the `model.ts_encoder` part, and finally save the model using `save_pretrained`. For detailed API usage, please refer to the [official Transformers documentation](https://huggingface.co/docs/transformers/en/index).
+ 
++## Optional: replace the MLP encoder with TimesFM 2.5
++
++ChatTS can keep its existing processor, `<ts>...<ts/>` merge logic, datasets, and LLM while using
++[`google/timesfm-2.5-200m-pytorch`](https://huggingface.co/google/timesfm-2.5-200m-pytorch)
++as a frozen time-series feature extractor. The adapter returns the same `(features, patch_cnt)` interface as the
++native encoder:
++
++```text
++ChatTS [value, mask] input
++  -> TimesFM 2.5 patching (32 points / token)
++  -> frozen 20-layer TimesFM backbone (1280-d)
++  -> trainable 2-layer TS-to-text projector
++  -> unchanged ChatTS token merge and LLM
++```
++
++Install the optional dependency:
++
++```bash
++# TimesFM 2.5 requires Python >= 3.10.
++pip install -e ".[timesfm,deepspeed]"
++hf download google/timesfm-2.5-200m-pytorch model.safetensors config.json
++```
++
++Then add the following options to a normal ChatTS training command:
++
++```bash
++--ts_encoder_type timesfm2_5 \
++--timesfm_model_name_or_path google/timesfm-2.5-200m-pytorch \
++--timeseries_sft_lr 1e-4
++```
++
++Runnable templates are provided in
++[`scripts/full/train_timesfm2_5_stage1.sh`](scripts/full/train_timesfm2_5_stage1.sh) and
++[`scripts/full/train_timesfm2_5_stage2.sh`](scripts/full/train_timesfm2_5_stage2.sh).
++
++Important behavior:
++
++- TimesFM stays frozen; only the projector and the parameters selected by the normal fine-tuning mode are optimized.
++- TimesFM uses 32-point patches instead of ChatTS' original 8-point patches, reducing time-series tokens by about 4x.
++- TimesFM weights remain an external dependency and are not copied into every ChatTS checkpoint.
++- Stage-1 checkpoints record `ts_encoder_type=timesfm2_5`; stage 2 can use `--ts_encoder_type auto`.
++- The current adapter accepts at most 16,384 points per individual series.
++- The old MLP encoder weights are not reusable: train the new projector in stage 1 before stage-2 SFT.
++- Load trained checkpoints through this patched LLaMA-Factory loader; a plain upstream
++  `AutoModelForCausalLM.from_pretrained(...)` does not know how to reconstruct the external TimesFM adapter.
++
+ 
+ ## Steps to reproduce
+ 1. Download the training datasets from [ChatTS-Training-Dataset](https://huggingface.co/datasets/ChatTSRepo/ChatTS-Training-Dataset). Put the folders under `data/` (e.g., `data/align_256/`, `data/align_random/`, etc).
+diff --git a/scripts/full/train_timesfm2_5_stage1.sh b/scripts/full/train_timesfm2_5_stage1.sh
+new file mode 100755
+index 0000000..ff6ef4a
+--- /dev/null
++++ b/scripts/full/train_timesfm2_5_stage1.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++
++# Alignment stage: frozen TimesFM 2.5 + trainable TS-to-text projector + ChatTS LLM.
++# Install once with: pip install -e ".[timesfm,deepspeed]"
++
++NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
++    --deepspeed ds_config/ds_config_3.json \
++    --stage sft \
++    --model_name_or_path "[PATH_TO_CHATTS_BASE_MODEL]" \
++    --ts_encoder_type timesfm2_5 \
++    --timesfm_model_name_or_path "google/timesfm-2.5-200m-pytorch" \
++    --dataset "align_256,ift" \
++    --interleave_probs "0.9,0.1" \
++    --do_train \
++    --mix_strategy "interleave_over" \
++    --template "chatts" \
++    --finetuning_type full \
++    --output_dir "[OUTPUT_PATH_TIMESFM_STAGE_1]" \
++    --overwrite_output_dir \
++    --per_device_train_batch_size 2 \
++    --gradient_accumulation_steps 32 \
++    --lr_scheduler_type cosine \
++    --logging_steps 1 \
++    --save_steps 100 \
++    --learning_rate 1e-5 \
++    --timeseries_sft_lr 1e-4 \
++    --warmup_ratio 0.02 \
++    --max_steps 1000 \
++    --plot_loss \
++    --bf16 \
++    --save_only_model \
++    --save_safetensors true \
++    --preprocessing_num_workers 96 \
++    --trust_remote_code true \
++    --cutoff_len 10000
+diff --git a/scripts/full/train_timesfm2_5_stage2.sh b/scripts/full/train_timesfm2_5_stage2.sh
+new file mode 100755
+index 0000000..758e6e5
+--- /dev/null
++++ b/scripts/full/train_timesfm2_5_stage2.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++
++# Instruction stage. `auto` reads `timesfm2_5` from the stage-1 config and
++# restores the saved projector while reloading the frozen Google checkpoint.
++
++NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
++    --deepspeed ds_config/ds_config_3.json \
++    --stage sft \
++    --model_name_or_path "[OUTPUT_PATH_TIMESFM_STAGE_1]" \
++    --ts_encoder_type auto \
++    --dataset "sft,ift,align_random" \
++    --interleave_probs "0.6,0.2,0.2" \
++    --do_train \
++    --mix_strategy "interleave_over" \
++    --template "chatts" \
++    --finetuning_type full \
++    --output_dir "[OUTPUT_PATH_TIMESFM_STAGE_2]" \
++    --overwrite_output_dir \
++    --per_device_train_batch_size 2 \
++    --gradient_accumulation_steps 32 \
++    --lr_scheduler_type cosine \
++    --logging_steps 1 \
++    --save_steps 100 \
++    --learning_rate 1e-5 \
++    --timeseries_sft_lr 3e-5 \
++    --warmup_ratio 0.02 \
++    --max_steps 400 \
++    --plot_loss \
++    --bf16 \
++    --save_only_model \
++    --save_safetensors true \
++    --preprocessing_num_workers 96 \
++    --trust_remote_code true \
++    --cutoff_len 10000
+diff --git a/setup.py b/setup.py
+index 0d60410..4588c5b 100644
+--- a/setup.py
++++ b/setup.py
+@@ -70,6 +70,7 @@ extra_require = {
+     ],
+     "openmind": ["openmind"],
+     "swanlab": ["swanlab"],
++    "timesfm": ["timesfm[torch]>=2.0.2"],
+     "dev": ["pre-commit", "ruff", "pytest", "build"],
+ }
+ 
+diff --git a/src/llamafactory/hparams/model_args.py b/src/llamafactory/hparams/model_args.py
+index d2f7cc5..ecf69cb 100644
+--- a/src/llamafactory/hparams/model_args.py
++++ b/src/llamafactory/hparams/model_args.py
+@@ -36,6 +36,19 @@ class BaseModelArguments:
+             "help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."
+         },
+     )
++    ts_encoder_type: Literal["auto", "native", "timesfm2_5"] = field(
++        default="auto",
++        metadata={
++            "help": (
++                "Time-series encoder architecture. `auto` restores the architecture recorded in the model config, "
++                "`native` keeps ChatTS' MLP encoder, and `timesfm2_5` uses a frozen TimesFM 2.5 backbone."
++            )
++        },
++    )
++    timesfm_model_name_or_path: str = field(
++        default="google/timesfm-2.5-200m-pytorch",
++        metadata={"help": "Hugging Face model ID or local path for the frozen TimesFM 2.5 PyTorch checkpoint."},
++    )
+     adapter_name_or_path: Optional[str] = field(
+         default=None,
+         metadata={
+diff --git a/src/llamafactory/model/loader.py b/src/llamafactory/model/loader.py
+index 7d7ee2e..3348424 100644
+--- a/src/llamafactory/model/loader.py
++++ b/src/llamafactory/model/loader.py
+@@ -34,6 +34,7 @@ from .adapter import init_adapter
+ from .model_utils.liger_kernel import apply_liger_kernel
+ from .model_utils.misc import register_autoclass
+ from .model_utils.mod import convert_pretrained_model_to_mod, load_mod_pretrained_model
++from .model_utils.timesfm2_5 import maybe_replace_with_timesfm2_5_encoder
+ from .model_utils.unsloth import load_unsloth_pretrained_model
+ from .model_utils.valuehead import load_valuehead_params
+ from .patcher import patch_config, patch_model, patch_processor, patch_tokenizer, patch_valuehead_model
+@@ -178,6 +179,7 @@ def load_model(
+             model = convert_pretrained_model_to_mod(model, config, model_args)
+ 
+     if not lazy_load:
++        maybe_replace_with_timesfm2_5_encoder(model, config, model_args)
+         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
+         register_autoclass(config, model, tokenizer)
+ 
+diff --git a/src/llamafactory/model/model_utils/timeseries.py b/src/llamafactory/model/model_utils/timeseries.py
+index e2f39a5..6e3e5e4 100644
+--- a/src/llamafactory/model/model_utils/timeseries.py
++++ b/src/llamafactory/model/model_utils/timeseries.py
+@@ -67,14 +67,14 @@ def _register_timeseries_model(
+ _register_timeseries_model(
+     model_type="chatts",
+     encoder_key="ts_encoder",
+-    lora_target_prefixes=["ts_encoder.mlp"],
++    lora_target_prefixes=["ts_encoder.mlp", "ts_encoder.projector"],
+     modules_to_save=[],
+ )
+ 
+ _register_timeseries_model(
+     model_type="qwen3ts",
+     encoder_key="ts_encoder",
+-    lora_target_prefixes=["ts_encoder.mlp"],
++    lora_target_prefixes=["ts_encoder.mlp", "ts_encoder.projector"],
+     modules_to_save=[],
+ )
+ 
+@@ -139,13 +139,16 @@ def get_timeseries_lora_settings(
+         )
+         return [], []
+ 
+-    modules_to_save = list(ts_model.modules_to_save)
++    lora_target_prefixes = getattr(
++        encoder, "llamafactory_lora_target_prefixes", ts_model.lora_target_prefixes
++    )
++    modules_to_save = list(getattr(encoder, "llamafactory_modules_to_save", ts_model.modules_to_save))
+ 
+-    target_modules = _collect_ts_target_modules(model, ts_model.lora_target_prefixes)
+-    if ts_model.lora_target_prefixes and not target_modules:
++    target_modules = _collect_ts_target_modules(model, lora_target_prefixes)
++    if lora_target_prefixes and not target_modules:
+         logger.warning_rank0(
+             "LoRA target prefixes %s resolved to no modules, please check model structure.",
+-            ",".join(ts_model.lora_target_prefixes),
++            ",".join(lora_target_prefixes),
+         )
+ 
+     if getattr(finetuning_args, "additional_target", None):
+@@ -284,6 +287,28 @@ def patch_timeseries_modules_for_lora(
+ ) -> list[str]:
+     modules_to_save, ts_target_modules = get_timeseries_lora_settings(model, finetuning_args)
+ 
++    if modules_to_save:
++        protected_linear_names = {
++            name
++            for name, module in model.named_modules()
++            if isinstance(module, nn.Linear)
++            and any(name == prefix or name.startswith(f"{prefix}.") for prefix in modules_to_save)
++        }
++        protected_linear_suffixes = {name.rsplit(".", maxsplit=1)[-1] for name in protected_linear_names}
++        filtered_target_modules = [
++            module
++            for module in target_modules
++            if module not in protected_linear_names and module not in protected_linear_suffixes
++        ]
++        if len(filtered_target_modules) != len(target_modules):
++            removed = [module for module in target_modules if module not in filtered_target_modules]
++            logger.info_rank0(
++                "Keep fully trainable time-series modules out of LoRA targets: {}.".format(
++                    ",".join(removed)
++                )
++            )
++        target_modules = filtered_target_modules
++
+     model_type = getattr(model.config, "model_type", None)
+     ts_prefixes = (
+         TIMESERIES_MODELS[model_type].lora_target_prefixes if model_type in TIMESERIES_MODELS else []
+diff --git a/src/llamafactory/model/model_utils/timesfm2_5.py b/src/llamafactory/model/model_utils/timesfm2_5.py
+new file mode 100644
+index 0000000..9b6bea4
+--- /dev/null
++++ b/src/llamafactory/model/model_utils/timesfm2_5.py
+@@ -0,0 +1,367 @@
++# Copyright 2026 the LlamaFactory team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++from contextlib import nullcontext
++from typing import TYPE_CHECKING, Any, ClassVar
++
++import torch
++from torch import nn
++
++from ...extras import logging
++
++
++if TYPE_CHECKING:
++    from transformers import PreTrainedModel
++
++    from ...hparams import ModelArguments
++
++
++logger = logging.get_logger(__name__)
++
++TIMESFM2_5_ENCODER = "timesfm2_5"
++TIMESFM2_5_HIDDEN_SIZE = 1280
++TIMESFM2_5_PATCH_SIZE = 32
++TIMESFM2_5_CONTEXT_LIMIT = 16384
++TIMESFM2_5_NORM_EPSILON = 1e-6
++CHATTS_MIN_INPUT_FEATURES = 2
++CHATTS_VALID_MASK_THRESHOLD = 0.5
++_PROJECTOR_PREFIX = "ts_encoder.projector."
++
++
++class TimesFMProjector(nn.Module):
++    r"""Map TimesFM patch embeddings into the language-model hidden space."""
++
++    def __init__(self, llm_hidden_size: int) -> None:
++        super().__init__()
++        self.input_norm = nn.LayerNorm(TIMESFM2_5_HIDDEN_SIZE)
++        self.linear_in = nn.Linear(TIMESFM2_5_HIDDEN_SIZE, llm_hidden_size)
++        self.activation = nn.GELU()
++        self.linear_out = nn.Linear(llm_hidden_size, llm_hidden_size)
++        self.output_norm = nn.LayerNorm(llm_hidden_size)
++        self.apply(self._init_weights)
++
++    @staticmethod
++    def _init_weights(module: nn.Module) -> None:
++        if isinstance(module, nn.Linear):
++            nn.init.xavier_normal_(module.weight)
++            if module.bias is not None:
++                nn.init.zeros_(module.bias)
++
++    def forward(self, features: torch.Tensor) -> torch.Tensor:
++        features = self.input_norm(features)
++        features = self.linear_in(features)
++        features = self.activation(features)
++        features = self.linear_out(features)
++        return self.output_norm(features)
++
++
++class TimesFM2_5TimeSeriesEncoder(nn.Module):
++    r"""Frozen TimesFM 2.5 backbone plus a trainable TS-to-text projector.
++
++    The input contract is identical to ChatTS' native ``TimeSeriesEmbedding``:
++    ``x`` contains interleaved ``[value, valid_mask]`` features and the return
++    value is ``(flattened_patch_features, patch_count_per_series)``.
++
++    TimesFM itself is deliberately held by a non-Module wrapper. Its frozen
++    200M parameters are downloaded from ``timesfm_model_name_or_path`` at first
++    use and are not duplicated in ChatTS checkpoints. Only ``projector`` is a
++    registered trainable submodule.
++    """
++
++    llamafactory_lora_target_prefixes: ClassVar[tuple[str, ...]] = ()
++    llamafactory_modules_to_save: ClassVar[tuple[str, ...]] = ("ts_encoder.projector",)
++
++    def __init__(
++        self,
++        llm_hidden_size: int,
++        model_name_or_path: str,
++        num_features: int = 2,
++        context_limit: int = TIMESFM2_5_CONTEXT_LIMIT,
++    ) -> None:
++        super().__init__()
++        if num_features < CHATTS_MIN_INPUT_FEATURES:
++            raise ValueError("TimesFM 2.5 requires ChatTS inputs with value and valid-mask features.")
++
++        self.patch_size = TIMESFM2_5_PATCH_SIZE
++        self.hidden_size = llm_hidden_size
++        self.num_features = num_features
++        self.context_limit = context_limit
++        self.model_name_or_path = model_name_or_path
++        self.projector = TimesFMProjector(llm_hidden_size)
++
++        # ``timesfm.TimesFM_2p5_200M_torch`` is a plain Python wrapper rather
++        # than an nn.Module. Keeping it here prevents its frozen weights from
++        # being serialized into every ChatTS checkpoint.
++        self._timesfm: Any | None = None
++
++    def _load_timesfm(self) -> Any:
++        if sys.version_info < (3, 10):
++            raise ImportError("TimesFM 2.5 requires Python 3.10 or newer.")
++
++        try:
++            import timesfm
++        except ImportError as exc:
++            raise ImportError(
++                'TimesFM 2.5 is not installed. Run `pip install -e ".[timesfm]"` from the ChatTS-Training repository.'
++            ) from exc
++
++        model_class = getattr(timesfm, "TimesFM_2p5_200M_torch", None)
++        if model_class is None:
++            raise ImportError(
++                "The installed `timesfm` package does not expose `TimesFM_2p5_200M_torch`. Install timesfm>=2.0.2."
++            )
++
++        logger.info_rank0("Loading frozen TimesFM 2.5 backbone from `%s`.", self.model_name_or_path)
++        timesfm_model = model_class.from_pretrained(self.model_name_or_path, torch_compile=False)
++        backbone = timesfm_model.model
++        backbone.eval()
++        backbone.requires_grad_(False)
++        return timesfm_model
++
++    def _get_backbone(self, device: torch.device) -> nn.Module:
++        if self._timesfm is None:
++            self._timesfm = self._load_timesfm()
++
++        backbone: nn.Module = self._timesfm.model
++        backbone.to(device=device, dtype=torch.float32)
++        backbone.eval()
++        backbone.requires_grad_(False)
++        return backbone
++
++    @staticmethod
++    def _update_running_stats(
++        n: torch.Tensor,
++        mean: torch.Tensor,
++        std: torch.Tensor,
++        values: torch.Tensor,
++        padding: torch.Tensor,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        r"""Match TimesFM 2.5's cumulative per-patch normalization."""
++        valid = ~padding
++        increment_n = valid.to(values.dtype).sum(dim=-1)
++        safe_increment_n = increment_n.clamp_min(1.0)
++        increment_mean = (values * valid).sum(dim=-1) / safe_increment_n
++        increment_mean = torch.where(increment_n == 0, 0.0, increment_mean)
++        increment_var = (((values - increment_mean.unsqueeze(-1)) ** 2) * valid).sum(dim=-1)
++        increment_var = increment_var / safe_increment_n
++        increment_var = torch.where(increment_n == 0, 0.0, increment_var)
++        increment_std = torch.sqrt(increment_var)
++
++        new_n = n + increment_n
++        safe_new_n = new_n.clamp_min(1.0)
++        new_mean = (n * mean + increment_n * increment_mean) / safe_new_n
++        new_mean = torch.where(new_n == 0, 0.0, new_mean)
++
++        new_var = (
++            n * std.square()
++            + increment_n * increment_std.square()
++            + n * (mean - new_mean).square()
++            + increment_n * (increment_mean - new_mean).square()
++        ) / safe_new_n
++        new_var = torch.where(new_n == 0, 0.0, new_var)
++        new_std = torch.sqrt(new_var.clamp_min(0.0))
++        return new_n, new_mean, new_std
++
++    def _prepare_timesfm_batch(
++        self, values: torch.Tensor, valid_mask: torch.Tensor, patch_cnt: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        r"""Left-pad, patch, and normalize a variable-length ChatTS batch."""
++        batch_size = values.size(0)
++        max_patch_cnt = int(patch_cnt.max().item())
++        padded_length = max_patch_cnt * self.patch_size
++        padded_values = torch.zeros(batch_size, padded_length, device=values.device, dtype=torch.float32)
++        padded_mask = torch.ones(batch_size, padded_length, device=values.device, dtype=torch.bool)
++
++        for index in range(batch_size):
++            series_values = values[index][valid_mask[index]].to(torch.float32)
++            series_length = series_values.numel()
++            if series_length == 0:
++                continue
++
++            left_padding = padded_length - series_length
++            padded_values[index, left_padding:] = series_values
++            padded_mask[index, left_padding:] = False
++
++        patched_values = padded_values.reshape(batch_size, max_patch_cnt, self.patch_size)
++        patched_mask = padded_mask.reshape(batch_size, max_patch_cnt, self.patch_size)
++
++        n = torch.zeros(batch_size, device=values.device, dtype=torch.float32)
++        mean = torch.zeros_like(n)
++        std = torch.zeros_like(n)
++        running_means = []
++        running_stds = []
++        for patch_index in range(max_patch_cnt):
++            n, mean, std = self._update_running_stats(
++                n,
++                mean,
++                std,
++                patched_values[:, patch_index],
++                patched_mask[:, patch_index],
++            )
++            running_means.append(mean)
++            running_stds.append(std)
++
++        cumulative_mean = torch.stack(running_means, dim=1).unsqueeze(-1)
++        cumulative_std = torch.stack(running_stds, dim=1).unsqueeze(-1)
++        safe_std = torch.where(cumulative_std < TIMESFM2_5_NORM_EPSILON, 1.0, cumulative_std)
++        normalized_values = (patched_values - cumulative_mean) / safe_std
++        normalized_values = normalized_values.masked_fill(patched_mask, 0.0)
++        return normalized_values, patched_mask
++
++    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        batch_size = x.size(0)
++        x = x.reshape(batch_size, -1, self.num_features)
++        values = x[:, :, 0]
++        valid_mask = x[:, :, -1] > CHATTS_VALID_MASK_THRESHOLD
++        valid_lengths = valid_mask.sum(dim=1, dtype=torch.long)
++
++        if torch.any(valid_lengths == 0):
++            raise ValueError("TimesFM 2.5 received an empty time series; every `<ts>` input must contain data.")
++
++        if torch.any(valid_lengths > self.context_limit):
++            longest = int(valid_lengths.max().item())
++            raise ValueError(
++                f"TimesFM 2.5 supports at most {self.context_limit} input points, but received {longest}."
++            )
++
++        patch_cnt = (valid_lengths + self.patch_size - 1) // self.patch_size
++        normalized_values, padding_mask = self._prepare_timesfm_batch(values, valid_mask, patch_cnt)
++
++        backbone = self._get_backbone(x.device)
++        autocast_context = (
++            torch.autocast(device_type="cuda", enabled=False) if x.device.type == "cuda" else nullcontext()
++        )
++        with torch.no_grad(), autocast_context:
++            (model_outputs, _) = backbone(normalized_values, padding_mask)
++            output_embeddings = model_outputs[1]
++
++        unpadded_embeddings = []
++        for index, count in enumerate(patch_cnt.tolist()):
++            unpadded_embeddings.append(output_embeddings[index, -count:])
++
++        timesfm_features = torch.cat(unpadded_embeddings, dim=0)
++        projector_param = next(self.projector.parameters())
++        timesfm_features = timesfm_features.to(device=projector_param.device, dtype=projector_param.dtype)
++        return self.projector(timesfm_features), patch_cnt
++
++
++def _resolve_encoder_type(config: Any, model_args: ModelArguments) -> str:
++    requested = model_args.ts_encoder_type
++    if requested != "auto":
++        return requested
++
++    return getattr(config, "ts_encoder_type", "native")
++
++
++def _load_weight_file(path: str) -> dict[str, torch.Tensor]:
++    if path.endswith(".safetensors"):
++        from safetensors.torch import load_file
++
++        return load_file(path, device="cpu")
++
++    return torch.load(path, map_location="cpu", weights_only=True)
++
++
++def _find_projector_weight_files(model_path: str) -> list[str]:
++    if not os.path.isdir(model_path):
++        return []
++
++    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
++        index_path = os.path.join(model_path, index_name)
++        if not os.path.isfile(index_path):
++            continue
++
++        with open(index_path, encoding="utf-8") as index_file:
++            weight_map = json.load(index_file).get("weight_map", {})
++
++        shard_names = {shard_name for key, shard_name in weight_map.items() if key.startswith(_PROJECTOR_PREFIX)}
++        return [os.path.join(model_path, shard_name) for shard_name in sorted(shard_names)]
++
++    for weight_name in ("model.safetensors", "pytorch_model.bin"):
++        weight_path = os.path.join(model_path, weight_name)
++        if os.path.isfile(weight_path):
++            return [weight_path]
++
++    return []
++
++
++def _load_projector_from_checkpoint(encoder: TimesFM2_5TimeSeriesEncoder, model_path: str) -> bool:
++    projector_state: dict[str, torch.Tensor] = {}
++    for weight_path in _find_projector_weight_files(model_path):
++        state = _load_weight_file(weight_path)
++        for key, value in state.items():
++            if key.startswith(_PROJECTOR_PREFIX):
++                projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = value
++
++    if not projector_state:
++        return False
++
++    incompatible = encoder.projector.load_state_dict(projector_state, strict=False)
++    if incompatible.missing_keys or incompatible.unexpected_keys:
++        raise ValueError(
++            "Incomplete TimesFM projector checkpoint: "
++            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}."
++        )
++
++    logger.info_rank0("Loaded TimesFM 2.5 projector weights from `%s`.", model_path)
++    return True
++
++
++def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, model_args: ModelArguments) -> None:
++    encoder_type = _resolve_encoder_type(config, model_args)
++    if encoder_type == "native":
++        return
++    if encoder_type != TIMESFM2_5_ENCODER:
++        raise ValueError(f"Unsupported time-series encoder type: {encoder_type}.")
++    if not hasattr(model, "ts_encoder"):
++        raise ValueError("The selected model does not expose a `ts_encoder` module.")
++    if model_args.use_unsloth:
++        raise ValueError("TimesFM 2.5 encoder replacement is not supported with Unsloth.")
++
++    ts_config = getattr(config, "ts", {}) or {}
++    timesfm_model_name_or_path = model_args.timesfm_model_name_or_path
++    if model_args.ts_encoder_type == "auto":
++        timesfm_model_name_or_path = getattr(config, "timesfm_model_name_or_path", timesfm_model_name_or_path)
++
++    encoder = TimesFM2_5TimeSeriesEncoder(
++        llm_hidden_size=config.hidden_size,
++        model_name_or_path=timesfm_model_name_or_path,
++        num_features=int(ts_config.get("num_features", 2)),
++    )
++
++    reference_weight = model.get_input_embeddings().weight
++    encoder.projector.to(device=reference_weight.device, dtype=reference_weight.dtype)
++    model.ts_encoder = encoder
++
++    config.ts_encoder_type = TIMESFM2_5_ENCODER
++    config.timesfm_model_name_or_path = timesfm_model_name_or_path
++    config.timesfm_hidden_size = TIMESFM2_5_HIDDEN_SIZE
++    if not hasattr(config, "ts") or config.ts is None:
++        config.ts = {}
++    config.ts["patch_size"] = TIMESFM2_5_PATCH_SIZE
++
++    restored = _load_projector_from_checkpoint(encoder, model_args.model_name_or_path)
++    if getattr(config, "ts_encoder_type", None) == TIMESFM2_5_ENCODER and not restored:
++        logger.info_rank0("Initialized a new TimesFM 2.5 TS-to-text projector.")
++
++    logger.info_rank0(
++        "Replaced ChatTS native encoder with frozen TimesFM 2.5 (%s); trainable projector: 1280 -> %d.",
++        timesfm_model_name_or_path,
++        config.hidden_size,
++    )
+diff --git a/tests/model/test_timesfm2_5.py b/tests/model/test_timesfm2_5.py
+new file mode 100644
+index 0000000..c394b17
+--- /dev/null
++++ b/tests/model/test_timesfm2_5.py
+@@ -0,0 +1,140 @@
++from types import SimpleNamespace
++
++import torch
++from safetensors.torch import save_file
++from torch import nn
++
++from llamafactory.model.model_utils.timeseries import patch_timeseries_modules_for_lora
++from llamafactory.model.model_utils.timesfm2_5 import (
++    TimesFM2_5TimeSeriesEncoder,
++    maybe_replace_with_timesfm2_5_encoder,
++)
++
++
++class _FakeTimesFMBackbone(nn.Module):
++    def __init__(self) -> None:
++        super().__init__()
++        self.frozen_weight = nn.Parameter(torch.ones(1))
++
++    def forward(self, values: torch.Tensor, masks: torch.Tensor):
++        patch_signal = values.mean(dim=-1, keepdim=True)
++        output_embeddings = patch_signal.expand(-1, -1, 1280).contiguous()
++        outputs = (output_embeddings, output_embeddings, values, values)
++        return outputs, []
++
++
++def _make_chatts_input(lengths: list[int]) -> torch.Tensor:
++    max_length = max(lengths)
++    encoded = []
++    for length in lengths:
++        values = torch.arange(max_length, dtype=torch.float32)
++        mask = torch.zeros(max_length, dtype=torch.float32)
++        mask[:length] = 1.0
++        encoded.append(torch.stack([values, mask], dim=-1).reshape(-1, 1))
++    return torch.stack(encoded)
++
++
++class _DummyChatTS(nn.Module):
++    def __init__(self, hidden_size: int = 64) -> None:
++        super().__init__()
++        self.ts_encoder = nn.Linear(2, hidden_size)
++        self.embed = nn.Embedding(8, hidden_size)
++        self.config = SimpleNamespace(model_type="qwen3ts")
++
++    def get_input_embeddings(self) -> nn.Embedding:
++        return self.embed
++
++
++def test_timesfm_encoder_preserves_chatts_contract(monkeypatch) -> None:
++    encoder = TimesFM2_5TimeSeriesEncoder(
++        llm_hidden_size=64,
++        model_name_or_path="fake/timesfm",
++    )
++    fake_wrapper = SimpleNamespace(model=_FakeTimesFMBackbone())
++    monkeypatch.setattr(encoder, "_load_timesfm", lambda: fake_wrapper)
++
++    features, patch_cnt = encoder(_make_chatts_input([40, 65]))
++
++    assert patch_cnt.tolist() == [2, 3]
++    assert features.shape == (5, 64)
++    assert torch.isfinite(features).all()
++    assert not fake_wrapper.model.training
++    assert all(not param.requires_grad for param in fake_wrapper.model.parameters())
++
++
++def test_timesfm_backbone_is_not_serialized(monkeypatch) -> None:
++    encoder = TimesFM2_5TimeSeriesEncoder(
++        llm_hidden_size=32,
++        model_name_or_path="fake/timesfm",
++    )
++    fake_wrapper = SimpleNamespace(model=_FakeTimesFMBackbone())
++    monkeypatch.setattr(encoder, "_load_timesfm", lambda: fake_wrapper)
++    encoder(_make_chatts_input([32]))
++
++    state_keys = list(encoder.state_dict())
++    assert state_keys
++    assert all(key.startswith("projector.") for key in state_keys)
++    assert not any("frozen_weight" in key for key in state_keys)
++
++
++def test_timesfm_encoder_rejects_overlong_series() -> None:
++    encoder = TimesFM2_5TimeSeriesEncoder(
++        llm_hidden_size=32,
++        model_name_or_path="fake/timesfm",
++        context_limit=32,
++    )
++
++    try:
++        encoder(_make_chatts_input([33]))
++    except ValueError as exc:
++        assert "at most 32" in str(exc)
++    else:
++        raise AssertionError("Expected an overlong TimesFM input to fail.")
++
++
++def test_timesfm_projector_stays_fully_trainable_with_lora() -> None:
++    model = _DummyChatTS()
++    model.ts_encoder = TimesFM2_5TimeSeriesEncoder(64, "fake/timesfm")
++    finetuning_args = SimpleNamespace(train_timeseries_modules=True, additional_target=None)
++
++    targets = patch_timeseries_modules_for_lora(
++        model,
++        finetuning_args,
++        ["q_proj", "linear_in", "linear_out"],
++    )
++
++    assert targets == ["q_proj"]
++    assert finetuning_args.additional_target == ["ts_encoder.projector"]
++
++
++def test_timesfm_projector_restores_for_stage_two(tmp_path) -> None:
++    source_encoder = TimesFM2_5TimeSeriesEncoder(64, "saved/timesfm")
++    for parameter in source_encoder.projector.parameters():
++        nn.init.constant_(parameter, 0.125)
++
++    checkpoint = {f"ts_encoder.{key}": value for key, value in source_encoder.state_dict().items()}
++    save_file(checkpoint, tmp_path / "model.safetensors")
++
++    model = _DummyChatTS()
++    config = SimpleNamespace(
++        hidden_size=64,
++        model_type="qwen3ts",
++        ts={"num_features": 2, "patch_size": 8},
++        ts_encoder_type="timesfm2_5",
++        timesfm_model_name_or_path="saved/timesfm",
++    )
++    model_args = SimpleNamespace(
++        ts_encoder_type="auto",
++        timesfm_model_name_or_path="wrong/default",
++        model_name_or_path=str(tmp_path),
++        use_unsloth=False,
++    )
++
++    maybe_replace_with_timesfm2_5_encoder(model, config, model_args)
++
++    assert model.ts_encoder.model_name_or_path == "saved/timesfm"
++    assert config.ts["patch_size"] == 32
++    assert all(
++        torch.allclose(parameter, torch.full_like(parameter, 0.125))
++        for parameter in model.ts_encoder.projector.parameters()
++    )
+-- 
+2.50.1 (Apple Git-155)
+
