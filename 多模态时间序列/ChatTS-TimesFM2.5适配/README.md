@@ -37,6 +37,7 @@ ChatTS [scaled_value, valid_mask]
 ## 目录内容
 
 - [完整 Git 补丁](./0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch)。
+- [`direct-files/`](./direct-files/)：保持 ChatTS-Training 相对路径的完整修改文件，可直接复制到服务器。
 - 补丁基线：ChatTS-Training `bf30699`。
 - 补丁实现提交：`9e24561`。
 - SHA-256：`60d3878a0f36e3e94b053894a0e64e10cbb4c9b6449b285869162e6c668a01b8`。
@@ -49,6 +50,28 @@ ChatTS [scaled_value, valid_mask]
 4. Full SFT 与 LoRA 的时间序列模块处理。
 5. 两阶段训练脚本和单元测试。
 6. `timesfm[torch]>=2.0.2` 可选依赖与 README 使用说明。
+
+## 直接复制修改文件
+
+如果服务器上的 ChatTS-Training 基于 `bf30699`，下载本目录后可以直接覆盖：
+
+```bash
+rsync -av direct-files/ /path/to/ChatTS-Training/
+```
+
+直接文件包括：
+
+- [`setup.py`](./direct-files/setup.py)
+- [`model_args.py`](./direct-files/src/llamafactory/hparams/model_args.py)
+- [`loader.py`](./direct-files/src/llamafactory/model/loader.py)
+- [`timeseries.py`](./direct-files/src/llamafactory/model/model_utils/timeseries.py)
+- [`timesfm2_5.py`](./direct-files/src/llamafactory/model/model_utils/timesfm2_5.py)
+- [`test_timesfm2_5.py`](./direct-files/tests/model/test_timesfm2_5.py)
+- [`train_timesfm2_5_stage1.sh`](./direct-files/scripts/full/train_timesfm2_5_stage1.sh)
+- [`train_timesfm2_5_stage2.sh`](./direct-files/scripts/full/train_timesfm2_5_stage2.sh)
+
+其中 `timesfm2_5.py` 是新增文件，其余 Python 文件包含基于 `bf30699` 的完整修改后内容。
+如果服务器版本较新或已有本地改动，不建议直接覆盖，应使用下方 Git 补丁进行三方合并。
 
 ## 应用补丁
 
