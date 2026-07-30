@@ -1,0 +1,18 @@
+{
+  "stage_1_120K": {
+    "file_name": "data/alignment/align_120K.jsonl",
+    "columns": {
+      "prompt": "input",
+      "response": "output",
+      "timeseries": "timeseries"
+    }
+  },
+  "stage_2_30K": {
+    "file_name": "data/finetuning/sft-30K.jsonl",
+    "columns": {
+      "prompt": "input",
+      "response": "output",
+      "timeseries": "timeseries"
+    }
+  }
+}

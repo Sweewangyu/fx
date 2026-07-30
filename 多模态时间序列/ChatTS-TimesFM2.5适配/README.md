@@ -36,11 +36,14 @@ ChatTS [scaled_value, valid_mask]
 
 ## 目录内容
 
-- [完整 Git 补丁](./0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch)。
+- [基础实现补丁](./0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch)。
+- [TS-Reasoner 训练配置修正补丁](./0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch)。
 - [`direct-files/`](./direct-files/)：保持 ChatTS-Training 相对路径的完整修改文件，可直接复制到服务器。
 - 补丁基线：ChatTS-Training `bf30699`。
-- 补丁实现提交：`9e24561`。
-- SHA-256：`60d3878a0f36e3e94b053894a0e64e10cbb4c9b6449b285869162e6c668a01b8`。
+- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`。
+- SHA-256：
+  - `0001`：`60d3878a0f36e3e94b053894a0e64e10cbb4c9b6449b285869162e6c668a01b8`
+  - `0002`：`1017284f4d1e94021eb10fa0089798f808628598c25dd0ed2a981b9a03e5425e`
 
 补丁包含：
 
@@ -62,7 +65,9 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 直接文件包括：
 
 - [`setup.py`](./direct-files/setup.py)
+- [`dataset_info.ts_reasoner.json`](./direct-files/data/dataset_info.ts_reasoner.json)
 - [`model_args.py`](./direct-files/src/llamafactory/hparams/model_args.py)
+- [`finetuning_args.py`](./direct-files/src/llamafactory/hparams/finetuning_args.py)
 - [`loader.py`](./direct-files/src/llamafactory/model/loader.py)
 - [`timeseries.py`](./direct-files/src/llamafactory/model/model_utils/timeseries.py)
 - [`timesfm2_5.py`](./direct-files/src/llamafactory/model/model_utils/timesfm2_5.py)
@@ -82,6 +87,7 @@ git clone https://github.com/xiezhe-24/ChatTS-Training.git
 cd ChatTS-Training
 git checkout bf30699
 git am "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
+git am "/path/to/0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch"
 ```
 
 如果你的 ChatTS-Training 已经包含后续提交，可以新建分支后尝试三方合并：
@@ -89,6 +95,7 @@ git am "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
 ```bash
 git switch -c timesfm2.5-adapter
 git am -3 "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
+git am -3 "/path/to/0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch"
 ```
 
 ## 安装与训练
@@ -107,18 +114,50 @@ bash scripts/full/train_timesfm2_5_stage1.sh
 bash scripts/full/train_timesfm2_5_stage2.sh
 ```
 
-默认起始超参数：
+当前脚本已按 TS-Reasoner 论文 Table 4 对齐：
 
-| 阶段 | LLM LR | Projector LR | 训练步数 |
-|---|---:|---:|---:|
-| Stage 1 alignment | `1e-5` | `1e-4` | 1000 |
-| Stage 2 SFT | `1e-5` | `3e-5` | 400 |
+| 阶段 | 数据 | 可训练模块 | 冻结模块 | 全局 Batch | 学习率 | Epoch |
+|---|---|---|---|---:|---:|---:|
+| Stage 1 alignment | 120K captions | 完整 LLM + projector | TimesFM | 64 | `1e-5` | 1 |
+| Stage 2 SFT | 30K instructions | 完整 LLM + projector | TimesFM | 32 | `2e-5` | 2 |
 
-这些是用于首次实验的起点，不是已经验证的最优超参数。
+这里有一个容易误解但很重要的事实：TS-Reasoner 并不是“Stage 1 只训练 projector，
+Stage 2 再训练 LLM”。论文 §3.2 明确写 LLM 在两个阶段都保持可训练，Table 4 也报告两个阶段
+均有约 7.3B 可训练参数。两阶段始终冻结的是 TimesFM。
+
+因此脚本中的 `--finetuning_type full` 是有意保留的：`full` 只会更新 ChatTS LLM 和
+`ts_encoder.projector`；外部 TimesFM 在代码中通过 `requires_grad_(False)` 和
+`torch.no_grad()` 双重冻结。
+
+`--timeseries_sft_lr` 是可选参数。在 TimesFM 2.5 架构下，它只控制两层 TS-to-text
+projector 的学习率，不是 TimesFM 20 层主干的学习率。当前复现脚本不设置它，让 projector
+与 LLM 共用论文给出的全局学习率。
+
+论文和官方 shell 在 Stage 2 的 batch size 上存在一处不一致：论文 Table 4 报告 32，
+而官方脚本按 8 卡 × 单卡 1 × 梯度累积 8 实际为 64。本目录脚本以论文表格为准，
+Stage 2 使用梯度累积 4。
+
+使用脚本前，请把
+[`data/dataset_info.ts_reasoner.json`](./direct-files/data/dataset_info.ts_reasoner.json)
+中的条目合并进服务器的 `data/dataset_info.json`。内容如下：
+
+```json
+{
+  "stage_1_120K": {
+    "file_name": "data/alignment/align_120K.jsonl",
+    "columns": {"prompt": "input", "response": "output", "timeseries": "timeseries"}
+  },
+  "stage_2_30K": {
+    "file_name": "data/finetuning/sft-30K.jsonl",
+    "columns": {"prompt": "input", "response": "output", "timeseries": "timeseries"}
+  }
+}
+```
 
 ## 重要行为
 
 - TimesFM 主干始终冻结，并保持 FP32；每个训练进程额外占用约 0.8 GB 权重显存。
+- Stage 1 与 Stage 2 均训练完整 LLM 和两层 projector；这与 TS-Reasoner 原论文一致。
 - TimesFM 权重不写入 ChatTS checkpoint，避免每个 checkpoint 重复保存约 200M 参数。
 - 原 ChatTS MLP encoder 权重不能迁移，需要重新运行 Stage 1 对齐 projector。
 - Stage 1 会写入 `ts_encoder_type=timesfm2_5`，Stage 2 使用 `auto` 自动恢复架构和模型路径。
