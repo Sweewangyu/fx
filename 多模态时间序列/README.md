@@ -2,12 +2,14 @@
 
 本目录收录时间序列与大语言模型、多模态问答及跨模态编码相关的调研与设计材料。
 
-## ChatTS × TimesFM 2.5 适配实现
+## ChatTS × TimesFM 2.5 / Chronos-2 / ZEUS 适配实现
 
 基于 TS-Reasoner 的“冻结时间序列基础模型 + 可训练 projector + 两阶段训练”思路，
-将 ChatTS 原生 MLP-Patch 编码器替换为 `google/timesfm-2.5-200m-pytorch`。
+将 ChatTS 原生 MLP-Patch 编码器替换为 `google/timesfm-2.5-200m-pytorch`、
+`amazon/chronos-2` 或 `GestaltCog/zeus`。目录包含连续 Git 补丁、可直接覆盖到服务器的
+完整 `.py` 文件和每种 backbone 的 Stage 1 / Stage 2 脚本。
 
-- [适配说明、完整 Git 补丁与训练方法](./ChatTS-TimesFM2.5适配/README.md)
+- [三种 backbone 的适配说明、完整 Git 补丁、直接文件与训练方法](./ChatTS-TimesFM2.5适配/README.md)
 
 ## ChatTS Time Encoder 架构更新调研
 

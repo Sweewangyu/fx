@@ -34,7 +34,7 @@ from .adapter import init_adapter
 from .model_utils.liger_kernel import apply_liger_kernel
 from .model_utils.misc import register_autoclass
 from .model_utils.mod import convert_pretrained_model_to_mod, load_mod_pretrained_model
-from .model_utils.timesfm2_5 import maybe_replace_with_timesfm2_5_encoder
+from .model_utils.timeseries_backbones import maybe_replace_timeseries_encoder
 from .model_utils.unsloth import load_unsloth_pretrained_model
 from .model_utils.valuehead import load_valuehead_params
 from .patcher import patch_config, patch_model, patch_processor, patch_tokenizer, patch_valuehead_model
@@ -179,7 +179,7 @@ def load_model(
             model = convert_pretrained_model_to_mod(model, config, model_args)
 
     if not lazy_load:
-        maybe_replace_with_timesfm2_5_encoder(model, config, model_args)
+        maybe_replace_timeseries_encoder(model, config, model_args)
         patch_model(model, tokenizer, model_args, is_trainable, add_valuehead)
         register_autoclass(config, model, tokenizer)
 

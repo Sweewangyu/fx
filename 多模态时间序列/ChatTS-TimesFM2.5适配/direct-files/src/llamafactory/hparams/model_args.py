@@ -36,18 +36,27 @@ class BaseModelArguments:
             "help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."
         },
     )
-    ts_encoder_type: Literal["auto", "native", "timesfm2_5"] = field(
+    ts_encoder_type: Literal["auto", "native", "timesfm2_5", "chronos2", "zeus"] = field(
         default="auto",
         metadata={
             "help": (
                 "Time-series encoder architecture. `auto` restores the architecture recorded in the model config, "
-                "`native` keeps ChatTS' MLP encoder, and `timesfm2_5` uses a frozen TimesFM 2.5 backbone."
+                "`native` keeps ChatTS' MLP encoder; `timesfm2_5`, `chronos2`, and `zeus` use a frozen "
+                "time-series foundation-model backbone."
             )
         },
     )
     timesfm_model_name_or_path: str = field(
         default="google/timesfm-2.5-200m-pytorch",
         metadata={"help": "Hugging Face model ID or local path for the frozen TimesFM 2.5 PyTorch checkpoint."},
+    )
+    chronos2_model_name_or_path: str = field(
+        default="amazon/chronos-2",
+        metadata={"help": "Hugging Face model ID or local path for the frozen Chronos-2 checkpoint."},
+    )
+    zeus_model_name_or_path: str = field(
+        default="GestaltCog/zeus",
+        metadata={"help": "Hugging Face model ID or local path for the frozen Zeus checkpoint."},
     )
     adapter_name_or_path: Optional[str] = field(
         default=None,

@@ -44,13 +44,13 @@ CHATTS_VALID_MASK_THRESHOLD = 0.5
 _PROJECTOR_PREFIX = "ts_encoder.projector."
 
 
-class TimesFMProjector(nn.Module):
-    r"""Map TimesFM patch embeddings into the language-model hidden space."""
+class ExternalTimeSeriesProjector(nn.Module):
+    r"""Map frozen backbone embeddings into the language-model hidden space."""
 
-    def __init__(self, llm_hidden_size: int) -> None:
+    def __init__(self, input_hidden_size: int, llm_hidden_size: int) -> None:
         super().__init__()
-        self.input_norm = nn.LayerNorm(TIMESFM2_5_HIDDEN_SIZE)
-        self.linear_in = nn.Linear(TIMESFM2_5_HIDDEN_SIZE, llm_hidden_size)
+        self.input_norm = nn.LayerNorm(input_hidden_size)
+        self.linear_in = nn.Linear(input_hidden_size, llm_hidden_size)
         self.activation = nn.GELU()
         self.linear_out = nn.Linear(llm_hidden_size, llm_hidden_size)
         self.output_norm = nn.LayerNorm(llm_hidden_size)
@@ -69,6 +69,13 @@ class TimesFMProjector(nn.Module):
         features = self.activation(features)
         features = self.linear_out(features)
         return self.output_norm(features)
+
+
+class TimesFMProjector(ExternalTimeSeriesProjector):
+    r"""Backward-compatible TimesFM 2.5 projector."""
+
+    def __init__(self, llm_hidden_size: int) -> None:
+        super().__init__(TIMESFM2_5_HIDDEN_SIZE, llm_hidden_size)
 
 
 class TimesFM2_5TimeSeriesEncoder(nn.Module):
@@ -301,7 +308,9 @@ def _find_projector_weight_files(model_path: str) -> list[str]:
     return []
 
 
-def _load_projector_from_checkpoint(encoder: TimesFM2_5TimeSeriesEncoder, model_path: str) -> bool:
+def load_external_projector_from_checkpoint(
+    encoder: nn.Module, model_path: str, encoder_name: str = "external time-series"
+) -> bool:
     projector_state: dict[str, torch.Tensor] = {}
     for weight_path in _find_projector_weight_files(model_path):
         state = _load_weight_file(weight_path)
@@ -315,15 +324,21 @@ def _load_projector_from_checkpoint(encoder: TimesFM2_5TimeSeriesEncoder, model_
     incompatible = encoder.projector.load_state_dict(projector_state, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise ValueError(
-            "Incomplete TimesFM projector checkpoint: "
+            f"Incomplete {encoder_name} projector checkpoint: "
             f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}."
         )
 
-    logger.info_rank0("Loaded TimesFM 2.5 projector weights from `%s`.", model_path)
+    logger.info_rank0("Loaded %s projector weights from `%s`.", encoder_name, model_path)
     return True
 
 
+def _load_projector_from_checkpoint(encoder: nn.Module, model_path: str) -> bool:
+    r"""Compatibility alias used by older integrations and tests."""
+    return load_external_projector_from_checkpoint(encoder, model_path, "TimesFM 2.5")
+
+
 def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, model_args: ModelArguments) -> None:
+    checkpoint_encoder_type = getattr(config, "ts_encoder_type", "native")
     encoder_type = _resolve_encoder_type(config, model_args)
     if encoder_type == "native":
         return
@@ -356,7 +371,9 @@ def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, m
         config.ts = {}
     config.ts["patch_size"] = TIMESFM2_5_PATCH_SIZE
 
-    restored = _load_projector_from_checkpoint(encoder, model_args.model_name_or_path)
+    restored = False
+    if checkpoint_encoder_type == TIMESFM2_5_ENCODER:
+        restored = _load_projector_from_checkpoint(encoder, model_args.model_name_or_path)
     if getattr(config, "ts_encoder_type", None) == TIMESFM2_5_ENCODER and not restored:
         logger.info_rank0("Initialized a new TimesFM 2.5 TS-to-text projector.")
 

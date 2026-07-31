@@ -71,6 +71,10 @@ extra_require = {
     "openmind": ["openmind"],
     "swanlab": ["swanlab"],
     "timesfm": ["timesfm[torch]>=2.0.2"],
+    "chronos2": ["chronos-forecasting==2.3.1"],
+    # Zeus is loaded through the local eager-attention compatibility module,
+    # avoiding BasicTS' incompatible Transformers pin and FlashAttention import.
+    "zeus": [],
     "dev": ["pre-commit", "ruff", "pytest", "build"],
 }
 
