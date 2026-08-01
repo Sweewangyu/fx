@@ -34,13 +34,15 @@ Chronos-2 输出 `ceil(L / 16)` 个。
 - [基础实现补丁](./0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch)。
 - [TS-Reasoner 训练配置修正补丁](./0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch)。
 - [ZEUS 与 Chronos-2 扩展补丁](./0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch)。
+- [单阶段混合训练补丁](./0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch)。
 - [`direct-files/`](./direct-files/)：保持 ChatTS-Training 相对路径的完整修改文件，可直接复制到服务器。
 - 补丁基线：ChatTS-Training `bf30699`。
-- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`。
+- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`；单阶段脚本提交：`4e0838e`。
 - SHA-256：
   - `0001`：`60d3878a0f36e3e94b053894a0e64e10cbb4c9b6449b285869162e6c668a01b8`
   - `0002`：`1017284f4d1e94021eb10fa0089798f808628598c25dd0ed2a981b9a03e5425e`
   - `0003`：`a36216f285ed721df20050fb898eec23ab0b759983748650f2d005f24030d5c3`
+  - `0004`：`46409109495226a7c6b90bea5a1c96437fe9124070925d783a63751296f831d1`
 
 补丁包含：
 
@@ -78,6 +80,7 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [`test_external_ts_backbones.py`](./direct-files/tests/model/test_external_ts_backbones.py)
 - [`train_timesfm2_5_stage1.sh`](./direct-files/scripts/full/train_timesfm2_5_stage1.sh)
 - [`train_timesfm2_5_stage2.sh`](./direct-files/scripts/full/train_timesfm2_5_stage2.sh)
+- [`train_timesfm2_5_one_stage.sh`](./direct-files/scripts/full/train_timesfm2_5_one_stage.sh)
 - [`train_chronos2_stage1.sh`](./direct-files/scripts/full/train_chronos2_stage1.sh)
 - [`train_chronos2_stage2.sh`](./direct-files/scripts/full/train_chronos2_stage2.sh)
 - [`train_zeus_stage1.sh`](./direct-files/scripts/full/train_zeus_stage1.sh)
@@ -138,6 +141,9 @@ pip install -e ".[zeus,deepspeed]"
 bash scripts/full/train_timesfm2_5_stage1.sh
 bash scripts/full/train_timesfm2_5_stage2.sh
 
+# 或将两阶段合成一次混合 SFT
+bash scripts/full/train_timesfm2_5_one_stage.sh
+
 # 或改用 Chronos-2
 bash scripts/full/train_chronos2_stage1.sh
 bash scripts/full/train_chronos2_stage2.sh
@@ -174,6 +180,30 @@ TS-to-text projector 的学习率，不是 TimesFM、Chronos-2 或 ZEUS 主干�
 论文和官方 shell 在 Stage 2 的 batch size 上存在一处不一致：论文 Table 4 报告 32，
 而官方脚本按 8 卡 × 单卡 1 × 梯度累积 8 实际为 64。本目录脚本以论文表格为准，
 Stage 2 使用梯度累积 4。
+
+### 合并为一个训练阶段
+
+`train_timesfm2_5_one_stage.sh` 使用：
+
+```bash
+--dataset "stage_1_120K,stage_2_30K" \
+--mix_strategy "interleave_over" \
+--interleave_probs "0.6667,0.3333"
+```
+
+这里的 `interleave_probs` 表示“下一条样本从各数据集抽取的概率”，顺序与
+`--dataset` 一一对应；它不是 loss 权重，也不直接等于 epoch 数。
+`interleave_over` 要等所有数据集都至少用完一次才停止，因此对 120K/30K 数据使用
+`2/3,1/3` 时，实际暴露量约为 alignment 120K 一遍、instruction 30K 两遍。
+
+如果你只想让两份数据各训练一遍，更简单的写法是：
+
+```bash
+--dataset "stage_1_120K,stage_2_30K" \
+--mix_strategy "concat"
+```
+
+此时删掉 `--interleave_probs`，数据的自然比例就是 `120K:30K = 0.8:0.2`。
 
 使用脚本前，请把
 [`data/dataset_info.ts_reasoner.json`](./direct-files/data/dataset_info.ts_reasoner.json)
