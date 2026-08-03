@@ -33,12 +33,13 @@ NUM_GPUS_PER_PROCESS="${NUM_GPUS_PER_PROCESS:-2}"
 EVAL_WORKERS="${EVAL_WORKERS:-8}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# Optional architecture override. Leave empty to auto-detect each checkpoint
-# from config metadata first, then from ts_encoder MLP/projector weight shapes.
+# Optional fallback for a 768-d external projector that cannot be distinguished
+# as Chronos-2 or Zeus from weight shapes alone. Unambiguous native MLP and
+# TimesFM checkpoints are always resolved from their own weights per model.
 # Supported values: native, timesfm2_5, chronos2, zeus.
 # CHATTS_TS_ENCODER_TYPE is accepted too, so either of these one-shot commands works:
-#   TS_ENCODER_TYPE=timesfm2_5 bash run_chatts_no_ragas_batch.sh
-#   CHATTS_TS_ENCODER_TYPE=timesfm2_5 bash run_chatts_no_ragas_batch.sh
+#   TS_ENCODER_TYPE=chronos2 bash run_chatts_no_ragas_batch.sh
+#   CHATTS_TS_ENCODER_TYPE=chronos2 bash run_chatts_no_ragas_batch.sh
 TS_ENCODER_TYPE="${TS_ENCODER_TYPE:-${CHATTS_TS_ENCODER_TYPE:-}}"
 
 # Optional shared local backbone directories/files. Frozen backbone weights are
@@ -116,7 +117,7 @@ echo " Project:   $PROJECT_ROOT"
 echo " Search:    $SEARCH_DIR"
 echo " Found ${#MODEL_DIRS[@]} model(s): ${MODEL_DIRS[*]}"
 if [[ -n "$TS_ENCODER_TYPE" ]]; then
-    echo " TS encoder override: $TS_ENCODER_TYPE"
+    echo " TS encoder fallback for ambiguous checkpoints: $TS_ENCODER_TYPE"
 else
     echo " TS encoder: auto-detect from config and checkpoint weights"
 fi
@@ -141,8 +142,9 @@ trap restore_source EXIT INT TERM
 
 detect_encoder_type_from_checkpoint() {
     local model_checkpoint="$1"
+    local requested_encoder_type="$2"
 
-    "$PYTHON_BIN" - "$model_checkpoint" <<'PY'
+    "$PYTHON_BIN" - "$model_checkpoint" "$requested_encoder_type" <<'PY'
 from __future__ import annotations
 
 import glob
@@ -153,6 +155,7 @@ from collections.abc import Mapping
 
 
 checkpoint = os.path.abspath(sys.argv[1])
+requested = sys.argv[2].strip().lower()
 config_path = os.path.join(checkpoint, "config.json")
 config = {}
 if os.path.isfile(config_path):
@@ -168,12 +171,12 @@ aliases = {
     "timesfm-2.5": "timesfm2_5",
     "chronos-2": "chronos2",
 }
+requested = aliases.get(requested, requested)
 configured = config.get("ts_encoder_type")
 if isinstance(configured, str):
     configured = aliases.get(configured.strip().lower(), configured.strip().lower())
-if configured not in (None, "", "auto"):
-    print(configured)
-    raise SystemExit(0)
+if configured in (None, "", "auto"):
+    configured = None
 
 path_fields = {
     "timesfm2_5": "timesfm_model_name_or_path",
@@ -185,19 +188,12 @@ path_matches = [
     for encoder_type, field in path_fields.items()
     if config.get(field)
 ]
-if len(path_matches) == 1:
-    print(path_matches[0])
-    raise SystemExit(0)
-if len(path_matches) > 1:
-    raise SystemExit(
-        "Cannot auto-detect the TS encoder: config.json contains multiple "
-        f"backbone path fields ({', '.join(path_matches)})."
-    )
-
-
 def relevant_shape(name: str, shape: tuple[int, ...]):
     """Return (kind, input_dim) for an identifying ChatTS tensor."""
-    if "ts_encoder.mlp." in name:
+    if (
+        "ts_encoder.mlp." in name
+        or "ts_encoder.position_embedding." in name
+    ):
         return "native", None
     if "ts_encoder.projector.input_norm.weight" in name and shape:
         return "projector", int(shape[0])
@@ -291,12 +287,40 @@ if native_found and projector_dims:
         "ts_encoder.projector.* weights; refusing to guess."
     )
 if native_found:
+    if requested and requested != "native":
+        print(
+            "Warning: ignoring the requested TS encoder fallback "
+            f"`{requested}` because this checkpoint contains native "
+            "ChatTS MLP weights.",
+            file=sys.stderr,
+        )
     print("native")
     raise SystemExit(0)
 if projector_dims == {1280}:
+    if requested and requested != "timesfm2_5":
+        print(
+            "Warning: ignoring the requested TS encoder fallback "
+            f"`{requested}` because this checkpoint has a 1280-d "
+            "TimesFM projector.",
+            file=sys.stderr,
+        )
     print("timesfm2_5")
     raise SystemExit(0)
 if projector_dims == {768}:
+    if requested in ("chronos2", "zeus"):
+        print(requested)
+        raise SystemExit(0)
+    if requested:
+        raise SystemExit(
+            f"The requested TS encoder `{requested}` conflicts with this "
+            "checkpoint's 768-d external projector. Use chronos2 or zeus."
+        )
+    if configured in ("chronos2", "zeus"):
+        print(configured)
+        raise SystemExit(0)
+    if len(path_matches) == 1 and path_matches[0] in ("chronos2", "zeus"):
+        print(path_matches[0])
+        raise SystemExit(0)
     patch_size = (config.get("ts") or {}).get("patch_size")
     try:
         patch_size = int(patch_size)
@@ -319,9 +343,25 @@ if projector_dims:
         "Unsupported or inconsistent external projector input dimensions: "
         f"{sorted(projector_dims)}."
     )
+if requested:
+    print(requested)
+    raise SystemExit(0)
+if configured:
+    print(configured)
+    raise SystemExit(0)
+if len(path_matches) == 1:
+    print(path_matches[0])
+    raise SystemExit(0)
+if len(path_matches) > 1:
+    raise SystemExit(
+        "Could not identify the TS encoder from checkpoint weights, and "
+        "config.json contains multiple backbone path fields "
+        f"({', '.join(path_matches)})."
+    )
 raise SystemExit(
-    "Could not find identifying ts_encoder.mlp.* or "
-    "ts_encoder.projector.* tensors in the checkpoint."
+    "Could not find identifying ts_encoder.mlp.*, "
+    "ts_encoder.position_embedding.*, or ts_encoder.projector.* tensors "
+    "in the checkpoint."
 )
 PY
 }
@@ -801,17 +841,15 @@ for model_dir in "${MODEL_DIRS[@]}"; do
     echo "  EXP_B:      $EXP_B"
 
     model_failed=0
-    MODEL_TS_ENCODER_TYPE="$TS_ENCODER_TYPE"
-    if [[ "$MODE" != "--score-only" && "$MODE" != "--summary-only" && \
-          -z "$MODEL_TS_ENCODER_TYPE" ]]; then
-        if MODEL_TS_ENCODER_TYPE="$(detect_encoder_type_from_checkpoint "$MODEL_CHECKPOINT")"; then
-            echo "  TS encoder: $MODEL_TS_ENCODER_TYPE (auto-detected)"
+    MODEL_TS_ENCODER_TYPE=""
+    if [[ "$MODE" != "--score-only" && "$MODE" != "--summary-only" ]]; then
+        if MODEL_TS_ENCODER_TYPE="$(detect_encoder_type_from_checkpoint \
+                "$MODEL_CHECKPOINT" "$TS_ENCODER_TYPE")"; then
+            echo "  TS encoder: $MODEL_TS_ENCODER_TYPE (resolved per checkpoint)"
         else
             echo "WARNING: Could not detect TS encoder for $model_dir" >&2
             model_failed=1
         fi
-    elif [[ -n "$MODEL_TS_ENCODER_TYPE" ]]; then
-        echo "  TS encoder: $MODEL_TS_ENCODER_TYPE (manual override)"
     fi
 
     # ---- Inference ----

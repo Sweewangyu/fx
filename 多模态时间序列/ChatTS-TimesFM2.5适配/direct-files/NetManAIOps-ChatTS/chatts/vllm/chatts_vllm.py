@@ -966,11 +966,14 @@ def validate_time_series_checkpoint_weights(
                 "size to the checkpoint config.json, or launch with "
                 f"`{TS_ENCODER_TYPE_ENV}=timesfm2_5|chronos2|zeus`."
             )
-        if not native_selected and name.startswith("ts_encoder.mlp."):
+        if not native_selected and name.startswith(
+            ("ts_encoder.mlp.", "ts_encoder.position_embedding.")
+        ):
             raise ValueError(
-                "The checkpoint contains native ChatTS MLP weights, but an external "
-                f"encoder was selected. Unset `{TS_ENCODER_TYPE_ENV}` or set it to "
-                "`native`, and verify config.json."
+                "The checkpoint contains native ChatTS MLP weights "
+                f"(`{name}`), but an external encoder was selected. Unset "
+                f"`{TS_ENCODER_TYPE_ENV}` or set it to `native`, and verify "
+                "config.json."
             )
         yield name, tensor
 

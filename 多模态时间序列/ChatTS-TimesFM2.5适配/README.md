@@ -134,15 +134,16 @@ export CHATTS_TS_ENCODER_TYPE=timesfm2_5
 对本目录附带的批处理脚本，默认留空就会先读取 checkpoint 配置，
 再根据 `ts_encoder.mlp.*` / `ts_encoder.projector.*` 权重 shape 自动识别。
 TimesFM 2.5 的 1280 维 projector 可唯一识别；Chronos-2 和 Zeus 同为 768 维，
-需要保留 patch size 或单次覆盖，不需要先 `export`：
+需要保留 patch size 或提供单次 fallback，不需要先 `export`：
 
 ```bash
-TS_ENCODER_TYPE=timesfm2_5 \
+TS_ENCODER_TYPE=chronos2 \
 bash direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
-若一个 `SEARCH_DIR` 中混合了多种编码器，应修复每个 checkpoint 的
-`config.json`，不要对整批设置同一覆盖值。
+最新脚本会逐个检查权重，所以这个 fallback 不会再把后续 native MLP 或
+TimesFM checkpoint 错误构造成 Chronos-2。但如果同一 `SEARCH_DIR` 同时包含
+Chronos-2 和 Zeus，两者仍需要各自的 patch size/元数据，或拆成两次运行。
 
 TimesFM 冻结主干不会复制进每个 ChatTS checkpoint，只保存了训练的 projector。
 无网评测时将一份 TimesFM `model.safetensors` 放在共享目录，然后：

@@ -6,13 +6,13 @@ checkpoint 兼容：
 
 - `chatts/vllm/chatts_vllm.py`：支持原始 MLP-Patch、TimesFM 2.5、Chronos-2 和 Zeus。
 - `chatts/vllm/zeus_modeling.py`：Zeus 官方 checkpoint 兼容的 eager-attention 结构。
-- `scripts/run_chatts_no_ragas_batch.sh`：用户批处理评测脚本的可选编码器覆盖版。
+- `scripts/run_chatts_no_ragas_batch.sh`：逐 checkpoint 权重识别、评测和结果汇总脚本。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
 文件 SHA-256：
 
-- `chatts_vllm.py`：`c04cd7e854e96c3b8c9559a41c5de8be3c32b1a2b8009cc767e106edfbeadd94`
+- `chatts_vllm.py`：`de887ab3ea9ea8c8c5a5b84f85f0d239c9ad5c43c7937b87c98b79db501ada03`
 - `zeus_modeling.py`：`d5850fb0d8d104f6d7d92580b74e48df5b0bf450536cdb662fff35fa66b5c271`
 
 ## 覆盖文件
@@ -104,7 +104,7 @@ bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 
 自动识别规则：
 
-- `ts_encoder.mlp.*` → 原始 ChatTS MLP。
+- `ts_encoder.mlp.*` 或 `ts_encoder.position_embedding.*` → 原始 ChatTS MLP。
 - 1280 维 `ts_encoder.projector.*` → TimesFM 2.5。
 - 768 维 projector + patch size 16 → Chronos-2。
 - 768 维 projector + patch size 32 → Zeus。
@@ -117,16 +117,19 @@ TS_ENCODER_TYPE=chronos2 \
 bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
-不需要在 shell 中先执行永久的 `export`。脚本会把它映射为
-`CHATTS_TS_ENCODER_TYPE`，并传给 Python 父进程与所有 vLLM spawn worker。也可以直接用：
+不需要在 shell 中先执行永久的 `export`。在最新批处理脚本中，这个值是
+768 维 projector 的 Chronos-2/Zeus 歧义解决值，不再强制覆盖所有 checkpoint。
+脚本会为每个模型先扫描权重：native MLP 和 1280 维 TimesFM 始终以各自权重为准，
+然后把解析后的类型传给 Python 父进程与所有 vLLM spawn worker。也可以使用底层别名：
 
 ```bash
 CHATTS_TS_ENCODER_TYPE=chronos2 \
 bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
-如果 `SEARCH_DIR` 混合了多种编码器，不要设全局覆盖；应保留每个 checkpoint
-可用于区分 Chronos-2/Zeus 的 patch size 或编码器元数据。
+因此，`SEARCH_DIR` 可以混合 native MLP、TimesFM 和一种 768 维外部编码器。
+如果同时混合 Chronos-2 和 Zeus，它们的权重 shape 相同，仍需要每个 checkpoint
+保留 patch size/编码器元数据，或拆分为两次批处理。
 
 ## 离线加载 TimesFM 主干
 
