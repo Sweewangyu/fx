@@ -7,6 +7,7 @@ checkpoint 兼容：
 - `chatts/vllm/chatts_vllm.py`：支持原始 MLP-Patch、TimesFM 2.5、Chronos-2 和 Zeus。
 - `chatts/vllm/zeus_modeling.py`：Zeus 官方 checkpoint 兼容的 eager-attention 结构。
 - `scripts/run_chatts_no_ragas_batch.sh`：逐 checkpoint 权重识别、评测和结果汇总脚本。
+- `scripts/inspect_chatts_ts_encoder_checkpoints.py`：只读扫描权重并盘点真实编码器。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
@@ -14,6 +15,7 @@ checkpoint 兼容：
 
 - `chatts_vllm.py`：`de887ab3ea9ea8c8c5a5b84f85f0d239c9ad5c43c7937b87c98b79db501ada03`
 - `zeus_modeling.py`：`d5850fb0d8d104f6d7d92580b74e48df5b0bf450536cdb662fff35fa66b5c271`
+- `inspect_chatts_ts_encoder_checkpoints.py`：`31f510c509cc9a57838ed4eaa101c4307ed4d7b111b904a8c07190beda596df0`
 
 ## 覆盖文件
 
@@ -91,6 +93,47 @@ Chronos-2 为 16。它是进程级设置，因此一次评测进程只应用于�
 训练补丁保存 checkpoint 时会自动写入这些字段。若字段中保存的是训练机本地路径，
 评测机不存在该路径，就把它改成对应 Hugging Face ID 或评测机本地模型目录。
 若 `ts_encoder_type` 缺失，但只存在一个 backbone 路径字段，最新版推理代码也会自动推断。
+
+## 先盘点整个目录的真实权重
+
+如果需要确认一批 checkpoint 到底保存了什么 encoder，运行：
+
+```bash
+python scripts/inspect_chatts_ts_encoder_checkpoints.py \
+  /share/airesearch/data/finiverse/output/ChatTS-Qwen3-1.7B-PR-grid
+```
+
+脚本不修改 checkpoint，会扫描 `.safetensors` / `.bin` / `.pt` / `.pth`
+的 tensor 名和 shape，并在终端输出：
+
+```text
+CHECKPOINT  DETECTED    STATUS  PROJ_DIM  NATIVE  PROJECTOR
+model-a     timesfm2_5  OK      1280      0       8
+```
+
+默认还会生成：
+
+```text
+$SEARCH_DIR/logs/chatts_ts_encoder_inventory.csv
+$SEARCH_DIR/logs/chatts_ts_encoder_inventory.md
+```
+
+CSV 的 `relevant_tensors` 列会保留具体权重键和 shape。对一个正常 TimesFM
+checkpoint，应当看到 `detected_encoder=timesfm2_5`、`projector_dims=1280`、
+`native_key_count=0` 和 `status=OK`。如果同时找到 native
+`position_embedding/MLP` 和 external projector，会标记为
+`mixed_native_external / ERROR`。
+
+如果每个子目录下还有固定的权重子路径，使用：
+
+```bash
+python scripts/inspect_chatts_ts_encoder_checkpoints.py "$SEARCH_DIR" \
+  --checkpoint-suffix stage2-checkpoint
+```
+
+脚本默认只使用 `torch.load(weights_only=True)`。老版 PyTorch/老格式不支持安全
+加载时会明确报错；只有完全信任这批 checkpoint 时才可加
+`--allow-unsafe-torch-load`。
 
 ## 批处理评测脚本怎么传参
 

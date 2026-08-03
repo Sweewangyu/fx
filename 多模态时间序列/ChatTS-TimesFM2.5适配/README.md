@@ -91,6 +91,7 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [vLLM 四后端版 `chatts_vllm.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/chatts_vllm.py)
 - [Zeus eager 模型结构 `zeus_modeling.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/zeus_modeling.py)
 - [Dataset A/B 批处理评测脚本](./direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh)
+- [TS encoder checkpoint 权重盘点脚本](./direct-files/NetManAIOps-ChatTS/scripts/inspect_chatts_ts_encoder_checkpoints.py)
 - [NetManAIOps/ChatTS 覆盖与评测说明](./direct-files/NetManAIOps-ChatTS/README.md)
 
 其中 `timesfm2_5.py`、`chronos2.py`、`zeus.py`、`zeus_modeling.py` 和
