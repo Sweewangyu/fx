@@ -172,6 +172,11 @@ bash scripts/run_chatts_no_ragas_batch.sh --score-only
 
 `--infer-only` 不执行评分，因此不生成汇总表。如果某个模型本次运行失败，
 脚本仍会汇总其他模型，并把该行标记为失败，避免把旧 `result.json` 误当成本次结果。
+对已经评分完的现有结果，可以不重新推理或评分，只生成表格：
+
+```bash
+bash scripts/run_chatts_no_ragas_batch.sh --summary-only
+```
 
 ## 正确启动标志
 

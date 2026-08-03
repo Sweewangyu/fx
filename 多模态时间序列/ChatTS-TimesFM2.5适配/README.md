@@ -162,7 +162,8 @@ $SEARCH_DIR/logs/chatts_batch_summary.md
 ```
 
 表格按四项总体指标的宏平均降序排名；可用 `SUMMARY_DIR` 和
-`SUMMARY_BASENAME` 改变输出位置与文件名。
+`SUMMARY_BASENAME` 改变输出位置与文件名。已有 `result.json` 时可以用
+`--summary-only` 直接生成表格，不重新推理或评分。
 
 服务器上先备份，再覆盖两个文件：
 

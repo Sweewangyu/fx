@@ -9,6 +9,7 @@ set -Eeuo pipefail
 #   bash run_chatts_no_ragas_batch.sh                 # infer if needed, then score
 #   bash run_chatts_no_ragas_batch.sh --score-only    # reuse existing inference
 #   bash run_chatts_no_ragas_batch.sh --infer-only    # inference only
+#   bash run_chatts_no_ragas_batch.sh --summary-only  # aggregate existing results
 #   TS_ENCODER_TYPE=timesfm2_5 bash run_chatts_no_ragas_batch.sh --infer-only
 #
 # Every configuration item can also be overridden with an environment variable.
@@ -68,9 +69,9 @@ esac
 
 MODE="${1:---all}"
 case "$MODE" in
-    --all | --score-only | --infer-only) ;;
+    --all | --score-only | --infer-only | --summary-only) ;;
     *)
-        echo "Usage: bash $0 [--all|--score-only|--infer-only]" >&2
+        echo "Usage: bash $0 [--all|--score-only|--infer-only|--summary-only]" >&2
         exit 2
         ;;
 esac
@@ -801,7 +802,8 @@ for model_dir in "${MODEL_DIRS[@]}"; do
 
     model_failed=0
     MODEL_TS_ENCODER_TYPE="$TS_ENCODER_TYPE"
-    if [[ "$MODE" != "--score-only" && -z "$MODEL_TS_ENCODER_TYPE" ]]; then
+    if [[ "$MODE" != "--score-only" && "$MODE" != "--summary-only" && \
+          -z "$MODEL_TS_ENCODER_TYPE" ]]; then
         if MODEL_TS_ENCODER_TYPE="$(detect_encoder_type_from_checkpoint "$MODEL_CHECKPOINT")"; then
             echo "  TS encoder: $MODEL_TS_ENCODER_TYPE (auto-detected)"
         else
@@ -813,7 +815,8 @@ for model_dir in "${MODEL_DIRS[@]}"; do
     fi
 
     # ---- Inference ----
-    if [[ "$MODE" != "--score-only" && "$model_failed" -eq 0 ]]; then
+    if [[ "$MODE" != "--score-only" && "$MODE" != "--summary-only" && \
+          "$model_failed" -eq 0 ]]; then
         echo "==================== Inference ===================="
         if ! run_inference "$MODEL_CHECKPOINT" "$DATASET_A" "$EXP_A" "$MODEL_TS_ENCODER_TYPE"; then
             echo "WARNING: Inference failed for $model_dir (dataset A)" >&2
@@ -826,7 +829,8 @@ for model_dir in "${MODEL_DIRS[@]}"; do
     fi
 
     # ---- Evaluation ----
-    if [[ "$MODE" != "--infer-only" && "$model_failed" -eq 0 ]]; then
+    if [[ "$MODE" != "--infer-only" && "$MODE" != "--summary-only" && \
+          "$model_failed" -eq 0 ]]; then
         echo "============= No-RAGAS local evaluation ==========="
         if ! run_fast_evaluation "$EXP_A" "$EXP_B"; then
             echo "WARNING: Evaluation failed for $model_dir" >&2
