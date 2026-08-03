@@ -268,16 +268,21 @@ class TimesFM2_5TimeSeriesEncoder(nn.Module):
         return self.projector(timesfm_features), patch_cnt
 
 
+def _resolve_encoder_type(config: Any, model_args: ModelArguments) -> str:
+    requested = model_args.ts_encoder_type
+    if requested != "auto":
+        return requested
+
+    return getattr(config, "ts_encoder_type", "native")
+
+
 def _load_weight_file(path: str) -> dict[str, torch.Tensor]:
     if path.endswith(".safetensors"):
         from safetensors.torch import load_file
 
         return load_file(path, device="cpu")
 
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-    except (TypeError, RuntimeError):
-        return torch.load(path, map_location="cpu", weights_only=True)
+    return torch.load(path, map_location="cpu", weights_only=True)
 
 
 def _find_projector_weight_files(model_path: str) -> list[str]:
@@ -303,99 +308,16 @@ def _find_projector_weight_files(model_path: str) -> list[str]:
     return []
 
 
-_PROJECTOR_STATE_CACHE: dict[str, dict[str, torch.Tensor]] = {}
-
-
-def _read_external_projector_state(model_path: str) -> dict[str, torch.Tensor]:
-    normalized_path = os.path.abspath(model_path)
-    if normalized_path in _PROJECTOR_STATE_CACHE:
-        return _PROJECTOR_STATE_CACHE[normalized_path]
-
-    projector_state: dict[str, torch.Tensor] = {}
-    for weight_path in _find_projector_weight_files(model_path):
-        if weight_path.endswith(".safetensors"):
-            from safetensors import safe_open
-
-            with safe_open(weight_path, framework="pt", device="cpu") as state:
-                for key in state.keys():
-                    if key.startswith(_PROJECTOR_PREFIX):
-                        projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = state.get_tensor(key).clone()
-            continue
-
-        state = _load_weight_file(weight_path)
-        for key, value in state.items():
-            if key.startswith(_PROJECTOR_PREFIX):
-                projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = value.detach().cpu().clone()
-        del state
-
-    _PROJECTOR_STATE_CACHE[normalized_path] = projector_state
-    return projector_state
-
-
-def infer_checkpoint_ts_encoder_type(config: Any, model_path: str) -> str:
-    r"""Infer the saved encoder from projector weights when metadata is absent."""
-    configured = getattr(config, "ts_encoder_type", None)
-    if isinstance(configured, str):
-        configured = configured.strip().lower()
-    if configured in ("", "auto"):
-        configured = None
-
-    projector_state = _read_external_projector_state(model_path)
-    input_dims: set[int] = set()
-    input_norm = projector_state.get("input_norm.weight")
-    if input_norm is not None and input_norm.ndim:
-        input_dims.add(int(input_norm.shape[0]))
-    linear_in = projector_state.get("linear_in.weight")
-    if linear_in is not None and linear_in.ndim >= 2:
-        input_dims.add(int(linear_in.shape[-1]))
-
-    if input_dims == {TIMESFM2_5_HIDDEN_SIZE}:
-        if configured not in (None, "native", TIMESFM2_5_ENCODER):
-            logger.warning_rank0(
-                "Checkpoint config says ts_encoder_type=%s, but projector weights are 1280-d TimesFM 2.5; "
-                "using the weight evidence.",
-                configured,
-            )
-        return TIMESFM2_5_ENCODER
-
-    if input_dims == {768}:
-        if configured in ("chronos2", "zeus"):
-            return configured
-        ts_config = getattr(config, "ts", {}) or {}
-        patch_size = ts_config.get("patch_size")
-        try:
-            patch_size = int(patch_size)
-        except (TypeError, ValueError):
-            patch_size = None
-        if patch_size == 16:
-            return "chronos2"
-        if patch_size == 32:
-            return "zeus"
-        return "external_768_ambiguous"
-
-    if input_dims:
-        raise ValueError(f"Unsupported external projector input dimensions in `{model_path}`: {sorted(input_dims)}.")
-    return configured or "native"
-
-
-def _resolve_encoder_type(config: Any, model_args: ModelArguments) -> str:
-    requested = model_args.ts_encoder_type
-    if requested != "auto":
-        return requested
-
-    encoder_type = infer_checkpoint_ts_encoder_type(config, model_args.model_name_or_path)
-    if encoder_type == "external_768_ambiguous":
-        raise ValueError(
-            "The checkpoint contains a 768-d external projector but lacks metadata to distinguish Chronos-2 "
-            "from Zeus. Set `--ts_encoder_type chronos2` or `--ts_encoder_type zeus`."
-        )
-    return encoder_type
-
-
 def load_external_projector_from_checkpoint(
     encoder: nn.Module, model_path: str, encoder_name: str = "external time-series"
 ) -> bool:
-    projector_state = _read_external_projector_state(model_path)
+    projector_state: dict[str, torch.Tensor] = {}
+    for weight_path in _find_projector_weight_files(model_path):
+        state = _load_weight_file(weight_path)
+        for key, value in state.items():
+            if key.startswith(_PROJECTOR_PREFIX):
+                projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = value
+
     if not projector_state:
         return False
 
@@ -416,7 +338,7 @@ def _load_projector_from_checkpoint(encoder: nn.Module, model_path: str) -> bool
 
 
 def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, model_args: ModelArguments) -> None:
-    checkpoint_encoder_type = infer_checkpoint_ts_encoder_type(config, model_args.model_name_or_path)
+    checkpoint_encoder_type = getattr(config, "ts_encoder_type", "native")
     encoder_type = _resolve_encoder_type(config, model_args)
     if encoder_type == "native":
         return
@@ -448,7 +370,6 @@ def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, m
     if not hasattr(config, "ts") or config.ts is None:
         config.ts = {}
     config.ts["patch_size"] = TIMESFM2_5_PATCH_SIZE
-    model.config = config
 
     restored = False
     if checkpoint_encoder_type == TIMESFM2_5_ENCODER:

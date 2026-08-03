@@ -161,7 +161,6 @@ def test_cross_architecture_projector_is_not_restored(tmp_path) -> None:
     maybe_replace_timeseries_encoder(model, config, model_args)
 
     assert isinstance(model.ts_encoder, Chronos2TimeSeriesEncoder)
-    assert model.config is config
     assert config.ts_encoder_type == "chronos2"
     assert config.ts["patch_size"] == 16
 
@@ -193,7 +192,6 @@ def test_chronos2_projector_restores_with_auto_stage_two(tmp_path) -> None:
     maybe_replace_timeseries_encoder(model, config, model_args)
 
     assert isinstance(model.ts_encoder, Chronos2TimeSeriesEncoder)
-    assert model.config is config
     assert model.ts_encoder.model_name_or_path == "saved/chronos2"
     assert all(
         torch.allclose(parameter, torch.full_like(parameter, 0.25))

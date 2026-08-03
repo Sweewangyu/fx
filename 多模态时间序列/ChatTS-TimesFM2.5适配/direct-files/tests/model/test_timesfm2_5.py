@@ -138,36 +138,3 @@ def test_timesfm_projector_restores_for_stage_two(tmp_path) -> None:
         torch.allclose(parameter, torch.full_like(parameter, 0.125))
         for parameter in model.ts_encoder.projector.parameters()
     )
-
-
-def test_legacy_stage_one_without_encoder_metadata_restores_projector(tmp_path) -> None:
-    source_encoder = TimesFM2_5TimeSeriesEncoder(64, "saved/timesfm")
-    for parameter in source_encoder.projector.parameters():
-        nn.init.constant_(parameter, 0.375)
-
-    checkpoint = {f"ts_encoder.{key}": value for key, value in source_encoder.state_dict().items()}
-    save_file(checkpoint, tmp_path / "model.safetensors")
-
-    model = _DummyChatTS()
-    config = SimpleNamespace(
-        hidden_size=64,
-        model_type="qwen3ts",
-        ts={"num_features": 2, "patch_size": 8},
-    )
-    model_args = SimpleNamespace(
-        ts_encoder_type="auto",
-        timesfm_model_name_or_path="local/timesfm",
-        model_name_or_path=str(tmp_path),
-        use_unsloth=False,
-    )
-
-    maybe_replace_with_timesfm2_5_encoder(model, config, model_args)
-
-    assert isinstance(model.ts_encoder, TimesFM2_5TimeSeriesEncoder)
-    assert model.config is config
-    assert config.ts_encoder_type == "timesfm2_5"
-    assert config.ts["patch_size"] == 32
-    assert all(
-        torch.allclose(parameter, torch.full_like(parameter, 0.375))
-        for parameter in model.ts_encoder.projector.parameters()
-    )

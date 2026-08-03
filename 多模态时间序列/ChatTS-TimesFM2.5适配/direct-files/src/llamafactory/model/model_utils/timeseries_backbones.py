@@ -6,12 +6,7 @@
 from typing import TYPE_CHECKING, Any
 
 from .chronos2 import CHRONOS2_ENCODER, replace_with_chronos2_encoder
-from .timesfm2_5 import (
-    TIMESFM2_5_ENCODER,
-    _resolve_encoder_type,
-    infer_checkpoint_ts_encoder_type,
-    maybe_replace_with_timesfm2_5_encoder,
-)
+from .timesfm2_5 import TIMESFM2_5_ENCODER, _resolve_encoder_type, maybe_replace_with_timesfm2_5_encoder
 from .zeus import ZEUS_ENCODER, replace_with_zeus_encoder
 
 
@@ -26,7 +21,7 @@ SUPPORTED_EXTERNAL_TS_ENCODERS = (TIMESFM2_5_ENCODER, CHRONOS2_ENCODER, ZEUS_ENC
 
 def maybe_replace_timeseries_encoder(model: "PreTrainedModel", config: Any, model_args: "ModelArguments") -> None:
     r"""Replace ChatTS' native MLP with the selected frozen foundation model."""
-    checkpoint_encoder_type = infer_checkpoint_ts_encoder_type(config, model_args.model_name_or_path)
+    checkpoint_encoder_type = getattr(config, "ts_encoder_type", "native")
     encoder_type = _resolve_encoder_type(config, model_args)
     if encoder_type == "native":
         return
