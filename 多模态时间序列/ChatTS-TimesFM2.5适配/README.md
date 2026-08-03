@@ -35,7 +35,8 @@ Chronos-2 输出 `ceil(L / 16)` 个。
 - [TS-Reasoner 训练配置修正补丁](./0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch)。
 - [ZEUS 与 Chronos-2 扩展补丁](./0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch)。
 - [单阶段混合训练补丁](./0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch)。
-- [`direct-files/`](./direct-files/)：保持 ChatTS-Training 相对路径的完整修改文件，可直接复制到服务器。
+- [`direct-files/`](./direct-files/)：保持 ChatTS-Training 与 NetManAIOps/ChatTS
+  相对路径的完整修改文件，可直接复制到服务器。
 - 补丁基线：ChatTS-Training `bf30699`。
 - 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`；单阶段脚本提交：`4e0838e`。
 - SHA-256：
@@ -54,6 +55,8 @@ Chronos-2 输出 `ceil(L / 16)` 个。
 6. Chronos-2 官方底层 `model.encode()` 接口，排除 REG/future token。
 7. 与官方 167 个权重键/形状完全一致的 ZEUS eager-attention 实现，不依赖 BasicTS 或 FlashAttention。
 8. `timesfm`、`chronos2` 和 `zeus` 可选依赖与 README 使用说明。
+9. NetManAIOps/ChatTS 的 vLLM 推理适配：自动识别原始 MLP-Patch、TimesFM 2.5、
+   Chronos-2 和 Zeus checkpoint，并加载 `ts_encoder.projector.*`。
 
 ## 直接复制修改文件
 
@@ -85,10 +88,85 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [`train_chronos2_stage2.sh`](./direct-files/scripts/full/train_chronos2_stage2.sh)
 - [`train_zeus_stage1.sh`](./direct-files/scripts/full/train_zeus_stage1.sh)
 - [`train_zeus_stage2.sh`](./direct-files/scripts/full/train_zeus_stage2.sh)
+- [vLLM 四后端版 `chatts_vllm.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/chatts_vllm.py)
+- [Zeus eager 模型结构 `zeus_modeling.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/zeus_modeling.py)
+- [NetManAIOps/ChatTS 覆盖与评测说明](./direct-files/NetManAIOps-ChatTS/README.md)
 
 其中 `timesfm2_5.py`、`chronos2.py`、`zeus.py`、`zeus_modeling.py` 和
 `timeseries_backbones.py` 是新增文件，其余 Python 文件包含基于 `bf30699` 的完整修改后内容。
 如果服务器版本较新或已有本地改动，不建议直接覆盖，应使用下方 Git 补丁进行三方合并。
+
+## NetManAIOps/ChatTS vLLM 评测
+
+原始 NetManAIOps/ChatTS 的 `Qwen3TSForCausalLM` 总是构造 MLP-Patch 编码器，
+因此外部 backbone checkpoint 中的 `ts_encoder.projector.*` 找不到对应模块，报错：
+
+```text
+ValueError: There is no module or parameter named 'ts_encoder.projector'
+in Qwen3TSForCausalLM
+```
+
+本目录的推理版根据 checkpoint `config.json` 中的 `ts_encoder_type` 自动构造：
+
+| `ts_encoder_type` | 推理编码器 | `ts.patch_size` | 额外安装 |
+|---|---|---:|---|
+| 缺省、`native`、`mlp` | 原始 ChatTS MLP-Patch | 沿用 checkpoint | 无 |
+| `timesfm2_5` | `google/timesfm-2.5-200m-pytorch` | 32 | `timesfm[torch]>=2.0.2` |
+| `chronos2` | `amazon/chronos-2` | 16 | `chronos-forecasting==2.3.1` |
+| `zeus` | `GestaltCog/zeus` | 32 | 无；必须同时复制 `zeus_modeling.py` |
+
+服务器上先备份，再覆盖两个文件：
+
+```bash
+cd /workspace/ChatTS/ChatTS-main
+cp chatts/vllm/chatts_vllm.py chatts/vllm/chatts_vllm.py.bak
+cp /path/to/direct-files/NetManAIOps-ChatTS/chatts/vllm/chatts_vllm.py chatts/vllm/
+cp /path/to/direct-files/NetManAIOps-ChatTS/chatts/vllm/zeus_modeling.py chatts/vllm/
+```
+
+只安装当前 checkpoint 需要的依赖即可：
+
+```bash
+# TimesFM 2.5 checkpoint
+pip install 'timesfm[torch]>=2.0.2'
+
+# Chronos-2 checkpoint
+pip install 'chronos-forecasting==2.3.1'
+```
+
+然后检查模型目录中的配置。`MODEL_PATH` 要指向 Stage 2 完整 checkpoint，不能只指向
+projector adapter 目录：
+
+```bash
+MODEL_PATH=/path/to/stage2-checkpoint python - <<'PY'
+import json
+import os
+
+path = os.environ["MODEL_PATH"]
+with open(os.path.join(path, "config.json"), encoding="utf-8") as file:
+    config = json.load(file)
+
+encoder = config.get("ts_encoder_type", "native")
+patch_size = config.get("ts", {}).get("patch_size")
+expected = {"timesfm2_5": 32, "chronos2": 16, "zeus": 32}
+print("ts_encoder_type =", encoder)
+print("ts.patch_size =", patch_size)
+if encoder in expected:
+    assert patch_size == expected[encoder], (encoder, patch_size)
+PY
+```
+
+保持原来的 ChatTS vLLM 启动/评测命令。多进程模式建议继续设置：
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+python3 -m chatts.utils.inference_tsmllm_vllm
+```
+
+不要通过忽略 `ts_encoder.projector.*` 来绕过报错；那会让评测使用错误或随机初始化的
+MLP 编码器。四种后端都保持训练时的输入契约和归一化路径；外部 backbone 在每个 vLLM
+worker 中冻结并以 FP32 各保存一份，因此显存估算需额外计入该 backbone。
 
 ## 应用补丁
 

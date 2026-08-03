@@ -8,6 +8,8 @@
 将 ChatTS 原生 MLP-Patch 编码器替换为 `google/timesfm-2.5-200m-pytorch`、
 `amazon/chronos-2` 或 `GestaltCog/zeus`。目录包含连续 Git 补丁、可直接覆盖到服务器的
 完整 `.py` 文件和每种 backbone 的 Stage 1 / Stage 2 脚本。
+同时提供 NetManAIOps/ChatTS 的四后端 vLLM 评测文件，兼容原始 MLP-Patch、
+TimesFM 2.5、Chronos-2 与 Zeus checkpoint。
 
 - [三种 backbone 的适配说明、完整 Git 补丁、直接文件与训练方法](./ChatTS-TimesFM2.5适配/README.md)
 
