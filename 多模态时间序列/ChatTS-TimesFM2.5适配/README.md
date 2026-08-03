@@ -153,6 +153,17 @@ TIMESFM_MODEL_PATH=/workspace/timesf \
 bash direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
+批处理脚本用 `--all` 或 `--score-only` 完成后，还会把全部模型的
+Dataset A/B categorical/numerical 指标、平均分、token 数和状态汇总到：
+
+```text
+$SEARCH_DIR/logs/chatts_batch_summary.csv
+$SEARCH_DIR/logs/chatts_batch_summary.md
+```
+
+表格按四项总体指标的宏平均降序排名；可用 `SUMMARY_DIR` 和
+`SUMMARY_BASENAME` 改变输出位置与文件名。
+
 服务器上先备份，再覆盖两个文件：
 
 ```bash

@@ -148,6 +148,31 @@ bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 `TIMESFM_MODEL_PATH` 可以指向包含 `model.safetensors` 的目录，也可直接指向该文件。
 它会被脚本映射为 `CHATTS_TIMESFM_MODEL_PATH` 并传给所有 vLLM worker。
 
+## 所有模型的汇总表
+
+使用 `--all` 或 `--score-only` 跑完后，脚本会读取每个模型的 Dataset A/B
+`result.json`，在终端打印总表，并默认生成：
+
+```text
+$SEARCH_DIR/logs/chatts_batch_summary.csv
+$SEARCH_DIR/logs/chatts_batch_summary.md
+```
+
+CSV 是 UTF-8 with BOM，可直接用 Excel 打开。每行包含：Dataset A/B 的
+categorical/numerical 分数、两个数据集的分项平均、四项指标的
+`Macro Mean`、token 数和运行状态。表格默认按 `Macro Mean` 降序排名。
+
+可以更改输出位置和文件名：
+
+```bash
+SUMMARY_DIR=/workspace/results \
+SUMMARY_BASENAME=chronos2_grid \
+bash scripts/run_chatts_no_ragas_batch.sh --score-only
+```
+
+`--infer-only` 不执行评分，因此不生成汇总表。如果某个模型本次运行失败，
+脚本仍会汇总其他模型，并把该行标记为失败，避免把旧 `result.json` 误当成本次结果。
+
 ## 正确启动标志
 
 启动后应出现以下四种日志之一：

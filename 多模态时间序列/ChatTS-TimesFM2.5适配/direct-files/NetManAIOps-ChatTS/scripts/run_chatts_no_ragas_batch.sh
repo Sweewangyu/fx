@@ -47,6 +47,11 @@ TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-${CHATTS_TIMESFM_MODEL_PATH:-}}"
 CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-${CHATTS_CHRONOS2_MODEL_PATH:-}}"
 ZEUS_MODEL_PATH="${ZEUS_MODEL_PATH:-${CHATTS_ZEUS_MODEL_PATH:-}}"
 
+# Aggregate table written after evaluation. The logs directory is already
+# excluded from checkpoint discovery, so summary files are not treated as models.
+SUMMARY_DIR="${SUMMARY_DIR:-${SEARCH_DIR%/}/logs}"
+SUMMARY_BASENAME="${SUMMARY_BASENAME:-chatts_batch_summary}"
+
 # Set FORCE_INFERENCE=1 to overwrite an already complete generated_answer file.
 FORCE_INFERENCE="${FORCE_INFERENCE:-0}"
 # ============================================================
@@ -552,6 +557,222 @@ for dataset_path, exp_name in runs:
 PY
 }
 
+write_batch_summary() {
+    local summary_dir="$SUMMARY_DIR"
+
+    mkdir -p "$summary_dir"
+    "$PYTHON_BIN" - \
+        "$PROJECT_ROOT" \
+        "$summary_dir" \
+        "$SUMMARY_BASENAME" \
+        "${MODEL_DIRS[@]}" \
+        --failed-models \
+        "${FAILED_MODELS[@]}" <<'PY'
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import statistics
+import sys
+from typing import Any
+
+
+project_root = os.path.abspath(sys.argv[1])
+summary_dir = os.path.abspath(sys.argv[2])
+summary_basename = sys.argv[3]
+remaining_args = sys.argv[4:]
+try:
+    failed_marker = remaining_args.index("--failed-models")
+except ValueError as exc:
+    raise SystemExit("Internal error: missing --failed-models marker.") from exc
+model_names = remaining_args[:failed_marker]
+failed_models = set(remaining_args[failed_marker + 1:])
+
+
+def finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def load_result(model_name: str, dataset_name: str):
+    exp_name = f"{model_name}_{dataset_name}"
+    path = os.path.join(project_root, "exp", exp_name, "result.json")
+    if not os.path.isfile(path):
+        return None, path, "missing"
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            result = json.load(stream)
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, path, f"invalid: {exc}"
+    return result, path, "ok"
+
+
+def mean_or_none(values: list[float | None]) -> float | None:
+    valid = [value for value in values if value is not None]
+    return statistics.fmean(valid) if valid else None
+
+
+rows = []
+for model_name in model_names:
+    result_a, path_a, state_a = load_result(model_name, "dataset_a")
+    result_b, path_b, state_b = load_result(model_name, "dataset_b")
+
+    a_categorical = finite_number(
+        result_a.get("overall_categorical") if result_a else None
+    )
+    a_numerical = finite_number(
+        result_a.get("overall_numerical") if result_a else None
+    )
+    b_categorical = finite_number(
+        result_b.get("overall_categorical") if result_b else None
+    )
+    b_numerical = finite_number(
+        result_b.get("overall_numerical") if result_b else None
+    )
+    a_tokens = finite_number(result_a.get("consumed_tokens") if result_a else None)
+    b_tokens = finite_number(result_b.get("consumed_tokens") if result_b else None)
+
+    metric_values = [a_categorical, a_numerical, b_categorical, b_numerical]
+    if model_name in failed_models:
+        status = "current run failed; result files may be stale"
+    elif state_a != "ok" or state_b != "ok":
+        status = f"dataset_a={state_a}; dataset_b={state_b}"
+    elif any(value is None for value in metric_values):
+        status = "invalid or missing overall metric"
+    else:
+        status = "ok"
+
+    rows.append({
+        "rank": None,
+        "model": model_name,
+        "dataset_a_categorical": a_categorical,
+        "dataset_a_numerical": a_numerical,
+        "dataset_b_categorical": b_categorical,
+        "dataset_b_numerical": b_numerical,
+        "avg_categorical": mean_or_none([a_categorical, b_categorical]),
+        "avg_numerical": mean_or_none([a_numerical, b_numerical]),
+        "macro_mean": mean_or_none(metric_values),
+        "dataset_a_tokens": int(a_tokens) if a_tokens is not None else None,
+        "dataset_b_tokens": int(b_tokens) if b_tokens is not None else None,
+        "total_tokens": (
+            int(a_tokens + b_tokens)
+            if a_tokens is not None and b_tokens is not None
+            else None
+        ),
+        "status": status,
+        "dataset_a_result": path_a,
+        "dataset_b_result": path_b,
+    })
+
+
+def sort_key(row):
+    score = row["macro_mean"]
+    return (
+        row["status"] != "ok",
+        -(score if score is not None else float("-inf")),
+        row["model"],
+    )
+
+
+rows.sort(key=sort_key)
+rank = 0
+for row in rows:
+    if row["status"] == "ok" and row["macro_mean"] is not None:
+        rank += 1
+        row["rank"] = rank
+
+fieldnames = [
+    "rank",
+    "model",
+    "dataset_a_categorical",
+    "dataset_a_numerical",
+    "dataset_b_categorical",
+    "dataset_b_numerical",
+    "avg_categorical",
+    "avg_numerical",
+    "macro_mean",
+    "dataset_a_tokens",
+    "dataset_b_tokens",
+    "total_tokens",
+    "status",
+    "dataset_a_result",
+    "dataset_b_result",
+]
+
+csv_path = os.path.join(summary_dir, f"{summary_basename}.csv")
+with open(csv_path, "w", encoding="utf-8-sig", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def score_text(value: float | None) -> str:
+    return "—" if value is None else f"{value:.4f}"
+
+
+def integer_text(value: int | None) -> str:
+    return "—" if value is None else str(value)
+
+
+def markdown_cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+headers = [
+    "Rank",
+    "Model",
+    "A Cat",
+    "A Num",
+    "B Cat",
+    "B Num",
+    "Avg Cat",
+    "Avg Num",
+    "Macro Mean",
+    "Tokens",
+    "Status",
+]
+markdown_lines = [
+    "# ChatTS Batch Evaluation Summary",
+    "",
+    (
+        "`Macro Mean` is the unweighted mean of Dataset A/B categorical and "
+        "numerical scores. Rows are ranked by this value."
+    ),
+    "",
+    "| " + " | ".join(headers) + " |",
+    "| " + " | ".join(["---"] * len(headers)) + " |",
+]
+for row in rows:
+    values = [
+        integer_text(row["rank"]),
+        markdown_cell(row["model"]),
+        score_text(row["dataset_a_categorical"]),
+        score_text(row["dataset_a_numerical"]),
+        score_text(row["dataset_b_categorical"]),
+        score_text(row["dataset_b_numerical"]),
+        score_text(row["avg_categorical"]),
+        score_text(row["avg_numerical"]),
+        score_text(row["macro_mean"]),
+        integer_text(row["total_tokens"]),
+        markdown_cell(row["status"]),
+    ]
+    markdown_lines.append("| " + " | ".join(values) + " |")
+
+markdown_path = os.path.join(summary_dir, f"{summary_basename}.md")
+with open(markdown_path, "w", encoding="utf-8") as stream:
+    stream.write("\n".join(markdown_lines) + "\n")
+
+print("\n".join(markdown_lines))
+print(f"\nCSV summary:      {csv_path}")
+print(f"Markdown summary: {markdown_path}")
+PY
+}
+
 # ==================== Main batch loop ====================
 
 FAILED_MODELS=()
@@ -637,10 +858,21 @@ if [[ ${#FAILED_MODELS[@]} -gt 0 ]]; then
     for f in "${FAILED_MODELS[@]}"; do
         echo "  ✗ $f"
     done
+fi
+
+if [[ "$MODE" != "--infer-only" ]]; then
     echo ""
-    echo "=============================================================="
-    exit 1
+    echo "================ Aggregated Results Table ==================="
+    if ! write_batch_summary; then
+        echo "WARNING: Failed to write the aggregated result table." >&2
+        FAILED_MODELS+=("<summary generation>")
+    fi
+else
+    echo "Aggregated table skipped in --infer-only mode (no evaluation was run)."
 fi
 
 echo "=============================================================="
+if [[ ${#FAILED_MODELS[@]} -gt 0 ]]; then
+    exit 1
+fi
 echo "All ${#MODEL_DIRS[@]} model(s) processed successfully."
