@@ -176,6 +176,7 @@ def replace_with_chronos2_encoder(
     if not hasattr(config, "ts") or config.ts is None:
         config.ts = {}
     config.ts["patch_size"] = CHRONOS2_PATCH_SIZE
+    model.config = config
 
     restored = False
     if checkpoint_encoder_type == CHRONOS2_ENCODER:

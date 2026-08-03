@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
-# TS-Reasoner-style instruction stage. `auto` reads `timesfm2_5` from the
-# stage-1 config and restores the trainable projector while reloading the
-# frozen Google checkpoint. The complete ChatTS LLM remains trainable.
+# TS-Reasoner-style instruction stage. The explicit encoder selection also
+# supports legacy stage-1 checkpoints whose config lost ts_encoder_type; the
+# loader infers the 1280-d TimesFM projector from weights and restores it.
+# The complete ChatTS LLM remains trainable.
 # Paper recipe: 30K instructions, global batch 32, lr 2e-5, two epochs.
 # With 8 GPUs: 1 sample/GPU * 4 accumulation steps * 8 GPUs = 32.
 
@@ -10,7 +11,8 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
     --deepspeed ds_config/ds_config_3.json \
     --stage sft \
     --model_name_or_path "[OUTPUT_PATH_TIMESFM_STAGE_1]" \
-    --ts_encoder_type auto \
+    --ts_encoder_type timesfm2_5 \
+    --timesfm_model_name_or_path "google/timesfm-2.5-200m-pytorch" \
     --dataset "stage_2_30K" \
     --interleave_probs "1.0" \
     --do_train \

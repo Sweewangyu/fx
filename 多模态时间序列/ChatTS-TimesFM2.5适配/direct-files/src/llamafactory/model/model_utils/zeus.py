@@ -179,6 +179,7 @@ def replace_with_zeus_encoder(
     if not hasattr(config, "ts") or config.ts is None:
         config.ts = {}
     config.ts["patch_size"] = ZEUS_OUTPUT_SCALE
+    model.config = config
 
     restored = False
     if checkpoint_encoder_type == ZEUS_ENCODER:

@@ -1,0 +1,388 @@
+From ba2257cf0f18c892a229b649e975e3fa64928db4 Mon Sep 17 00:00:00 2001
+From: swee <2385455860@qq.com>
+Date: Mon, 3 Aug 2026 14:27:20 +0800
+Subject: [PATCH] fix: restore external projector from legacy checkpoint
+ weights
+
+---
+ scripts/full/train_timesfm2_5_grid_stage2.sh  |  71 ++++++++++++
+ scripts/full/train_timesfm2_5_stage2.sh       |  10 +-
+ .../model/model_utils/chronos2.py             |   1 +
+ .../model/model_utils/timeseries_backbones.py |   9 +-
+ .../model/model_utils/timesfm2_5.py           | 107 +++++++++++++++---
+ src/llamafactory/model/model_utils/zeus.py    |   1 +
+ tests/model/test_external_ts_backbones.py     |   2 +
+ tests/model/test_timesfm2_5.py                |  33 ++++++
+ 8 files changed, 214 insertions(+), 20 deletions(-)
+ create mode 100755 scripts/full/train_timesfm2_5_grid_stage2.sh
+
+diff --git a/scripts/full/train_timesfm2_5_grid_stage2.sh b/scripts/full/train_timesfm2_5_grid_stage2.sh
+new file mode 100755
+index 0000000..227a34d
+--- /dev/null
++++ b/scripts/full/train_timesfm2_5_grid_stage2.sh
+@@ -0,0 +1,71 @@
++#!/usr/bin/env bash
++# Usage: bash train_timesfm2_5_grid_stage2.sh <LR> <STAGE1_TAG> <STAGE2_TAG>
++
++set -Eeuo pipefail
++
++LR="${1:?Usage: train_timesfm2_5_grid_stage2.sh <LR> <STAGE1_TAG> <STAGE2_TAG>}"
++STAGE1_TAG="${2:?Missing STAGE1_TAG}"
++STAGE2_TAG="${3:?Missing STAGE2_TAG}"
++
++OUTPUT_ROOT="${OUTPUT_ROOT:-/share/airesearch/data/finiverse/output/ChatTS-Qwen3-1.7B-PR}"
++TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-/workspace/timesfm}"
++TRAINING_ROOT="${TRAINING_ROOT:-/workspace/ChatTS-Train/ChatTS-Training}"
++
++MODEL_PATH="$OUTPUT_ROOT/$STAGE1_TAG"
++STAGE2_OUT="$OUTPUT_ROOT/$STAGE2_TAG"
++
++if [[ ! -d "$MODEL_PATH" ]]; then
++    echo "Error: Stage 1 checkpoint does not exist: $MODEL_PATH" >&2
++    exit 1
++fi
++if [[ ! -f "$TIMESFM_MODEL_PATH/model.safetensors" ]]; then
++    echo "Error: TimesFM model.safetensors does not exist under: $TIMESFM_MODEL_PATH" >&2
++    exit 1
++fi
++
++mkdir -p "$OUTPUT_ROOT/logs"
++cd "$TRAINING_ROOT"
++
++echo "[Stage2] LR=$LR  Stage1=$MODEL_PATH  ->  $STAGE2_OUT"
++echo "[Stage2] Encoder=timesfm2_5  Backbone=$TIMESFM_MODEL_PATH"
++
++deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port=19901 src/train.py \
++    --deepspeed ds_config/ds_config_2.json \
++    --stage sft \
++    --model_name_or_path "$MODEL_PATH" \
++    --ts_encoder_type timesfm2_5 \
++    --timesfm_model_name_or_path "$TIMESFM_MODEL_PATH" \
++    --dataset "sft,ift,align_random" \
++    --interleave_probs "0.6,0.2,0.2" \
++    --mix_strategy interleave_over \
++    --template chatts \
++    --do_train \
++    --finetuning_type full \
++    --output_dir "$STAGE2_OUT" \
++    --overwrite_output_dir \
++    --per_device_train_batch_size 2 \
++    --gradient_accumulation_steps 32 \
++    --learning_rate "$LR" \
++    --timeseries_sft_lr "$LR" \
++    --lr_scheduler_type cosine \
++    --warmup_ratio 0.02 \
++    --num_train_epochs 1 \
++    --logging_steps 1 \
++    --save_steps 100 \
++    --save_total_limit 2 \
++    --plot_loss \
++    --bf16 \
++    --save_safetensors False \
++    --preprocessing_num_workers 96 \
++    --trust_remote_code True \
++    --flash_attn fa2 \
++    --cutoff_len 2048 \
++    --val_size 0.05 \
++    --per_device_eval_batch_size 4 \
++    --eval_strategy steps \
++    --eval_steps 100 \
++    --load_best_model_at_end True \
++    --metric_for_best_model eval_loss \
++    --greater_is_better False \
++    --report_to tensorboard \
++    --logging_dir "$OUTPUT_ROOT/logs/tensorboard/$STAGE2_TAG"
+diff --git a/scripts/full/train_timesfm2_5_stage2.sh b/scripts/full/train_timesfm2_5_stage2.sh
+index 9393a34..3b116c0 100755
+--- a/scripts/full/train_timesfm2_5_stage2.sh
++++ b/scripts/full/train_timesfm2_5_stage2.sh
+@@ -1,8 +1,9 @@
+ #!/usr/bin/env bash
+ 
+-# TS-Reasoner-style instruction stage. `auto` reads `timesfm2_5` from the
+-# stage-1 config and restores the trainable projector while reloading the
+-# frozen Google checkpoint. The complete ChatTS LLM remains trainable.
++# TS-Reasoner-style instruction stage. The explicit encoder selection also
++# supports legacy stage-1 checkpoints whose config lost ts_encoder_type; the
++# loader infers the 1280-d TimesFM projector from weights and restores it.
++# The complete ChatTS LLM remains trainable.
+ # Paper recipe: 30K instructions, global batch 32, lr 2e-5, two epochs.
+ # With 8 GPUs: 1 sample/GPU * 4 accumulation steps * 8 GPUs = 32.
+ 
+@@ -10,7 +11,8 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+     --model_name_or_path "[OUTPUT_PATH_TIMESFM_STAGE_1]" \
+-    --ts_encoder_type auto \
++    --ts_encoder_type timesfm2_5 \
++    --timesfm_model_name_or_path "google/timesfm-2.5-200m-pytorch" \
+     --dataset "stage_2_30K" \
+     --interleave_probs "1.0" \
+     --do_train \
+diff --git a/src/llamafactory/model/model_utils/chronos2.py b/src/llamafactory/model/model_utils/chronos2.py
+index f25cdcb..d2acc6c 100644
+--- a/src/llamafactory/model/model_utils/chronos2.py
++++ b/src/llamafactory/model/model_utils/chronos2.py
+@@ -176,6 +176,7 @@ def replace_with_chronos2_encoder(
+     if not hasattr(config, "ts") or config.ts is None:
+         config.ts = {}
+     config.ts["patch_size"] = CHRONOS2_PATCH_SIZE
++    model.config = config
+ 
+     restored = False
+     if checkpoint_encoder_type == CHRONOS2_ENCODER:
+diff --git a/src/llamafactory/model/model_utils/timeseries_backbones.py b/src/llamafactory/model/model_utils/timeseries_backbones.py
+index 7de8993..50028f6 100644
+--- a/src/llamafactory/model/model_utils/timeseries_backbones.py
++++ b/src/llamafactory/model/model_utils/timeseries_backbones.py
+@@ -6,7 +6,12 @@
+ from typing import TYPE_CHECKING, Any
+ 
+ from .chronos2 import CHRONOS2_ENCODER, replace_with_chronos2_encoder
+-from .timesfm2_5 import TIMESFM2_5_ENCODER, _resolve_encoder_type, maybe_replace_with_timesfm2_5_encoder
++from .timesfm2_5 import (
++    TIMESFM2_5_ENCODER,
++    _resolve_encoder_type,
++    infer_checkpoint_ts_encoder_type,
++    maybe_replace_with_timesfm2_5_encoder,
++)
+ from .zeus import ZEUS_ENCODER, replace_with_zeus_encoder
+ 
+ 
+@@ -21,7 +26,7 @@ SUPPORTED_EXTERNAL_TS_ENCODERS = (TIMESFM2_5_ENCODER, CHRONOS2_ENCODER, ZEUS_ENC
+ 
+ def maybe_replace_timeseries_encoder(model: "PreTrainedModel", config: Any, model_args: "ModelArguments") -> None:
+     r"""Replace ChatTS' native MLP with the selected frozen foundation model."""
+-    checkpoint_encoder_type = getattr(config, "ts_encoder_type", "native")
++    checkpoint_encoder_type = infer_checkpoint_ts_encoder_type(config, model_args.model_name_or_path)
+     encoder_type = _resolve_encoder_type(config, model_args)
+     if encoder_type == "native":
+         return
+diff --git a/src/llamafactory/model/model_utils/timesfm2_5.py b/src/llamafactory/model/model_utils/timesfm2_5.py
+index 058b3a3..944903b 100644
+--- a/src/llamafactory/model/model_utils/timesfm2_5.py
++++ b/src/llamafactory/model/model_utils/timesfm2_5.py
+@@ -268,21 +268,16 @@ class TimesFM2_5TimeSeriesEncoder(nn.Module):
+         return self.projector(timesfm_features), patch_cnt
+ 
+ 
+-def _resolve_encoder_type(config: Any, model_args: ModelArguments) -> str:
+-    requested = model_args.ts_encoder_type
+-    if requested != "auto":
+-        return requested
+-
+-    return getattr(config, "ts_encoder_type", "native")
+-
+-
+ def _load_weight_file(path: str) -> dict[str, torch.Tensor]:
+     if path.endswith(".safetensors"):
+         from safetensors.torch import load_file
+ 
+         return load_file(path, device="cpu")
+ 
+-    return torch.load(path, map_location="cpu", weights_only=True)
++    try:
++        return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
++    except (TypeError, RuntimeError):
++        return torch.load(path, map_location="cpu", weights_only=True)
+ 
+ 
+ def _find_projector_weight_files(model_path: str) -> list[str]:
+@@ -308,16 +303,99 @@ def _find_projector_weight_files(model_path: str) -> list[str]:
+     return []
+ 
+ 
+-def load_external_projector_from_checkpoint(
+-    encoder: nn.Module, model_path: str, encoder_name: str = "external time-series"
+-) -> bool:
++_PROJECTOR_STATE_CACHE: dict[str, dict[str, torch.Tensor]] = {}
++
++
++def _read_external_projector_state(model_path: str) -> dict[str, torch.Tensor]:
++    normalized_path = os.path.abspath(model_path)
++    if normalized_path in _PROJECTOR_STATE_CACHE:
++        return _PROJECTOR_STATE_CACHE[normalized_path]
++
+     projector_state: dict[str, torch.Tensor] = {}
+     for weight_path in _find_projector_weight_files(model_path):
++        if weight_path.endswith(".safetensors"):
++            from safetensors import safe_open
++
++            with safe_open(weight_path, framework="pt", device="cpu") as state:
++                for key in state.keys():
++                    if key.startswith(_PROJECTOR_PREFIX):
++                        projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = state.get_tensor(key).clone()
++            continue
++
+         state = _load_weight_file(weight_path)
+         for key, value in state.items():
+             if key.startswith(_PROJECTOR_PREFIX):
+-                projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = value
++                projector_state[key.removeprefix(_PROJECTOR_PREFIX)] = value.detach().cpu().clone()
++        del state
++
++    _PROJECTOR_STATE_CACHE[normalized_path] = projector_state
++    return projector_state
++
++
++def infer_checkpoint_ts_encoder_type(config: Any, model_path: str) -> str:
++    r"""Infer the saved encoder from projector weights when metadata is absent."""
++    configured = getattr(config, "ts_encoder_type", None)
++    if isinstance(configured, str):
++        configured = configured.strip().lower()
++    if configured in ("", "auto"):
++        configured = None
++
++    projector_state = _read_external_projector_state(model_path)
++    input_dims: set[int] = set()
++    input_norm = projector_state.get("input_norm.weight")
++    if input_norm is not None and input_norm.ndim:
++        input_dims.add(int(input_norm.shape[0]))
++    linear_in = projector_state.get("linear_in.weight")
++    if linear_in is not None and linear_in.ndim >= 2:
++        input_dims.add(int(linear_in.shape[-1]))
++
++    if input_dims == {TIMESFM2_5_HIDDEN_SIZE}:
++        if configured not in (None, "native", TIMESFM2_5_ENCODER):
++            logger.warning_rank0(
++                "Checkpoint config says ts_encoder_type=%s, but projector weights are 1280-d TimesFM 2.5; "
++                "using the weight evidence.",
++                configured,
++            )
++        return TIMESFM2_5_ENCODER
+ 
++    if input_dims == {768}:
++        if configured in ("chronos2", "zeus"):
++            return configured
++        ts_config = getattr(config, "ts", {}) or {}
++        patch_size = ts_config.get("patch_size")
++        try:
++            patch_size = int(patch_size)
++        except (TypeError, ValueError):
++            patch_size = None
++        if patch_size == 16:
++            return "chronos2"
++        if patch_size == 32:
++            return "zeus"
++        return "external_768_ambiguous"
++
++    if input_dims:
++        raise ValueError(f"Unsupported external projector input dimensions in `{model_path}`: {sorted(input_dims)}.")
++    return configured or "native"
++
++
++def _resolve_encoder_type(config: Any, model_args: ModelArguments) -> str:
++    requested = model_args.ts_encoder_type
++    if requested != "auto":
++        return requested
++
++    encoder_type = infer_checkpoint_ts_encoder_type(config, model_args.model_name_or_path)
++    if encoder_type == "external_768_ambiguous":
++        raise ValueError(
++            "The checkpoint contains a 768-d external projector but lacks metadata to distinguish Chronos-2 "
++            "from Zeus. Set `--ts_encoder_type chronos2` or `--ts_encoder_type zeus`."
++        )
++    return encoder_type
++
++
++def load_external_projector_from_checkpoint(
++    encoder: nn.Module, model_path: str, encoder_name: str = "external time-series"
++) -> bool:
++    projector_state = _read_external_projector_state(model_path)
+     if not projector_state:
+         return False
+ 
+@@ -338,7 +416,7 @@ def _load_projector_from_checkpoint(encoder: nn.Module, model_path: str) -> bool
+ 
+ 
+ def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, model_args: ModelArguments) -> None:
+-    checkpoint_encoder_type = getattr(config, "ts_encoder_type", "native")
++    checkpoint_encoder_type = infer_checkpoint_ts_encoder_type(config, model_args.model_name_or_path)
+     encoder_type = _resolve_encoder_type(config, model_args)
+     if encoder_type == "native":
+         return
+@@ -370,6 +448,7 @@ def maybe_replace_with_timesfm2_5_encoder(model: PreTrainedModel, config: Any, m
+     if not hasattr(config, "ts") or config.ts is None:
+         config.ts = {}
+     config.ts["patch_size"] = TIMESFM2_5_PATCH_SIZE
++    model.config = config
+ 
+     restored = False
+     if checkpoint_encoder_type == TIMESFM2_5_ENCODER:
+diff --git a/src/llamafactory/model/model_utils/zeus.py b/src/llamafactory/model/model_utils/zeus.py
+index 7fdb360..65d594a 100644
+--- a/src/llamafactory/model/model_utils/zeus.py
++++ b/src/llamafactory/model/model_utils/zeus.py
+@@ -179,6 +179,7 @@ def replace_with_zeus_encoder(
+     if not hasattr(config, "ts") or config.ts is None:
+         config.ts = {}
+     config.ts["patch_size"] = ZEUS_OUTPUT_SCALE
++    model.config = config
+ 
+     restored = False
+     if checkpoint_encoder_type == ZEUS_ENCODER:
+diff --git a/tests/model/test_external_ts_backbones.py b/tests/model/test_external_ts_backbones.py
+index 17fad1e..38de31c 100644
+--- a/tests/model/test_external_ts_backbones.py
++++ b/tests/model/test_external_ts_backbones.py
+@@ -161,6 +161,7 @@ def test_cross_architecture_projector_is_not_restored(tmp_path) -> None:
+     maybe_replace_timeseries_encoder(model, config, model_args)
+ 
+     assert isinstance(model.ts_encoder, Chronos2TimeSeriesEncoder)
++    assert model.config is config
+     assert config.ts_encoder_type == "chronos2"
+     assert config.ts["patch_size"] == 16
+ 
+@@ -192,6 +193,7 @@ def test_chronos2_projector_restores_with_auto_stage_two(tmp_path) -> None:
+     maybe_replace_timeseries_encoder(model, config, model_args)
+ 
+     assert isinstance(model.ts_encoder, Chronos2TimeSeriesEncoder)
++    assert model.config is config
+     assert model.ts_encoder.model_name_or_path == "saved/chronos2"
+     assert all(
+         torch.allclose(parameter, torch.full_like(parameter, 0.25))
+diff --git a/tests/model/test_timesfm2_5.py b/tests/model/test_timesfm2_5.py
+index c394b17..8ccbdd4 100644
+--- a/tests/model/test_timesfm2_5.py
++++ b/tests/model/test_timesfm2_5.py
+@@ -138,3 +138,36 @@ def test_timesfm_projector_restores_for_stage_two(tmp_path) -> None:
+         torch.allclose(parameter, torch.full_like(parameter, 0.125))
+         for parameter in model.ts_encoder.projector.parameters()
+     )
++
++
++def test_legacy_stage_one_without_encoder_metadata_restores_projector(tmp_path) -> None:
++    source_encoder = TimesFM2_5TimeSeriesEncoder(64, "saved/timesfm")
++    for parameter in source_encoder.projector.parameters():
++        nn.init.constant_(parameter, 0.375)
++
++    checkpoint = {f"ts_encoder.{key}": value for key, value in source_encoder.state_dict().items()}
++    save_file(checkpoint, tmp_path / "model.safetensors")
++
++    model = _DummyChatTS()
++    config = SimpleNamespace(
++        hidden_size=64,
++        model_type="qwen3ts",
++        ts={"num_features": 2, "patch_size": 8},
++    )
++    model_args = SimpleNamespace(
++        ts_encoder_type="auto",
++        timesfm_model_name_or_path="local/timesfm",
++        model_name_or_path=str(tmp_path),
++        use_unsloth=False,
++    )
++
++    maybe_replace_with_timesfm2_5_encoder(model, config, model_args)
++
++    assert isinstance(model.ts_encoder, TimesFM2_5TimeSeriesEncoder)
++    assert model.config is config
++    assert config.ts_encoder_type == "timesfm2_5"
++    assert config.ts["patch_size"] == 32
++    assert all(
++        torch.allclose(parameter, torch.full_like(parameter, 0.375))
++        for parameter in model.ts_encoder.projector.parameters()
++    )
+-- 
+2.50.1 (Apple Git-155)
+

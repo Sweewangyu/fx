@@ -35,21 +35,24 @@ Chronos-2 输出 `ceil(L / 16)` 个。
 - [TS-Reasoner 训练配置修正补丁](./0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch)。
 - [ZEUS 与 Chronos-2 扩展补丁](./0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch)。
 - [单阶段混合训练补丁](./0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch)。
+- [旧 checkpoint 权重识别与 projector 恢复补丁](./0005-fix-restore-external-projector-from-legacy-checkpoint-weights.patch)。
 - [`direct-files/`](./direct-files/)：保持 ChatTS-Training 与 NetManAIOps/ChatTS
   相对路径的完整修改文件，可直接复制到服务器。
 - 补丁基线：ChatTS-Training `bf30699`。
-- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`；单阶段脚本提交：`4e0838e`。
+- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`；单阶段脚本提交：`4e0838e`；旧 checkpoint 恢复提交：`ba2257c`。
 - SHA-256：
   - `0001`：`60d3878a0f36e3e94b053894a0e64e10cbb4c9b6449b285869162e6c668a01b8`
   - `0002`：`1017284f4d1e94021eb10fa0089798f808628598c25dd0ed2a981b9a03e5425e`
   - `0003`：`a36216f285ed721df20050fb898eec23ab0b759983748650f2d005f24030d5c3`
   - `0004`：`46409109495226a7c6b90bea5a1c96437fe9124070925d783a63751296f831d1`
+  - `0005`：`883436d7a0f92c5e5ef35193db58d8e2110a4953f1c53949e0e512780e651306`
 
 补丁包含：
 
 1. TimesFM 2.5 编码器、官方 cumulative normalization 和变长 batch 处理。
 2. `LayerNorm → Linear → GELU → Linear → LayerNorm` projector。
-3. Stage 1 保存与 Stage 2 自动恢复 projector。
+3. Stage 1 保存与 Stage 2 自动恢复 projector；对旧 checkpoint 也可根据
+   `ts_encoder.projector` 权重 shape 反推架构。
 4. Full SFT 与 LoRA 的时间序列模块处理。
 5. 两阶段训练脚本和单元测试。
 6. Chronos-2 官方底层 `model.encode()` 接口，排除 REG/future token。
@@ -83,6 +86,7 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [`test_external_ts_backbones.py`](./direct-files/tests/model/test_external_ts_backbones.py)
 - [`train_timesfm2_5_stage1.sh`](./direct-files/scripts/full/train_timesfm2_5_stage1.sh)
 - [`train_timesfm2_5_stage2.sh`](./direct-files/scripts/full/train_timesfm2_5_stage2.sh)
+- [TimesFM 2.5 学习率网格 Stage 2 脚本](./direct-files/scripts/full/train_timesfm2_5_grid_stage2.sh)
 - [`train_timesfm2_5_one_stage.sh`](./direct-files/scripts/full/train_timesfm2_5_one_stage.sh)
 - [`train_chronos2_stage1.sh`](./direct-files/scripts/full/train_chronos2_stage1.sh)
 - [`train_chronos2_stage2.sh`](./direct-files/scripts/full/train_chronos2_stage2.sh)
@@ -231,6 +235,8 @@ git checkout bf30699
 git am "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
 git am "/path/to/0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch"
 git am "/path/to/0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch"
+git am "/path/to/0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch"
+git am "/path/to/0005-fix-restore-external-projector-from-legacy-checkpoint-weights.patch"
 ```
 
 如果你的 ChatTS-Training 已经包含后续提交，可以新建分支后尝试三方合并：
@@ -240,6 +246,8 @@ git switch -c timesfm2.5-adapter
 git am -3 "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
 git am -3 "/path/to/0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch"
 git am -3 "/path/to/0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch"
+git am -3 "/path/to/0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch"
+git am -3 "/path/to/0005-fix-restore-external-projector-from-legacy-checkpoint-weights.patch"
 ```
 
 ## 安装与训练
@@ -282,6 +290,53 @@ bash scripts/full/train_chronos2_stage2.sh
 bash scripts/full/train_zeus_stage1.sh
 bash scripts/full/train_zeus_stage2.sh
 ```
+
+### Stage 2 打印 native 的排查与修复
+
+如果 Stage 1 的权重盘点是 `timesfm2_5`，Stage 2 却全部变成 `native`，根因通常是：
+
+1. Stage 1 虽然保存了 1280 维 `ts_encoder.projector.*`，但旧版代码没有把
+   `ts_encoder_type=timesfm2_5` 持久化到 `config.json`。
+2. Stage 2 在加载权重之前就要决定构造哪个编码器；缺少元数据时，旧版
+   `auto` 默认构造 native MLP，projector 权重随后被当成 unexpected keys 忽略。
+3. Stage 2 最终保存的因而是 native MLP，这不是一阶段 TimesFM 在训练中
+   “自己变回去”。
+
+`0005` 修复了这条加载链：1280 维 projector 权重可唯一识别为 TimesFM 2.5，
+并在替换架构后精确恢复 Stage 1 projector；新配置同时会写回 `model.config`，
+后续 checkpoint 不再丢失元数据。Chronos-2 与 Zeus 同为 768 维，老权重仍需
+`ts.patch_size` 或显式 `--ts_encoder_type` 消除歧义。
+
+对已练好的旧 Stage 1，不需重跑一阶段。先在服务器的 ChatTS-Training 根目录
+应用新文件或 `0005`，再用显式参数跑一个新目录的 smoke test：
+
+```bash
+TIMESFM_MODEL_PATH=/workspace/timesfm \
+bash scripts/full/train_timesfm2_5_grid_stage2.sh \
+  1e-5 s1lr_1e-5 s1lr_1e-5__s2lr_1e-5_fixcheck
+```
+
+网格 Stage 2 脚本始终显式传入：
+
+```bash
+--ts_encoder_type timesfm2_5 \
+--timesfm_model_name_or_path /workspace/timesfm
+```
+
+正常日志必须包含类似：
+
+```text
+Loaded TimesFM 2.5 projector weights from '.../s1lr_1e-5'.
+```
+
+如果看到 `Initialized a new TimesFM 2.5 projector`，先停止训练：这表示没有恢复
+Stage 1 对齐结果。确认 smoke test 的盘点结果为 `timesfm2_5 / OK`后，
+再备份原来 9 个 native Stage 2 目录并重跑网格。那些 native Stage 2 已经丢失
+TimesFM 语义路径，不能用修改 `config.json` 的方式补救。
+
+用户自定义 Stage 1 脚本中的 `--finetuning_type sft` 也应改为
+`--finetuning_type full`。在本实现中，`full` 才表示全参数 SFT；外部 TimesFM
+仍由 adapter 内的 `requires_grad_(False)` 和 `torch.no_grad()` 保持冻结。
 
 三个方案都不需要额外手工归一化：TimesFM 走官方 cumulative normalization；Chronos-2
 在官方 encoder 内完成 instance normalization 与 `asinh`；ZEUS 适配器按有效点执行
@@ -358,7 +413,10 @@ Stage 2 使用梯度累积 4。
 - Stage 1 与 Stage 2 均训练完整 LLM 和两层 projector；这与 TS-Reasoner 原论文一致。
 - 外部 backbone 权重不写入 ChatTS checkpoint，只保存 projector，避免重复保存 100M–200M 参数。
 - 原 ChatTS MLP encoder 权重不能迁移，需要重新运行 Stage 1 对齐 projector。
-- Stage 1 会写入具体 `ts_encoder_type`，Stage 2 使用 `auto` 自动恢复架构、模型路径与 projector。
+- 新 Stage 1 会把具体 `ts_encoder_type` 持久化到 `model.config`；旧 Stage 1
+  即使缺少该字段，也可从 projector 权重与 patch size 识别并恢复。
+- 训练脚本显式传入目标架构和本地 backbone 路径；`auto` 可用于元数据完整
+  或可从权重唯一推断的 checkpoint。
 - 单条序列上限：TimesFM 16,384 点，Chronos-2 8,192 点，ZEUS 4,096 点。
 - 训练后的模型需通过打过补丁的 LLaMA-Factory loader 加载；普通的
   `AutoModelForCausalLM.from_pretrained(...)` 不会自动重建外部 backbone adapter。
@@ -372,13 +430,15 @@ Stage 2 使用梯度累积 4。
 
 - Ruff 检查和格式检查通过。
 - Python compileall 通过。
-- 六个训练脚本的 `bash -n` 检查通过。
+- 新增的 TimesFM Stage 2 与网格 Stage 2 脚本的 `bash -n` 检查通过。
 - 模拟 TimesFM backbone 的变长输入接口通过：长度 `[40, 65]` 得到 patch 数 `[2, 3]`。
 - 冻结状态和“TimesFM 权重不进入 ChatTS state dict”通过。
 - LoRA projector 隔离与完整保存逻辑通过。
 - Stage 1 checkpoint → Stage 2 projector 自动恢复通过。
 - 官方 `TimesFM_2p5_200M_torch.from_pretrained` API 已核对。
-- 10 项 TimesFM/Chronos-2/ZEUS 单元测试全部通过。
+- 原有 10 项 TimesFM/Chronos-2/ZEUS 单元测试全部通过；本次新增了
+  “缺失 encoder 元数据的旧 Stage 1”回归测试。当前本地环境未安装
+  PyTorch/TimesFM，新测试只完成 AST 静态校验，尚未在本机执行。
 - `amazon/chronos-2` 在 Transformers 4.51.3 下完成真实权重加载和前向：33 点得到
   3 个 context patch，encoder 输出形状为 `[1, 5, 768]`，排除 REG/future 后为 `[1, 3, 768]`。
 - `GestaltCog/zeus` 官方 102,096,777 参数已真实加载；本地 eager 实现与官方
