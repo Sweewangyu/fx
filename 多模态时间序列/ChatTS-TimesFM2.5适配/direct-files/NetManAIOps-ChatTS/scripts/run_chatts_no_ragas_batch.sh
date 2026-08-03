@@ -32,14 +32,20 @@ NUM_GPUS_PER_PROCESS="${NUM_GPUS_PER_PROCESS:-2}"
 EVAL_WORKERS="${EVAL_WORKERS:-8}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# Optional architecture override for legacy checkpoints whose config.json lost
-# the external time-series encoder metadata. Leave empty to auto-detect each
-# checkpoint from ts_encoder_type or its single backbone path field.
+# Optional architecture override. Leave empty to auto-detect each checkpoint
+# from config metadata first, then from ts_encoder MLP/projector weight shapes.
 # Supported values: native, timesfm2_5, chronos2, zeus.
 # CHATTS_TS_ENCODER_TYPE is accepted too, so either of these one-shot commands works:
 #   TS_ENCODER_TYPE=timesfm2_5 bash run_chatts_no_ragas_batch.sh
 #   CHATTS_TS_ENCODER_TYPE=timesfm2_5 bash run_chatts_no_ragas_batch.sh
 TS_ENCODER_TYPE="${TS_ENCODER_TYPE:-${CHATTS_TS_ENCODER_TYPE:-}}"
+
+# Optional shared local backbone directories/files. Frozen backbone weights are
+# intentionally not duplicated inside every ChatTS checkpoint. These aliases
+# are mapped to the CHATTS_* variables consumed by chatts_vllm.py.
+TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-${CHATTS_TIMESFM_MODEL_PATH:-}}"
+CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-${CHATTS_CHRONOS2_MODEL_PATH:-}}"
+ZEUS_MODEL_PATH="${ZEUS_MODEL_PATH:-${CHATTS_ZEUS_MODEL_PATH:-}}"
 
 # Set FORCE_INFERENCE=1 to overwrite an already complete generated_answer file.
 FORCE_INFERENCE="${FORCE_INFERENCE:-0}"
@@ -106,8 +112,11 @@ echo " Found ${#MODEL_DIRS[@]} model(s): ${MODEL_DIRS[*]}"
 if [[ -n "$TS_ENCODER_TYPE" ]]; then
     echo " TS encoder override: $TS_ENCODER_TYPE"
 else
-    echo " TS encoder: auto-detect from each checkpoint config.json"
+    echo " TS encoder: auto-detect from config and checkpoint weights"
 fi
+[[ -n "$TIMESFM_MODEL_PATH" ]] && echo " TimesFM backbone: $TIMESFM_MODEL_PATH"
+[[ -n "$CHRONOS2_MODEL_PATH" ]] && echo " Chronos-2 backbone: $CHRONOS2_MODEL_PATH"
+[[ -n "$ZEUS_MODEL_PATH" ]] && echo " Zeus backbone: $ZEUS_MODEL_PATH"
 echo "=========================================="
 
 # ---- Temporary directory for inference script backup ----
@@ -123,6 +132,193 @@ restore_source() {
 trap restore_source EXIT INT TERM
 
 # ---- Helper functions ----
+
+detect_encoder_type_from_checkpoint() {
+    local model_checkpoint="$1"
+
+    "$PYTHON_BIN" - "$model_checkpoint" <<'PY'
+from __future__ import annotations
+
+import glob
+import json
+import os
+import sys
+from collections.abc import Mapping
+
+
+checkpoint = os.path.abspath(sys.argv[1])
+config_path = os.path.join(checkpoint, "config.json")
+config = {}
+if os.path.isfile(config_path):
+    with open(config_path, "r", encoding="utf-8") as stream:
+        config = json.load(stream)
+
+aliases = {
+    "mlp": "native",
+    "mlp_patch": "native",
+    "mlp-patch": "native",
+    "chatts_mlp": "native",
+    "timesfm2.5": "timesfm2_5",
+    "timesfm-2.5": "timesfm2_5",
+    "chronos-2": "chronos2",
+}
+configured = config.get("ts_encoder_type")
+if isinstance(configured, str):
+    configured = aliases.get(configured.strip().lower(), configured.strip().lower())
+if configured not in (None, "", "auto"):
+    print(configured)
+    raise SystemExit(0)
+
+path_fields = {
+    "timesfm2_5": "timesfm_model_name_or_path",
+    "chronos2": "chronos2_model_name_or_path",
+    "zeus": "zeus_model_name_or_path",
+}
+path_matches = [
+    encoder_type
+    for encoder_type, field in path_fields.items()
+    if config.get(field)
+]
+if len(path_matches) == 1:
+    print(path_matches[0])
+    raise SystemExit(0)
+if len(path_matches) > 1:
+    raise SystemExit(
+        "Cannot auto-detect the TS encoder: config.json contains multiple "
+        f"backbone path fields ({', '.join(path_matches)})."
+    )
+
+
+def relevant_shape(name: str, shape: tuple[int, ...]):
+    """Return (kind, input_dim) for an identifying ChatTS tensor."""
+    if "ts_encoder.mlp." in name:
+        return "native", None
+    if "ts_encoder.projector.input_norm.weight" in name and shape:
+        return "projector", int(shape[0])
+    if "ts_encoder.projector.linear_in.weight" in name and len(shape) >= 2:
+        return "projector", int(shape[-1])
+    return None
+
+
+native_found = False
+projector_dims: set[int] = set()
+
+
+def record(name: str, shape: tuple[int, ...]) -> None:
+    global native_found
+    result = relevant_shape(name, shape)
+    if result is None:
+        return
+    kind, input_dim = result
+    if kind == "native":
+        native_found = True
+    elif input_dim is not None:
+        projector_dims.add(input_dim)
+
+
+weight_files: list[str] = []
+patterns = (
+    "model*.safetensors",
+    "pytorch_model*.safetensors",
+    "pytorch_model*.bin",
+    "model*.bin",
+    "model*.pt",
+    "pytorch_model*.pt",
+)
+for pattern in patterns:
+    weight_files.extend(glob.glob(os.path.join(checkpoint, pattern)))
+weight_files = list(dict.fromkeys(sorted(weight_files)))
+
+for weight_path in weight_files:
+    if weight_path.endswith(".safetensors"):
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:
+            raise SystemExit(
+                "safetensors is required to inspect this checkpoint."
+            ) from exc
+        with safe_open(weight_path, framework="pt", device="cpu") as stream:
+            for name in stream.keys():
+                if "ts_encoder." not in name:
+                    continue
+                record(name, tuple(stream.get_slice(name).get_shape()))
+    else:
+        import torch
+
+        load_kwargs = {"map_location": "cpu"}
+        try:
+            state = torch.load(
+                weight_path,
+                weights_only=True,
+                mmap=True,
+                **load_kwargs,
+            )
+        except (TypeError, RuntimeError):
+            # Compatibility with older PyTorch releases/checkpoint formats.
+            # This may use more RAM than mmap mode, but only runs before vLLM
+            # allocates the model.
+            try:
+                state = torch.load(
+                    weight_path,
+                    weights_only=True,
+                    **load_kwargs,
+                )
+            except TypeError:
+                state = torch.load(weight_path, **load_kwargs)
+
+        def visit(value, prefix: str = "", depth: int = 0) -> None:
+            if isinstance(value, torch.Tensor):
+                if "ts_encoder." in prefix:
+                    record(prefix, tuple(value.shape))
+                return
+            if isinstance(value, Mapping) and depth < 3:
+                for key, child in value.items():
+                    child_name = f"{prefix}.{key}" if prefix else str(key)
+                    visit(child, child_name, depth + 1)
+
+        visit(state)
+        del state
+
+if native_found and projector_dims:
+    raise SystemExit(
+        "Checkpoint contains both native ts_encoder.mlp.* and external "
+        "ts_encoder.projector.* weights; refusing to guess."
+    )
+if native_found:
+    print("native")
+    raise SystemExit(0)
+if projector_dims == {1280}:
+    print("timesfm2_5")
+    raise SystemExit(0)
+if projector_dims == {768}:
+    patch_size = (config.get("ts") or {}).get("patch_size")
+    try:
+        patch_size = int(patch_size)
+    except (TypeError, ValueError):
+        patch_size = None
+    if patch_size == 16:
+        print("chronos2")
+        raise SystemExit(0)
+    if patch_size == 32:
+        print("zeus")
+        raise SystemExit(0)
+    raise SystemExit(
+        "The checkpoint has a 768-d external projector, which can be either "
+        "Chronos-2 or Zeus. Their saved projector tensor names and shapes are "
+        "identical. Set TS_ENCODER_TYPE=chronos2 or zeus, or retain ts.patch_size "
+        "(16 for Chronos-2; 32 for Zeus) in config.json."
+    )
+if projector_dims:
+    raise SystemExit(
+        "Unsupported or inconsistent external projector input dimensions: "
+        f"{sorted(projector_dims)}."
+    )
+raise SystemExit(
+    "Could not find identifying ts_encoder.mlp.* or "
+    "ts_encoder.projector.* tensors in the checkpoint."
+)
+PY
+}
 
 configure_inference() {
     local model_checkpoint="$1"
@@ -203,6 +399,7 @@ run_inference() {
     local model_checkpoint="$1"
     local dataset_path="$2"
     local exp_name="$3"
+    local ts_encoder_type="$4"
 
     if [[ "$FORCE_INFERENCE" != "1" ]] && \
        inference_is_complete "$dataset_path" "$exp_name"; then
@@ -222,11 +419,17 @@ run_inference() {
         "VLLM_WORKER_MULTIPROC_METHOD=spawn"
         "VLLM_ALLOW_INSECURE_SERIALIZATION=1"
     )
-    if [[ -n "$TS_ENCODER_TYPE" ]]; then
+    if [[ -n "$ts_encoder_type" ]]; then
         # env passes the selection to the parent Python process and every vLLM
         # spawn worker without requiring a permanent shell export.
-        launch_env+=("CHATTS_TS_ENCODER_TYPE=$TS_ENCODER_TYPE")
+        launch_env+=("CHATTS_TS_ENCODER_TYPE=$ts_encoder_type")
     fi
+    [[ -n "$TIMESFM_MODEL_PATH" ]] && \
+        launch_env+=("CHATTS_TIMESFM_MODEL_PATH=$TIMESFM_MODEL_PATH")
+    [[ -n "$CHRONOS2_MODEL_PATH" ]] && \
+        launch_env+=("CHATTS_CHRONOS2_MODEL_PATH=$CHRONOS2_MODEL_PATH")
+    [[ -n "$ZEUS_MODEL_PATH" ]] && \
+        launch_env+=("CHATTS_ZEUS_MODEL_PATH=$ZEUS_MODEL_PATH")
 
     env "${launch_env[@]}" \
         "$PYTHON_BIN" -m chatts.utils.inference_tsmllm_vllm
@@ -376,15 +579,26 @@ for model_dir in "${MODEL_DIRS[@]}"; do
     echo "  EXP_B:      $EXP_B"
 
     model_failed=0
+    MODEL_TS_ENCODER_TYPE="$TS_ENCODER_TYPE"
+    if [[ "$MODE" != "--score-only" && -z "$MODEL_TS_ENCODER_TYPE" ]]; then
+        if MODEL_TS_ENCODER_TYPE="$(detect_encoder_type_from_checkpoint "$MODEL_CHECKPOINT")"; then
+            echo "  TS encoder: $MODEL_TS_ENCODER_TYPE (auto-detected)"
+        else
+            echo "WARNING: Could not detect TS encoder for $model_dir" >&2
+            model_failed=1
+        fi
+    elif [[ -n "$MODEL_TS_ENCODER_TYPE" ]]; then
+        echo "  TS encoder: $MODEL_TS_ENCODER_TYPE (manual override)"
+    fi
 
     # ---- Inference ----
-    if [[ "$MODE" != "--score-only" ]]; then
+    if [[ "$MODE" != "--score-only" && "$model_failed" -eq 0 ]]; then
         echo "==================== Inference ===================="
-        if ! run_inference "$MODEL_CHECKPOINT" "$DATASET_A" "$EXP_A"; then
+        if ! run_inference "$MODEL_CHECKPOINT" "$DATASET_A" "$EXP_A" "$MODEL_TS_ENCODER_TYPE"; then
             echo "WARNING: Inference failed for $model_dir (dataset A)" >&2
             model_failed=1
         fi
-        if ! run_inference "$MODEL_CHECKPOINT" "$DATASET_B" "$EXP_B"; then
+        if ! run_inference "$MODEL_CHECKPOINT" "$DATASET_B" "$EXP_B" "$MODEL_TS_ENCODER_TYPE"; then
             echo "WARNING: Inference failed for $model_dir (dataset B)" >&2
             model_failed=1
         fi

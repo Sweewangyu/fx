@@ -1,6 +1,6 @@
 # NetManAIOps/ChatTS 四后端 vLLM 适配
 
-这两个文件用于修复外部时间序列 backbone checkpoint 在
+这些文件用于修复外部时间序列 backbone checkpoint 在
 NetManAIOps/ChatTS vLLM 评测中的权重加载错误，同时保持原始 ChatTS MLP-Patch
 checkpoint 兼容：
 
@@ -95,17 +95,25 @@ Chronos-2 为 16。它是进程级设置，因此一次评测进程只应用于�
 ## 批处理评测脚本怎么传参
 
 [`scripts/run_chatts_no_ragas_batch.sh`](./scripts/run_chatts_no_ragas_batch.sh)
-默认不传环境覆盖，由推理代码逐个读取 checkpoint 的 `config.json`：
+默认不传环境覆盖，会先读取每个 checkpoint 的配置，配置无元数据时再扫描
+`ts_encoder` 权重名和 tensor shape：
 
 ```bash
 bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
-对于旧 checkpoint，如果权重已经是 TimesFM projector，但
-`config.json` 没有 `ts_encoder_type` 和 backbone 路径字段，可以仅对这次命令指定：
+自动识别规则：
+
+- `ts_encoder.mlp.*` → 原始 ChatTS MLP。
+- 1280 维 `ts_encoder.projector.*` → TimesFM 2.5。
+- 768 维 projector + patch size 16 → Chronos-2。
+- 768 维 projector + patch size 32 → Zeus。
+
+Chronos-2 和 Zeus 的 projector 权重名与 shape 完全相同。如果连 patch size 也没保存，
+仅根据权重在数学上无法区分，脚本会明确报错而不会猜。此时可仅对本次命令指定：
 
 ```bash
-TS_ENCODER_TYPE=timesfm2_5 \
+TS_ENCODER_TYPE=chronos2 \
 bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
@@ -113,13 +121,32 @@ bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 `CHATTS_TS_ENCODER_TYPE`，并传给 Python 父进程与所有 vLLM spawn worker。也可以直接用：
 
 ```bash
-CHATTS_TS_ENCODER_TYPE=timesfm2_5 \
+CHATTS_TS_ENCODER_TYPE=chronos2 \
 bash scripts/run_chatts_no_ragas_batch.sh --infer-only
 ```
 
-如果 `SEARCH_DIR` 混合了多种编码器，不要设全局覆盖；应补齐每个
-checkpoint 的 `config.json`。仅根据 projector 权重不能总是唯一识别：
-Chronos-2 和 Zeus 的 projector 输入维度同为 768。
+如果 `SEARCH_DIR` 混合了多种编码器，不要设全局覆盖；应保留每个 checkpoint
+可用于区分 Chronos-2/Zeus 的 patch size 或编码器元数据。
+
+## 离线加载 TimesFM 主干
+
+ChatTS Stage 2 checkpoint 只保存训练过的 `ts_encoder.projector.*`。TimesFM 2.5
+是冻结的 200M 外部主干，不会重复打包进每个网格实验 checkpoint。无网评测机需要
+准备一份共享的 `model.safetensors`：
+
+```bash
+# 在能联网的机器上执行，再把整个目录复制到评测机
+hf download google/timesfm-2.5-200m-pytorch \
+  --local-dir /tmp/timesfm-2.5-200m-pytorch
+
+# 在无网评测机上；最新批处理脚本会自动识别 TimesFM 类型
+HF_HUB_OFFLINE=1 \
+TIMESFM_MODEL_PATH=/workspace/timesf \
+bash scripts/run_chatts_no_ragas_batch.sh --infer-only
+```
+
+`TIMESFM_MODEL_PATH` 可以指向包含 `model.safetensors` 的目录，也可直接指向该文件。
+它会被脚本映射为 `CHATTS_TIMESFM_MODEL_PATH` 并传给所有 vLLM worker。
 
 ## 正确启动标志
 
@@ -139,6 +166,6 @@ Chronos-2 和 Zeus 的 projector 输入维度同为 768。
 
 - 四种后端都必须使用与训练时相同的 ChatTS Processor；不要在评测脚本外再次 z-score。
 - TimesFM、Chronos-2、Zeus 主干均冻结并保持 FP32。
-- 外部主干不在 ChatTS checkpoint 内；首次评测需能访问模型缓存或 Hugging Face。
+- 外部主干不在 ChatTS checkpoint 内；评测需能访问本地共享主干、模型缓存或 Hugging Face。
 - tensor parallel 只切分 Qwen，外部时序主干在每个 vLLM worker 中各复制一份。
 - 不要过滤或跳过 `ts_encoder.projector.*`；这样会得到能运行但无效的评测结果。

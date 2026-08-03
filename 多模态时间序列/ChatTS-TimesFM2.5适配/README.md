@@ -131,9 +131,10 @@ export CHATTS_TS_ENCODER_TYPE=timesfm2_5
 `CHATTS_ZEUS_MODEL_PATH` 指向评测机本地 backbone。永久方案仍是把正确的
 `ts_encoder_type`、backbone 路径字段和 patch size 写回 checkpoint `config.json`。
 
-对本目录附带的批处理脚本，默认留空就会逐个自动读取 checkpoint
-配置；只有旧 checkpoint 丢失上述元数据时才需要单次覆盖，不需要先
-`export`：
+对本目录附带的批处理脚本，默认留空就会先读取 checkpoint 配置，
+再根据 `ts_encoder.mlp.*` / `ts_encoder.projector.*` 权重 shape 自动识别。
+TimesFM 2.5 的 1280 维 projector 可唯一识别；Chronos-2 和 Zeus 同为 768 维，
+需要保留 patch size 或单次覆盖，不需要先 `export`：
 
 ```bash
 TS_ENCODER_TYPE=timesfm2_5 \
@@ -142,6 +143,15 @@ bash direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh --infe
 
 若一个 `SEARCH_DIR` 中混合了多种编码器，应修复每个 checkpoint 的
 `config.json`，不要对整批设置同一覆盖值。
+
+TimesFM 冻结主干不会复制进每个 ChatTS checkpoint，只保存了训练的 projector。
+无网评测时将一份 TimesFM `model.safetensors` 放在共享目录，然后：
+
+```bash
+HF_HUB_OFFLINE=1 \
+TIMESFM_MODEL_PATH=/workspace/timesf \
+bash direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh --infer-only
+```
 
 服务器上先备份，再覆盖两个文件：
 
