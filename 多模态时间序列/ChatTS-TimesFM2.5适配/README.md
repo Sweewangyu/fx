@@ -90,6 +90,7 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [`train_zeus_stage2.sh`](./direct-files/scripts/full/train_zeus_stage2.sh)
 - [vLLM 四后端版 `chatts_vllm.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/chatts_vllm.py)
 - [Zeus eager 模型结构 `zeus_modeling.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/zeus_modeling.py)
+- [Dataset A/B 批处理评测脚本](./direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh)
 - [NetManAIOps/ChatTS 覆盖与评测说明](./direct-files/NetManAIOps-ChatTS/README.md)
 
 其中 `timesfm2_5.py`、`chronos2.py`、`zeus.py`、`zeus_modeling.py` 和
@@ -129,6 +130,18 @@ export CHATTS_TS_ENCODER_TYPE=timesfm2_5
 也可以分别用 `CHATTS_TIMESFM_MODEL_PATH`、`CHATTS_CHRONOS2_MODEL_PATH`、
 `CHATTS_ZEUS_MODEL_PATH` 指向评测机本地 backbone。永久方案仍是把正确的
 `ts_encoder_type`、backbone 路径字段和 patch size 写回 checkpoint `config.json`。
+
+对本目录附带的批处理脚本，默认留空就会逐个自动读取 checkpoint
+配置；只有旧 checkpoint 丢失上述元数据时才需要单次覆盖，不需要先
+`export`：
+
+```bash
+TS_ENCODER_TYPE=timesfm2_5 \
+bash direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh --infer-only
+```
+
+若一个 `SEARCH_DIR` 中混合了多种编码器，应修复每个 checkpoint 的
+`config.json`，不要对整批设置同一覆盖值。
 
 服务器上先备份，再覆盖两个文件：
 

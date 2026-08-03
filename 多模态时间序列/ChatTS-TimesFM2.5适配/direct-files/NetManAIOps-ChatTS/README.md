@@ -6,6 +6,7 @@ checkpoint 兼容：
 
 - `chatts/vllm/chatts_vllm.py`：支持原始 MLP-Patch、TimesFM 2.5、Chronos-2 和 Zeus。
 - `chatts/vllm/zeus_modeling.py`：Zeus 官方 checkpoint 兼容的 eager-attention 结构。
+- `scripts/run_chatts_no_ragas_batch.sh`：用户批处理评测脚本的可选编码器覆盖版。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
@@ -90,6 +91,35 @@ Chronos-2 为 16。它是进程级设置，因此一次评测进程只应用于�
 训练补丁保存 checkpoint 时会自动写入这些字段。若字段中保存的是训练机本地路径，
 评测机不存在该路径，就把它改成对应 Hugging Face ID 或评测机本地模型目录。
 若 `ts_encoder_type` 缺失，但只存在一个 backbone 路径字段，最新版推理代码也会自动推断。
+
+## 批处理评测脚本怎么传参
+
+[`scripts/run_chatts_no_ragas_batch.sh`](./scripts/run_chatts_no_ragas_batch.sh)
+默认不传环境覆盖，由推理代码逐个读取 checkpoint 的 `config.json`：
+
+```bash
+bash scripts/run_chatts_no_ragas_batch.sh --infer-only
+```
+
+对于旧 checkpoint，如果权重已经是 TimesFM projector，但
+`config.json` 没有 `ts_encoder_type` 和 backbone 路径字段，可以仅对这次命令指定：
+
+```bash
+TS_ENCODER_TYPE=timesfm2_5 \
+bash scripts/run_chatts_no_ragas_batch.sh --infer-only
+```
+
+不需要在 shell 中先执行永久的 `export`。脚本会把它映射为
+`CHATTS_TS_ENCODER_TYPE`，并传给 Python 父进程与所有 vLLM spawn worker。也可以直接用：
+
+```bash
+CHATTS_TS_ENCODER_TYPE=timesfm2_5 \
+bash scripts/run_chatts_no_ragas_batch.sh --infer-only
+```
+
+如果 `SEARCH_DIR` 混合了多种编码器，不要设全局覆盖；应补齐每个
+checkpoint 的 `config.json`。仅根据 projector 权重不能总是唯一识别：
+Chronos-2 和 Zeus 的 projector 输入维度同为 768。
 
 ## 正确启动标志
 
