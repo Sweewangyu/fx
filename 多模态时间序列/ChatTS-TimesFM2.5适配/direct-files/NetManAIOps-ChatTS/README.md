@@ -11,7 +11,7 @@ checkpoint 兼容：
 
 文件 SHA-256：
 
-- `chatts_vllm.py`：`d573f0178f27752c350650568d9bbdf882470edcfb56e33e841bbe2cff7eb0f9`
+- `chatts_vllm.py`：`c04cd7e854e96c3b8c9559a41c5de8be3c32b1a2b8009cc767e106edfbeadd94`
 - `zeus_modeling.py`：`d5850fb0d8d104f6d7d92580b74e48df5b0bf450536cdb662fff35fa66b5c271`
 
 ## 覆盖文件
@@ -36,6 +36,48 @@ pip install 'chronos-forecasting==2.3.1'    # Chronos-2
 
 Zeus 不需要 BasicTS 或 FlashAttention，但必须复制本目录的 `zeus_modeling.py`。
 
+## 出现 “Using the native ChatTS MLP-Patch encoder”
+
+如果 checkpoint 权重含 `ts_encoder.projector.*`，但启动日志显示：
+
+```text
+[ChatTS vLLM] Using the native ChatTS MLP-Patch encoder.
+```
+
+说明评测目录的 `config.json` 缺少外部编码器元数据，或仍是原始 ChatTS 配置。
+更新本目录最新版 `chatts_vllm.py` 后，可先用环境变量明确指定本次评测架构：
+
+```bash
+# 三选一；原始 MLP 则使用 native
+export CHATTS_TS_ENCODER_TYPE=timesfm2_5
+# export CHATTS_TS_ENCODER_TYPE=chronos2
+# export CHATTS_TS_ENCODER_TYPE=zeus
+
+# 可选：评测机上的本地 backbone 路径；不设置就使用 config 或官方 Hugging Face ID
+# export CHATTS_TIMESFM_MODEL_PATH=/models/timesfm-2.5-200m-pytorch
+# export CHATTS_CHRONOS2_MODEL_PATH=/models/chronos-2
+# export CHATTS_ZEUS_MODEL_PATH=/models/zeus
+```
+
+环境变量会同时修正模型端和 vLLM Processor 使用的 patch size：TimesFM/Zeus 为 32，
+Chronos-2 为 16。它是进程级设置，因此一次评测进程只应用于一种 checkpoint 架构。
+
+更推荐的永久修复是补齐 checkpoint 的 `config.json`。以 TimesFM 2.5 为例：
+
+```json
+{
+  "ts_encoder_type": "timesfm2_5",
+  "timesfm_model_name_or_path": "google/timesfm-2.5-200m-pytorch",
+  "ts": {
+    "patch_size": 32
+  }
+}
+```
+
+这里只展示需要确认的字段；不要用这段 JSON 覆盖整个配置文件。Chronos-2 对应
+`chronos2`、`chronos2_model_name_or_path`、patch size 16；Zeus 对应 `zeus`、
+`zeus_model_name_or_path`、patch size 32。
+
 ## `config.json` 契约
 
 | `ts_encoder_type` | patch size | backbone 路径字段 |
@@ -47,6 +89,7 @@ Zeus 不需要 BasicTS 或 FlashAttention，但必须复制本目录的 `zeus_mo
 
 训练补丁保存 checkpoint 时会自动写入这些字段。若字段中保存的是训练机本地路径，
 评测机不存在该路径，就把它改成对应 Hugging Face ID 或评测机本地模型目录。
+若 `ts_encoder_type` 缺失，但只存在一个 backbone 路径字段，最新版推理代码也会自动推断。
 
 ## 正确启动标志
 

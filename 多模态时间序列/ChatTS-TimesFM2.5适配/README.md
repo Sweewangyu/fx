@@ -115,6 +115,21 @@ in Qwen3TSForCausalLM
 | `chronos2` | `amazon/chronos-2` | 16 | `chronos-forecasting==2.3.1` |
 | `zeus` | `GestaltCog/zeus` | 32 | 无；必须同时复制 `zeus_modeling.py` |
 
+如果权重含 `ts_encoder.projector.*`，启动时却打印
+`Using the native ChatTS MLP-Patch encoder`，说明评测目录没有保存外部编码器元数据。
+最新版支持用环境变量立即指定：
+
+```bash
+# 按实际 checkpoint 三选一
+export CHATTS_TS_ENCODER_TYPE=timesfm2_5
+# export CHATTS_TS_ENCODER_TYPE=chronos2
+# export CHATTS_TS_ENCODER_TYPE=zeus
+```
+
+也可以分别用 `CHATTS_TIMESFM_MODEL_PATH`、`CHATTS_CHRONOS2_MODEL_PATH`、
+`CHATTS_ZEUS_MODEL_PATH` 指向评测机本地 backbone。永久方案仍是把正确的
+`ts_encoder_type`、backbone 路径字段和 patch size 写回 checkpoint `config.json`。
+
 服务器上先备份，再覆盖两个文件：
 
 ```bash

@@ -221,6 +221,22 @@ NATIVE_ENCODER_ALIASES = (
     "mlp-patch",
     "chatts_mlp",
 )
+TS_ENCODER_TYPE_ENV = "CHATTS_TS_ENCODER_TYPE"
+TS_ENCODER_PATH_FIELDS = {
+    TIMESFM2_5_ENCODER: "timesfm_model_name_or_path",
+    CHRONOS2_ENCODER: "chronos2_model_name_or_path",
+    ZEUS_ENCODER: "zeus_model_name_or_path",
+}
+TS_ENCODER_PATCH_SIZES = {
+    TIMESFM2_5_ENCODER: TIMESFM2_5_PATCH_SIZE,
+    CHRONOS2_ENCODER: CHRONOS2_PATCH_SIZE,
+    ZEUS_ENCODER: ZEUS_OUTPUT_SCALE,
+}
+TS_ENCODER_TYPE_ALIASES = {
+    "timesfm2.5": TIMESFM2_5_ENCODER,
+    "timesfm-2.5": TIMESFM2_5_ENCODER,
+    "chronos-2": CHRONOS2_ENCODER,
+}
 
 
 class ExternalTimeSeriesProjector(nn.Module):
@@ -800,27 +816,82 @@ class ZeusTimeSeriesEncoder(nn.Module):
         return self.projector(zeus_features), patch_cnt
 
 
+def resolve_time_series_encoder_type(config: PretrainedConfig) -> str:
+    """Resolve the encoder from an environment override or checkpoint metadata."""
+    environment_value = os.getenv(TS_ENCODER_TYPE_ENV, "").strip().lower()
+    if environment_value:
+        return TS_ENCODER_TYPE_ALIASES.get(environment_value, environment_value)
+
+    configured_value = getattr(config, "ts_encoder_type", None)
+    if isinstance(configured_value, str):
+        configured_value = configured_value.strip().lower()
+        configured_value = TS_ENCODER_TYPE_ALIASES.get(
+            configured_value, configured_value
+        )
+    if configured_value not in (None, "", "auto"):
+        return configured_value
+
+    inferred_types = [
+        encoder_type
+        for encoder_type, field_name in TS_ENCODER_PATH_FIELDS.items()
+        if getattr(config, field_name, None)
+    ]
+    if len(inferred_types) == 1:
+        return inferred_types[0]
+    if len(inferred_types) > 1:
+        fields = ", ".join(
+            TS_ENCODER_PATH_FIELDS[encoder_type]
+            for encoder_type in inferred_types
+        )
+        raise ValueError(
+            "Cannot infer the ChatTS time-series encoder because config.json "
+            f"contains multiple backbone path fields: {fields}. Set "
+            f"`{TS_ENCODER_TYPE_ENV}` explicitly."
+        )
+    if configured_value == "auto":
+        raise ValueError(
+            "config.json sets `ts_encoder_type=auto` but contains no backbone "
+            f"path metadata. Set `{TS_ENCODER_TYPE_ENV}` to `timesfm2_5`, "
+            "`chronos2`, `zeus`, or `native`."
+        )
+    return "native"
+
+
+def get_time_series_patch_size(config: PretrainedConfig) -> int:
+    """Return the patch size implied by the selected encoder architecture."""
+    encoder_type = resolve_time_series_encoder_type(config)
+    if encoder_type in NATIVE_ENCODER_ALIASES:
+        return int(config.ts["patch_size"])
+    if encoder_type in TS_ENCODER_PATCH_SIZES:
+        return TS_ENCODER_PATCH_SIZES[encoder_type]
+    raise ValueError(f"Unsupported `ts_encoder_type={encoder_type}`.")
+
+
 def build_time_series_encoder(config: PretrainedConfig) -> nn.Module:
     """Build the encoder architecture declared by the saved checkpoint."""
-    encoder_type = getattr(config, "ts_encoder_type", "native")
+    encoder_type = resolve_time_series_encoder_type(config)
+    environment_value = os.getenv(TS_ENCODER_TYPE_ENV, "").strip()
+    configured_value = getattr(config, "ts_encoder_type", None)
+    if environment_value:
+        print(
+            f"[ChatTS vLLM] `{TS_ENCODER_TYPE_ENV}={environment_value}` "
+            f"overrides config `ts_encoder_type={configured_value}`."
+        )
+    elif configured_value in (None, "", "auto") and encoder_type not in NATIVE_ENCODER_ALIASES:
+        print(
+            "[ChatTS vLLM] Inferred time-series encoder "
+            f"`{encoder_type}` from its backbone path field in config.json."
+        )
+
     if encoder_type in NATIVE_ENCODER_ALIASES:
         print("[ChatTS vLLM] Using the native ChatTS MLP-Patch encoder.")
         return TimeSeriesEmbedding(config.ts)
 
     if encoder_type == TIMESFM2_5_ENCODER:
-        configured_patch_size = int(
-            config.ts.get("patch_size", TIMESFM2_5_PATCH_SIZE)
-        )
-        if configured_patch_size != TIMESFM2_5_PATCH_SIZE:
-            raise ValueError(
-                "TimesFM 2.5 checkpoints require `ts.patch_size=32` in "
-                f"config.json, but found {configured_patch_size}."
-            )
-
-        model_name_or_path = getattr(
-            config,
-            "timesfm_model_name_or_path",
-            "google/timesfm-2.5-200m-pytorch",
+        model_name_or_path = os.getenv(
+            "CHATTS_TIMESFM_MODEL_PATH"
+        ) or getattr(
+            config, "timesfm_model_name_or_path", "google/timesfm-2.5-200m-pytorch"
         )
         print(
             "[ChatTS vLLM] Using TimesFM 2.5 time-series encoder; "
@@ -834,19 +905,10 @@ def build_time_series_encoder(config: PretrainedConfig) -> nn.Module:
         )
 
     if encoder_type == CHRONOS2_ENCODER:
-        configured_patch_size = int(
-            config.ts.get("patch_size", CHRONOS2_PATCH_SIZE)
-        )
-        if configured_patch_size != CHRONOS2_PATCH_SIZE:
-            raise ValueError(
-                "Chronos-2 checkpoints require `ts.patch_size=16` in "
-                f"config.json, but found {configured_patch_size}."
-            )
-
-        model_name_or_path = getattr(
-            config,
-            "chronos2_model_name_or_path",
-            "amazon/chronos-2",
+        model_name_or_path = os.getenv(
+            "CHATTS_CHRONOS2_MODEL_PATH"
+        ) or getattr(
+            config, "chronos2_model_name_or_path", "amazon/chronos-2"
         )
         print(
             "[ChatTS vLLM] Using Chronos-2 time-series encoder; checkpoint "
@@ -859,19 +921,8 @@ def build_time_series_encoder(config: PretrainedConfig) -> nn.Module:
         )
 
     if encoder_type == ZEUS_ENCODER:
-        configured_patch_size = int(
-            config.ts.get("patch_size", ZEUS_OUTPUT_SCALE)
-        )
-        if configured_patch_size != ZEUS_OUTPUT_SCALE:
-            raise ValueError(
-                "Zeus checkpoints require `ts.patch_size=32` in config.json, "
-                f"but found {configured_patch_size}."
-            )
-
-        model_name_or_path = getattr(
-            config,
-            "zeus_model_name_or_path",
-            "GestaltCog/zeus",
+        model_name_or_path = os.getenv("CHATTS_ZEUS_MODEL_PATH") or getattr(
+            config, "zeus_model_name_or_path", "GestaltCog/zeus"
         )
         print(
             "[ChatTS vLLM] Using Zeus time-series encoder; checkpoint "
@@ -888,6 +939,40 @@ def build_time_series_encoder(config: PretrainedConfig) -> nn.Module:
         "Supported values are `native`/`mlp`, `timesfm2_5`, `chronos2`, "
         "and `zeus`."
     )
+
+
+def validate_time_series_checkpoint_weights(
+    encoder: nn.Module,
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Fail with an actionable message when config and checkpoint disagree."""
+    native_selected = isinstance(encoder, TimeSeriesEmbedding)
+    for name, tensor in weights:
+        if native_selected and name.startswith("ts_encoder.projector."):
+            dimension_hint = ""
+            if name.endswith(("input_norm.weight", "input_norm.bias")) and tensor.ndim:
+                input_dimension = int(tensor.shape[0])
+                if input_dimension == TIMESFM2_5_HIDDEN_SIZE:
+                    dimension_hint = " The projector shape suggests `timesfm2_5`."
+                elif input_dimension == CHRONOS2_HIDDEN_SIZE:
+                    dimension_hint = (
+                        " The projector shape is compatible with `chronos2` or "
+                        "`zeus`; use the architecture that produced this checkpoint."
+                    )
+            raise ValueError(
+                "The checkpoint contains external time-series projector weights "
+                f"(`{name}`), but ChatTS selected the native MLP encoder."
+                f"{dimension_hint} Add the correct `ts_encoder_type` and patch "
+                "size to the checkpoint config.json, or launch with "
+                f"`{TS_ENCODER_TYPE_ENV}=timesfm2_5|chronos2|zeus`."
+            )
+        if not native_selected and name.startswith("ts_encoder.mlp."):
+            raise ValueError(
+                "The checkpoint contains native ChatTS MLP weights, but an external "
+                f"encoder was selected. Unset `{TS_ENCODER_TYPE_ENV}` or set it to "
+                "`native`, and verify config.json."
+            )
+        yield name, tensor
 
 
 # === TS Encoder === #
@@ -1078,7 +1163,7 @@ class Qwen2TSMultiModalProcessor(BaseMultiModalProcessor[Qwen2TSProcessingInfo]
         if 'timeseries' not in out_mm_kwargs:
             return []
 
-        patch_size = hf_config.ts['patch_size']
+        patch_size = get_time_series_patch_size(hf_config)
 
         # Check if we are using the new structure (list of items with .data) or old structure (list of tuples)
         ts_data = out_mm_kwargs["timeseries"]
@@ -1309,6 +1394,9 @@ class Qwen2TSForCausalLM(nn.Module, SupportsMultiModal, SupportsPP,
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
+        weights = validate_time_series_checkpoint_weights(
+            self.ts_encoder, weights
+        )
 
         autoloaded_weights = loader.load_weights(weights,
                                                  mapper=self.hf_to_vllm_mapper)
@@ -1490,6 +1578,9 @@ class Qwen3TSForCausalLM(nn.Module, SupportsMultiModal, SupportsPP,
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
+        weights = validate_time_series_checkpoint_weights(
+            self.ts_encoder, weights
+        )
 
         autoloaded_weights = loader.load_weights(weights,
                                                  mapper=self.hf_to_vllm_mapper)
