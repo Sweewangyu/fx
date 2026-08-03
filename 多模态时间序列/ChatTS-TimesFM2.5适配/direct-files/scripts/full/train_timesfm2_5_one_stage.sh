@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -Eeuo pipefail
+
 # One-stage replacement for the TS-Reasoner-style alignment + instruction recipe.
 #
 # Data exposure (approximately):
@@ -14,19 +16,23 @@
 # Frozen: complete TimesFM 2.5 backbone.
 # Effective global batch: 1 sample/GPU * 8 accumulation * 8 GPUs = 64.
 
+MODEL_PATH="${MODEL_PATH:-[PATH_TO_CHATTS_BASE_MODEL]}"
+TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-google/timesfm-2.5-200m-pytorch}"
+OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_TIMESFM_ONE_STAGE]}"
+
 NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
     --deepspeed ds_config/ds_config_3.json \
     --stage sft \
-    --model_name_or_path "[PATH_TO_CHATTS_BASE_MODEL]" \
+    --model_name_or_path "$MODEL_PATH" \
     --ts_encoder_type timesfm2_5 \
-    --timesfm_model_name_or_path "google/timesfm-2.5-200m-pytorch" \
+    --timesfm_model_name_or_path "$TIMESFM_MODEL_PATH" \
     --dataset "stage_1_120K,stage_2_30K" \
     --mix_strategy "interleave_over" \
     --interleave_probs "0.6667,0.3333" \
     --do_train \
     --template "chatts" \
     --finetuning_type full \
-    --output_dir "[OUTPUT_PATH_TIMESFM_ONE_STAGE]" \
+    --output_dir "$OUTPUT_PATH" \
     --overwrite_output_dir \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 8 \
@@ -43,3 +49,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
     --preprocessing_num_workers 96 \
     --trust_remote_code true \
     --cutoff_len 10000
+
+python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
+    --encoder-type timesfm2_5 \
+    --backbone-path "$TIMESFM_MODEL_PATH"

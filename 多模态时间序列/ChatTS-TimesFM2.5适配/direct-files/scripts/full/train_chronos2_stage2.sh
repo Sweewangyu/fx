@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 
-# TS-Reasoner-style instruction stage. `auto` restores Chronos-2 and its
-# stage-1 projector; Chronos-2 remains frozen while the full LLM is trainable.
+set -Eeuo pipefail
+
+# TS-Reasoner-style instruction stage. Explicit encoder selection plus the
+# stage-1 config restore its projector; Chronos-2 remains frozen.
 # Paper recipe: 30K instructions, global batch 32, lr 2e-5, two epochs.
+
+MODEL_PATH="${MODEL_PATH:-[OUTPUT_PATH_CHRONOS2_STAGE_1]}"
+CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-amazon/chronos-2}"
+OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_CHRONOS2_STAGE_2]}"
 
 NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
     --deepspeed ds_config/ds_config_3.json \
     --stage sft \
-    --model_name_or_path "[OUTPUT_PATH_CHRONOS2_STAGE_1]" \
-    --ts_encoder_type auto \
+    --model_name_or_path "$MODEL_PATH" \
+    --ts_encoder_type chronos2 \
+    --chronos2_model_name_or_path "$CHRONOS2_MODEL_PATH" \
     --dataset "stage_2_30K" \
     --interleave_probs "1.0" \
     --do_train \
     --mix_strategy "interleave_over" \
     --template "chatts" \
     --finetuning_type full \
-    --output_dir "[OUTPUT_PATH_CHRONOS2_STAGE_2]" \
+    --output_dir "$OUTPUT_PATH" \
     --overwrite_output_dir \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 4 \
@@ -32,3 +39,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
     --preprocessing_num_workers 96 \
     --trust_remote_code true \
     --cutoff_len 10000
+
+python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
+    --encoder-type chronos2 \
+    --backbone-path "$CHRONOS2_MODEL_PATH"

@@ -1,0 +1,540 @@
+From 37fb2704777ac6c2323a559dd99057e525235c7f Mon Sep 17 00:00:00 2001
+From: swee <2385455860@qq.com>
+Date: Mon, 3 Aug 2026 20:53:10 +0800
+Subject: [PATCH] feat: persist time-series encoder metadata from training
+ scripts
+
+---
+ README.md                                  |  23 +++-
+ scripts/full/save_ts_encoder_config.py     | 141 +++++++++++++++++++++
+ scripts/full/train_chronos2_stage1.sh      |  16 ++-
+ scripts/full/train_chronos2_stage2.sh      |  21 ++-
+ scripts/full/train_timesfm2_5_one_stage.sh |  16 ++-
+ scripts/full/train_timesfm2_5_stage1.sh    |  16 ++-
+ scripts/full/train_timesfm2_5_stage2.sh    |  23 +++-
+ scripts/full/train_zeus_stage1.sh          |  16 ++-
+ scripts/full/train_zeus_stage2.sh          |  21 ++-
+ 9 files changed, 262 insertions(+), 31 deletions(-)
+ create mode 100644 scripts/full/save_ts_encoder_config.py
+
+diff --git a/README.md b/README.md
+index 0575599..b209104 100644
+--- a/README.md
++++ b/README.md
+@@ -61,7 +61,8 @@ Important behavior:
+   alignment and instruction tuning. It does not use a projector-only stage 1.
+ - TimesFM uses 32-point patches instead of ChatTS' original 8-point patches, reducing time-series tokens by about 4x.
+ - TimesFM weights remain an external dependency and are not copied into every ChatTS checkpoint.
+-- Stage-1 checkpoints record `ts_encoder_type=timesfm2_5`; stage 2 can use `--ts_encoder_type auto`.
++- After DeepSpeed finishes, the training templates call `save_ts_encoder_config.py` to persist the exact encoder
++  metadata into the final output and every `checkpoint-*` config. Stage 2 explicitly selects the same encoder.
+ - The current adapter accepts at most 16,384 points per individual series.
+ - The old MLP encoder weights are not reusable: train the new projector in stage 1 before stage-2 SFT.
+ - Load trained checkpoints through this patched LLaMA-Factory loader; a plain upstream
+@@ -132,13 +133,29 @@ Select one backbone in stage 1:
+ --zeus_model_name_or_path GestaltCog/zeus
+ ```
+ 
+-Stage 2 should point `model_name_or_path` at the complete stage-1 checkpoint and use
+-`--ts_encoder_type auto`; the saved config reconstructs the same backbone and restores its projector.
++Stage 2 should point `model_name_or_path` at the complete stage-1 checkpoint and explicitly select the same
++encoder. The stage-1 config identifies which projector must be restored, while the explicit Stage-2 flags select
++the architecture and local frozen-backbone path. Every template automatically persists the same metadata again
++after Stage 2, so the resulting checkpoint can be sent directly to the patched vLLM evaluator.
+ Templates are provided in:
+ 
+ - `scripts/full/train_chronos2_stage1.sh` and `scripts/full/train_chronos2_stage2.sh`
+ - `scripts/full/train_zeus_stage1.sh` and `scripts/full/train_zeus_stage2.sh`
+ 
++The metadata helper can also be added to custom grid scripts. Call it immediately after a successful DeepSpeed
++command, using the same output and backbone variables:
++
++```bash
++python scripts/full/save_ts_encoder_config.py "$STAGE1_OUT" \
++  --encoder-type timesfm2_5 \
++  --backbone-path "$TIMESFM_MODEL_PATH"
++```
++
++Supported encoder types are `native`, `timesfm2_5`, `chronos2`, and `zeus`. For external encoders the helper
++writes `ts_encoder_type`, the backbone path, hidden width, and `ts.patch_size`; for Zeus it also writes
++`zeus_output_scale`. It fails if no config exists, rather than silently allowing Stage 2 to start from an
++unidentified projector.
++
+ To replace the two TS-Reasoner-style stages with one mixed SFT run, use
+ `scripts/full/train_timesfm2_5_one_stage.sh`. It interleaves the 120K alignment
+ set and 30K instruction set with probabilities `2/3,1/3` and
+diff --git a/scripts/full/save_ts_encoder_config.py b/scripts/full/save_ts_encoder_config.py
+new file mode 100644
+index 0000000..837abc1
+--- /dev/null
++++ b/scripts/full/save_ts_encoder_config.py
+@@ -0,0 +1,141 @@
++#!/usr/bin/env python3
++"""Persist time-series encoder metadata into saved ChatTS configs.
++
++This helper is intentionally independent of PyTorch and Transformers. Training
++shell scripts call it only after DeepSpeed exits successfully, so the final
++checkpoint and every ``checkpoint-*`` directory can be loaded without a
++manual config.json edit.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import tempfile
++from pathlib import Path
++from typing import Any
++
++
++ENCODER_METADATA: dict[str, dict[str, Any]] = {
++    "native": {},
++    "timesfm2_5": {
++        "path_field": "timesfm_model_name_or_path",
++        "hidden_field": "timesfm_hidden_size",
++        "hidden_size": 1280,
++        "patch_size": 32,
++    },
++    "chronos2": {
++        "path_field": "chronos2_model_name_or_path",
++        "hidden_field": "chronos2_hidden_size",
++        "hidden_size": 768,
++        "patch_size": 16,
++    },
++    "zeus": {
++        "path_field": "zeus_model_name_or_path",
++        "hidden_field": "zeus_hidden_size",
++        "hidden_size": 768,
++        "patch_size": 32,
++        "extra": {"zeus_output_scale": 32},
++    },
++}
++
++EXTERNAL_METADATA_FIELDS = {
++    "timesfm_model_name_or_path",
++    "timesfm_hidden_size",
++    "chronos2_model_name_or_path",
++    "chronos2_hidden_size",
++    "zeus_model_name_or_path",
++    "zeus_hidden_size",
++    "zeus_output_scale",
++}
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("checkpoint_dir", help="Final training output directory.")
++    parser.add_argument(
++        "--encoder-type",
++        required=True,
++        choices=tuple(ENCODER_METADATA),
++        help="Encoder architecture actually used to produce the checkpoint.",
++    )
++    parser.add_argument(
++        "--backbone-path",
++        help="Frozen external-backbone path or Hugging Face model ID. Required for non-native encoders.",
++    )
++    return parser.parse_args()
++
++
++def find_config_paths(checkpoint_dir: Path) -> list[Path]:
++    paths = []
++    root_config = checkpoint_dir / "config.json"
++    if root_config.is_file():
++        paths.append(root_config)
++    paths.extend(sorted(checkpoint_dir.glob("checkpoint-*/config.json")))
++    return list(dict.fromkeys(paths))
++
++
++def update_config(config: dict[str, Any], encoder_type: str, backbone_path: str | None) -> None:
++    for field in EXTERNAL_METADATA_FIELDS:
++        config.pop(field, None)
++
++    config["ts_encoder_type"] = encoder_type
++    metadata = ENCODER_METADATA[encoder_type]
++    if encoder_type == "native":
++        return
++
++    if not backbone_path:
++        raise ValueError(f"--backbone-path is required for encoder type {encoder_type}.")
++
++    config[metadata["path_field"]] = backbone_path
++    config[metadata["hidden_field"]] = metadata["hidden_size"]
++    config.update(metadata.get("extra", {}))
++    ts_config = config.setdefault("ts", {})
++    if not isinstance(ts_config, dict):
++        raise TypeError("config.json field `ts` must be an object.")
++    ts_config["patch_size"] = metadata["patch_size"]
++
++
++def atomic_write_json(path: Path, config: dict[str, Any]) -> None:
++    file_descriptor, temporary_name = tempfile.mkstemp(
++        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
++    )
++    try:
++        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
++            json.dump(config, file, ensure_ascii=False, indent=2)
++            file.write("\n")
++            file.flush()
++            os.fsync(file.fileno())
++        os.replace(temporary_name, path)
++    except BaseException:
++        try:
++            os.unlink(temporary_name)
++        except FileNotFoundError:
++            pass
++        raise
++
++
++def main() -> None:
++    args = parse_args()
++    checkpoint_dir = Path(args.checkpoint_dir).expanduser().resolve()
++    if not checkpoint_dir.is_dir():
++        raise SystemExit(f"Checkpoint directory does not exist: {checkpoint_dir}")
++
++    config_paths = find_config_paths(checkpoint_dir)
++    if not config_paths:
++        raise SystemExit(
++            f"No config.json found in {checkpoint_dir} or its checkpoint-* directories; "
++            "refusing to report successful metadata persistence."
++        )
++
++    for path in config_paths:
++        with path.open(encoding="utf-8") as file:
++            config = json.load(file)
++        update_config(config, args.encoder_type, args.backbone_path)
++        atomic_write_json(path, config)
++        print(f"[TS config] saved {args.encoder_type} metadata: {path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/full/train_chronos2_stage1.sh b/scripts/full/train_chronos2_stage1.sh
+index ce4e103..5e5f56d 100755
+--- a/scripts/full/train_chronos2_stage1.sh
++++ b/scripts/full/train_chronos2_stage1.sh
+@@ -1,23 +1,29 @@
+ #!/usr/bin/env bash
+ 
++set -Eeuo pipefail
++
+ # TS-Reasoner-style alignment stage with a frozen Chronos-2 backbone.
+ # Trainable: complete ChatTS LLM + TS-to-text projector. Frozen: Chronos-2.
+ # Paper recipe: 120K captions, global batch 64, lr 1e-5, one epoch.
+ # Install once with: pip install -e ".[chronos2,deepspeed]"
+ 
++MODEL_PATH="${MODEL_PATH:-[PATH_TO_CHATTS_BASE_MODEL]}"
++CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-amazon/chronos-2}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_CHRONOS2_STAGE_1]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[PATH_TO_CHATTS_BASE_MODEL]" \
++    --model_name_or_path "$MODEL_PATH" \
+     --ts_encoder_type chronos2 \
+-    --chronos2_model_name_or_path "amazon/chronos-2" \
++    --chronos2_model_name_or_path "$CHRONOS2_MODEL_PATH" \
+     --dataset "stage_1_120K" \
+     --interleave_probs "1.0" \
+     --do_train \
+     --mix_strategy "interleave_over" \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_CHRONOS2_STAGE_1]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 8 \
+@@ -34,3 +40,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type chronos2 \
++    --backbone-path "$CHRONOS2_MODEL_PATH"
+diff --git a/scripts/full/train_chronos2_stage2.sh b/scripts/full/train_chronos2_stage2.sh
+index bb4d16b..61a3c8c 100755
+--- a/scripts/full/train_chronos2_stage2.sh
++++ b/scripts/full/train_chronos2_stage2.sh
+@@ -1,21 +1,28 @@
+ #!/usr/bin/env bash
+ 
+-# TS-Reasoner-style instruction stage. `auto` restores Chronos-2 and its
+-# stage-1 projector; Chronos-2 remains frozen while the full LLM is trainable.
++set -Eeuo pipefail
++
++# TS-Reasoner-style instruction stage. Explicit encoder selection plus the
++# stage-1 config restore its projector; Chronos-2 remains frozen.
+ # Paper recipe: 30K instructions, global batch 32, lr 2e-5, two epochs.
+ 
++MODEL_PATH="${MODEL_PATH:-[OUTPUT_PATH_CHRONOS2_STAGE_1]}"
++CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-amazon/chronos-2}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_CHRONOS2_STAGE_2]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[OUTPUT_PATH_CHRONOS2_STAGE_1]" \
+-    --ts_encoder_type auto \
++    --model_name_or_path "$MODEL_PATH" \
++    --ts_encoder_type chronos2 \
++    --chronos2_model_name_or_path "$CHRONOS2_MODEL_PATH" \
+     --dataset "stage_2_30K" \
+     --interleave_probs "1.0" \
+     --do_train \
+     --mix_strategy "interleave_over" \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_CHRONOS2_STAGE_2]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 4 \
+@@ -32,3 +39,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type chronos2 \
++    --backbone-path "$CHRONOS2_MODEL_PATH"
+diff --git a/scripts/full/train_timesfm2_5_one_stage.sh b/scripts/full/train_timesfm2_5_one_stage.sh
+index c18a53d..ffeefab 100644
+--- a/scripts/full/train_timesfm2_5_one_stage.sh
++++ b/scripts/full/train_timesfm2_5_one_stage.sh
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env bash
+ 
++set -Eeuo pipefail
++
+ # One-stage replacement for the TS-Reasoner-style alignment + instruction recipe.
+ #
+ # Data exposure (approximately):
+@@ -14,19 +16,23 @@
+ # Frozen: complete TimesFM 2.5 backbone.
+ # Effective global batch: 1 sample/GPU * 8 accumulation * 8 GPUs = 64.
+ 
++MODEL_PATH="${MODEL_PATH:-[PATH_TO_CHATTS_BASE_MODEL]}"
++TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-google/timesfm-2.5-200m-pytorch}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_TIMESFM_ONE_STAGE]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[PATH_TO_CHATTS_BASE_MODEL]" \
++    --model_name_or_path "$MODEL_PATH" \
+     --ts_encoder_type timesfm2_5 \
+-    --timesfm_model_name_or_path "google/timesfm-2.5-200m-pytorch" \
++    --timesfm_model_name_or_path "$TIMESFM_MODEL_PATH" \
+     --dataset "stage_1_120K,stage_2_30K" \
+     --mix_strategy "interleave_over" \
+     --interleave_probs "0.6667,0.3333" \
+     --do_train \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_TIMESFM_ONE_STAGE]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 8 \
+@@ -43,3 +49,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type timesfm2_5 \
++    --backbone-path "$TIMESFM_MODEL_PATH"
+diff --git a/scripts/full/train_timesfm2_5_stage1.sh b/scripts/full/train_timesfm2_5_stage1.sh
+index e972e22..97e0010 100755
+--- a/scripts/full/train_timesfm2_5_stage1.sh
++++ b/scripts/full/train_timesfm2_5_stage1.sh
+@@ -1,5 +1,7 @@
+ #!/usr/bin/env bash
+ 
++set -Eeuo pipefail
++
+ # TS-Reasoner-style alignment stage.
+ # Trainable: the complete ChatTS LLM and the TS-to-text projector.
+ # Frozen: the complete TimesFM 2.5 backbone.
+@@ -7,19 +9,23 @@
+ # With 8 GPUs: 1 sample/GPU * 8 accumulation steps * 8 GPUs = 64.
+ # Install once with: pip install -e ".[timesfm,deepspeed]"
+ 
++MODEL_PATH="${MODEL_PATH:-[PATH_TO_CHATTS_BASE_MODEL]}"
++TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-google/timesfm-2.5-200m-pytorch}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_TIMESFM_STAGE_1]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[PATH_TO_CHATTS_BASE_MODEL]" \
++    --model_name_or_path "$MODEL_PATH" \
+     --ts_encoder_type timesfm2_5 \
+-    --timesfm_model_name_or_path "google/timesfm-2.5-200m-pytorch" \
++    --timesfm_model_name_or_path "$TIMESFM_MODEL_PATH" \
+     --dataset "stage_1_120K" \
+     --interleave_probs "1.0" \
+     --do_train \
+     --mix_strategy "interleave_over" \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_TIMESFM_STAGE_1]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 8 \
+@@ -36,3 +42,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type timesfm2_5 \
++    --backbone-path "$TIMESFM_MODEL_PATH"
+diff --git a/scripts/full/train_timesfm2_5_stage2.sh b/scripts/full/train_timesfm2_5_stage2.sh
+index 9393a34..c526fb4 100755
+--- a/scripts/full/train_timesfm2_5_stage2.sh
++++ b/scripts/full/train_timesfm2_5_stage2.sh
+@@ -1,23 +1,30 @@
+ #!/usr/bin/env bash
+ 
+-# TS-Reasoner-style instruction stage. `auto` reads `timesfm2_5` from the
+-# stage-1 config and restores the trainable projector while reloading the
+-# frozen Google checkpoint. The complete ChatTS LLM remains trainable.
++set -Eeuo pipefail
++
++# TS-Reasoner-style instruction stage. Explicit encoder selection plus the
++# stage-1 config restore the trainable projector while reloading the frozen
++# Google checkpoint. The complete ChatTS LLM remains trainable.
+ # Paper recipe: 30K instructions, global batch 32, lr 2e-5, two epochs.
+ # With 8 GPUs: 1 sample/GPU * 4 accumulation steps * 8 GPUs = 32.
+ 
++MODEL_PATH="${MODEL_PATH:-[OUTPUT_PATH_TIMESFM_STAGE_1]}"
++TIMESFM_MODEL_PATH="${TIMESFM_MODEL_PATH:-google/timesfm-2.5-200m-pytorch}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_TIMESFM_STAGE_2]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[OUTPUT_PATH_TIMESFM_STAGE_1]" \
+-    --ts_encoder_type auto \
++    --model_name_or_path "$MODEL_PATH" \
++    --ts_encoder_type timesfm2_5 \
++    --timesfm_model_name_or_path "$TIMESFM_MODEL_PATH" \
+     --dataset "stage_2_30K" \
+     --interleave_probs "1.0" \
+     --do_train \
+     --mix_strategy "interleave_over" \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_TIMESFM_STAGE_2]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 4 \
+@@ -34,3 +41,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type timesfm2_5 \
++    --backbone-path "$TIMESFM_MODEL_PATH"
+diff --git a/scripts/full/train_zeus_stage1.sh b/scripts/full/train_zeus_stage1.sh
+index aff8225..3cd7029 100755
+--- a/scripts/full/train_zeus_stage1.sh
++++ b/scripts/full/train_zeus_stage1.sh
+@@ -1,23 +1,29 @@
+ #!/usr/bin/env bash
+ 
++set -Eeuo pipefail
++
+ # TS-Reasoner-style alignment stage with a frozen Zeus backbone.
+ # Trainable: complete ChatTS LLM + TS-to-text projector. Frozen: Zeus.
+ # Paper recipe: 120K captions, global batch 64, lr 1e-5, one epoch.
+ # The bundled eager implementation does not require BasicTS or flash-attn.
+ 
++MODEL_PATH="${MODEL_PATH:-[PATH_TO_CHATTS_BASE_MODEL]}"
++ZEUS_MODEL_PATH="${ZEUS_MODEL_PATH:-GestaltCog/zeus}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_ZEUS_STAGE_1]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[PATH_TO_CHATTS_BASE_MODEL]" \
++    --model_name_or_path "$MODEL_PATH" \
+     --ts_encoder_type zeus \
+-    --zeus_model_name_or_path "GestaltCog/zeus" \
++    --zeus_model_name_or_path "$ZEUS_MODEL_PATH" \
+     --dataset "stage_1_120K" \
+     --interleave_probs "1.0" \
+     --do_train \
+     --mix_strategy "interleave_over" \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_ZEUS_STAGE_1]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 8 \
+@@ -34,3 +40,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type zeus \
++    --backbone-path "$ZEUS_MODEL_PATH"
+diff --git a/scripts/full/train_zeus_stage2.sh b/scripts/full/train_zeus_stage2.sh
+index 6656684..e9201cc 100755
+--- a/scripts/full/train_zeus_stage2.sh
++++ b/scripts/full/train_zeus_stage2.sh
+@@ -1,21 +1,28 @@
+ #!/usr/bin/env bash
+ 
+-# TS-Reasoner-style instruction stage. `auto` restores Zeus and its stage-1
+-# projector; Zeus remains frozen while the full LLM remains trainable.
++set -Eeuo pipefail
++
++# TS-Reasoner-style instruction stage. Explicit encoder selection plus the
++# stage-1 config restore its projector; Zeus remains frozen.
+ # Paper recipe: 30K instructions, global batch 32, lr 2e-5, two epochs.
+ 
++MODEL_PATH="${MODEL_PATH:-[OUTPUT_PATH_ZEUS_STAGE_1]}"
++ZEUS_MODEL_PATH="${ZEUS_MODEL_PATH:-GestaltCog/zeus}"
++OUTPUT_PATH="${OUTPUT_PATH:-[OUTPUT_PATH_ZEUS_STAGE_2]}"
++
+ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901 src/train.py \
+     --deepspeed ds_config/ds_config_3.json \
+     --stage sft \
+-    --model_name_or_path "[OUTPUT_PATH_ZEUS_STAGE_1]" \
+-    --ts_encoder_type auto \
++    --model_name_or_path "$MODEL_PATH" \
++    --ts_encoder_type zeus \
++    --zeus_model_name_or_path "$ZEUS_MODEL_PATH" \
+     --dataset "stage_2_30K" \
+     --interleave_probs "1.0" \
+     --do_train \
+     --mix_strategy "interleave_over" \
+     --template "chatts" \
+     --finetuning_type full \
+-    --output_dir "[OUTPUT_PATH_ZEUS_STAGE_2]" \
++    --output_dir "$OUTPUT_PATH" \
+     --overwrite_output_dir \
+     --per_device_train_batch_size 1 \
+     --gradient_accumulation_steps 4 \
+@@ -32,3 +39,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 8 --master_port=19901
+     --preprocessing_num_workers 96 \
+     --trust_remote_code true \
+     --cutoff_len 10000
++
++python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
++    --encoder-type zeus \
++    --backbone-path "$ZEUS_MODEL_PATH"
+-- 
+2.50.1 (Apple Git-155)
+

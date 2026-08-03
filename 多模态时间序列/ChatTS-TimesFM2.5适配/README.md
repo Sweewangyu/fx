@@ -35,15 +35,17 @@ Chronos-2 输出 `ceil(L / 16)` 个。
 - [TS-Reasoner 训练配置修正补丁](./0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch)。
 - [ZEUS 与 Chronos-2 扩展补丁](./0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch)。
 - [单阶段混合训练补丁](./0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch)。
+- [训练脚本自动保存 encoder 元数据补丁](./0005-feat-persist-time-series-encoder-metadata-from-train.patch)。
 - [`direct-files/`](./direct-files/)：保持 ChatTS-Training 与 NetManAIOps/ChatTS
   相对路径的完整修改文件，可直接复制到服务器。
 - 补丁基线：ChatTS-Training `bf30699`。
-- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`；单阶段脚本提交：`4e0838e`。
+- 补丁实现提交：`9e24561`；训练配置修正提交：`f6abe7b`；多 backbone 提交：`c630197`；单阶段脚本提交：`4e0838e`；元数据脚本提交：`37fb270`。
 - SHA-256：
   - `0001`：`60d3878a0f36e3e94b053894a0e64e10cbb4c9b6449b285869162e6c668a01b8`
   - `0002`：`1017284f4d1e94021eb10fa0089798f808628598c25dd0ed2a981b9a03e5425e`
   - `0003`：`a36216f285ed721df20050fb898eec23ab0b759983748650f2d005f24030d5c3`
   - `0004`：`46409109495226a7c6b90bea5a1c96437fe9124070925d783a63751296f831d1`
+  - `0005`：`59e80dbd678eefde500535e742dbf183ccbeafd74b688c89b29fdc6a49b7ab97`
 
 补丁包含：
 
@@ -57,6 +59,8 @@ Chronos-2 输出 `ceil(L / 16)` 个。
 8. `timesfm`、`chronos2` 和 `zeus` 可选依赖与 README 使用说明。
 9. NetManAIOps/ChatTS 的 vLLM 推理适配：自动识别原始 MLP-Patch、TimesFM 2.5、
    Chronos-2 和 Zeus checkpoint，并加载 `ts_encoder.projector.*`。
+10. 训练成功后由 shell 脚本自动把 encoder 元数据写入最终输出与所有
+    `checkpoint-*`，无需人工修改 `config.json`。
 
 ## 直接复制修改文件
 
@@ -81,6 +85,7 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [`timeseries_backbones.py`](./direct-files/src/llamafactory/model/model_utils/timeseries_backbones.py)
 - [`test_timesfm2_5.py`](./direct-files/tests/model/test_timesfm2_5.py)
 - [`test_external_ts_backbones.py`](./direct-files/tests/model/test_external_ts_backbones.py)
+- [`save_ts_encoder_config.py`](./direct-files/scripts/full/save_ts_encoder_config.py)
 - [`train_timesfm2_5_stage1.sh`](./direct-files/scripts/full/train_timesfm2_5_stage1.sh)
 - [`train_timesfm2_5_stage2.sh`](./direct-files/scripts/full/train_timesfm2_5_stage2.sh)
 - [`train_timesfm2_5_one_stage.sh`](./direct-files/scripts/full/train_timesfm2_5_one_stage.sh)
@@ -231,6 +236,8 @@ git checkout bf30699
 git am "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
 git am "/path/to/0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch"
 git am "/path/to/0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch"
+git am "/path/to/0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch"
+git am "/path/to/0005-feat-persist-time-series-encoder-metadata-from-train.patch"
 ```
 
 如果你的 ChatTS-Training 已经包含后续提交，可以新建分支后尝试三方合并：
@@ -240,6 +247,8 @@ git switch -c timesfm2.5-adapter
 git am -3 "/path/to/0001-feat-add-frozen-TimesFM-2.5-encoder-for-ChatTS.patch"
 git am -3 "/path/to/0002-fix-match-TS-Reasoner-two-stage-training-recipe.patch"
 git am -3 "/path/to/0003-feat-add-Zeus-and-Chronos-2-time-series-backbones.patch"
+git am -3 "/path/to/0004-feat-add-one-stage-mixed-TimesFM-training-recipe.patch"
+git am -3 "/path/to/0005-feat-persist-time-series-encoder-metadata-from-train.patch"
 ```
 
 ## 安装与训练
@@ -282,6 +291,35 @@ bash scripts/full/train_chronos2_stage2.sh
 bash scripts/full/train_zeus_stage1.sh
 bash scripts/full/train_zeus_stage2.sh
 ```
+
+### 训练后自动保存 encoder 配置
+
+`0005` 只修改训练脚本，不增加按权重 shape 猜测架构的加载逻辑。每个
+shell 模板都启用 `set -Eeuo pipefail`；DeepSpeed 成功退出后才会调用：
+
+```bash
+python scripts/full/save_ts_encoder_config.py "$OUTPUT_PATH" \
+  --encoder-type timesfm2_5 \
+  --backbone-path "$TIMESFM_MODEL_PATH"
+```
+
+该工具会以原子替换方式更新最终输出和所有 `checkpoint-*/config.json`，
+保留 `ts` 中现有字段，并写入：
+
+| 架构 | 顶层字段 | `ts.patch_size` |
+|---|---|---:|
+| TimesFM 2.5 | `ts_encoder_type`、`timesfm_model_name_or_path`、`timesfm_hidden_size=1280` | 32 |
+| Chronos-2 | `ts_encoder_type`、`chronos2_model_name_or_path`、`chronos2_hidden_size=768` | 16 |
+| Zeus | `ts_encoder_type`、`zeus_model_name_or_path`、`zeus_hidden_size=768`、`zeus_output_scale=32` | 32 |
+| native | `ts_encoder_type=native` | 保留原值 |
+
+它在找不到任何 `config.json` 时会直接失败，不会将“没保存元数据”当作
+训练成功。Stage 2 模板同时显式传入具体 encoder 类型和本地 backbone 路径，
+但 Stage 1 配置仍用于判定并恢复对应 projector。
+
+对用户自定义的网格脚本，只需在每个 `deepspeed ...` 命令之后调用同一
+工具。TimesFM Stage 1 的参数例如上；Stage 2 把 `"$OUTPUT_PATH"` 替换为
+`"$STAGE2_OUT"` 即可。Chronos-2/Zeus 分别使用 `chronos2`/`zeus` 和对应路径变量。
 
 三个方案都不需要额外手工归一化：TimesFM 走官方 cumulative normalization；Chronos-2
 在官方 encoder 内完成 instance normalization 与 `asinh`；ZEUS 适配器按有效点执行
@@ -358,7 +396,8 @@ Stage 2 使用梯度累积 4。
 - Stage 1 与 Stage 2 均训练完整 LLM 和两层 projector；这与 TS-Reasoner 原论文一致。
 - 外部 backbone 权重不写入 ChatTS checkpoint，只保存 projector，避免重复保存 100M–200M 参数。
 - 原 ChatTS MLP encoder 权重不能迁移，需要重新运行 Stage 1 对齐 projector。
-- Stage 1 会写入具体 `ts_encoder_type`，Stage 2 使用 `auto` 自动恢复架构、模型路径与 projector。
+- Stage 1 训练成功后由脚本写入具体 encoder 元数据；Stage 2 显式选择相同
+  架构和 backbone 路径，并依据 Stage 1 配置恢复 projector。
 - 单条序列上限：TimesFM 16,384 点，Chronos-2 8,192 点，ZEUS 4,096 点。
 - 训练后的模型需通过打过补丁的 LLaMA-Factory loader 加载；普通的
   `AutoModelForCausalLM.from_pretrained(...)` 不会自动重建外部 backbone adapter。
@@ -372,7 +411,9 @@ Stage 2 使用梯度累积 4。
 
 - Ruff 检查和格式检查通过。
 - Python compileall 通过。
-- 六个训练脚本的 `bash -n` 检查通过。
+- 七个外部 backbone 训练脚本的 `bash -n` 检查通过。
+- `save_ts_encoder_config.py` 的四种架构元数据映射、Python 编译，以及最终目录与
+  `checkpoint-*` 命令行写入验证通过。
 - 模拟 TimesFM backbone 的变长输入接口通过：长度 `[40, 65]` 得到 patch 数 `[2, 3]`。
 - 冻结状态和“TimesFM 权重不进入 ChatTS state dict”通过。
 - LoRA projector 隔离与完整保存逻辑通过。
