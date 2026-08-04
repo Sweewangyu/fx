@@ -43,3 +43,19 @@ Chronos-2 的模型类与内嵌配置依据：
 - [`amazon/chronos-2` config.json](https://huggingface.co/amazon/chronos-2/blob/main/config.json)
 - [`amazon-science/chronos-forecasting`](https://github.com/amazon-science/chronos-forecasting)
 
+## 真实 Chronos-2 权重验证
+
+除小模型单元测试外，还使用了 `amazon/chronos-2` revision
+`29ec3766d36d6f73f0696f85560a422f50e8498c` 的真实 `model.safetensors`：
+
+```text
+文件大小：477,930,472 bytes
+参数量：119,477,664（F32）
+state-dict tensor：170
+```
+
+验证流程为：真实 Chronos-2 + 两层 768→16 测试 projector + 小型 Qwen3，先执行
+tensor 合并，再用 `AutoModelForCausalLM.from_pretrained(...,
+trust_remote_code=True, local_files_only=True)` 离线重载，最后输入 17 个时间点执行
+Chronos 前向。结果为 170 个 `ts_encoder.backbone.*` tensor、输出 shape `(2, 16)`、
+patch count `[2]`，无 missing/unexpected keys。

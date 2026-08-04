@@ -128,7 +128,6 @@ class SelfContainedModelTests(unittest.TestCase):
             chronos.mkdir()
 
             chatts_config = {
-                "architectures": ["Qwen3TSForCausalLM"],
                 "model_type": "qwen3ts",
                 "hidden_size": 4,
                 "ts_token_start_index": 10,

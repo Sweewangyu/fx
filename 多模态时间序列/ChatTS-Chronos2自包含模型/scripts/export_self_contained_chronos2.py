@@ -10,9 +10,11 @@ shard.
 from __future__ import annotations
 
 import argparse
+import atexit
 import gc
 import json
 import shutil
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -187,10 +189,11 @@ def validate_source_configs(chatts_config: dict, chronos_config: dict) -> None:
         )
     if int(chatts_config.get("hidden_size", -1)) <= 0:
         raise ValueError("ChatTS config.json has no valid hidden_size.")
-    if "Qwen3" not in " ".join(chatts_config.get("architectures", [])):
+    chatts_architectures = chatts_config.get("architectures")
+    if chatts_architectures and "Qwen3" not in " ".join(chatts_architectures):
         raise ValueError(
             "The source ChatTS checkpoint does not identify a Qwen3 architecture: "
-            f"{chatts_config.get('architectures')!r}."
+            f"{chatts_architectures!r}."
         )
 
 
@@ -250,27 +253,37 @@ def copy_remote_code(output_dir: Path) -> None:
         shutil.copy2(source, output_dir / filename)
 
 
-def prepare_output_dir(output_dir: Path) -> None:
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(
-            f"Refusing to overwrite non-empty output directory: {output_dir}. "
-            "Choose a new path."
-        )
-    output_dir.mkdir(parents=True, exist_ok=True)
+def prepare_output_dir(output_dir: Path) -> Path:
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            raise FileExistsError(f"Output path exists and is not a directory: {output_dir}")
+        if any(output_dir.iterdir()):
+            raise FileExistsError(
+                f"Refusing to overwrite non-empty output directory: {output_dir}. "
+                "Choose a new path."
+            )
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
+    )
+    # If validation raises, remove only the staging directory created above.
+    # A successful atomic rename makes this callback a harmless no-op.
+    atexit.register(shutil.rmtree, staging_dir, True)
+    return staging_dir
 
 
 def main() -> None:
     args = parse_args()
     chatts_dir = args.chatts_checkpoint.resolve()
     chronos_dir = args.chronos2_checkpoint.resolve()
-    output_dir = args.output_dir.resolve()
+    final_output_dir = args.output_dir.resolve()
 
     chatts_config = read_json(chatts_dir / "config.json")
     chronos_config = read_json(chronos_dir / "config.json")
     validate_source_configs(chatts_config, chronos_config)
     chatts_files = discover_weight_files(chatts_dir)
     chronos_files = discover_weight_files(chronos_dir)
-    prepare_output_dir(output_dir)
+    output_dir = prepare_output_dir(final_output_dir)
 
     copy_auxiliary_files(chatts_dir, output_dir)
     copy_remote_code(output_dir)
@@ -380,7 +393,7 @@ def main() -> None:
         "chronos2_backbone_tensor_count": backbone_key_count,
         "total_size_bytes": total_size,
         "component_size_bytes": component_sizes,
-        "required_runtime_weight_paths": [str(output_dir)],
+        "required_runtime_weight_paths": [str(final_output_dir)],
         "external_chronos2_weight_path_required": False,
     }
     write_json(output_dir / "weight_audit.json", audit)
@@ -393,8 +406,14 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    if final_output_dir.exists():
+        # prepare_output_dir proved this directory was empty. rmdir also
+        # protects against a concurrent writer appearing during conversion.
+        final_output_dir.rmdir()
+    output_dir.rename(final_output_dir)
+
     print("\nConversion complete")
-    print(f"output: {output_dir}")
+    print(f"output: {final_output_dir}")
     print(f"tensors: {len(weight_map)}")
     print(f"size: {total_size / 1024**3:.2f} GiB")
     print("external Chronos-2 path required at runtime: NO")
