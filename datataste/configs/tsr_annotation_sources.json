@@ -1,0 +1,42 @@
+{
+  "taxonomy_version": "tsrbench-4x15-v1",
+  "sources": [
+    {
+      "name": "chatts_align_256",
+      "path": "data/raw/chatts_training/align_256/train.jsonl",
+      "split": "train"
+    },
+    {
+      "name": "chatts_align_random",
+      "path": "data/raw/chatts_training/align_random/train.jsonl",
+      "split": "train"
+    },
+    {
+      "name": "chatts_ift",
+      "path": "data/raw/chatts_training/ift/train.jsonl",
+      "split": "train"
+    },
+    {
+      "name": "chatts_sft",
+      "path": "data/raw/chatts_training/sft/train.jsonl",
+      "split": "train"
+    },
+    {
+      "name": "chatts_dev",
+      "path": "data/raw/chatts_training/dev/train.jsonl",
+      "split": "dev"
+    },
+    {
+      "name": "time_mqa",
+      "path": "data/chatts/time_mqa_train.jsonl",
+      "audit": "data/chatts/time_mqa_train.audit.jsonl",
+      "split": "train"
+    },
+    {
+      "name": "tsaqa",
+      "path": "data/chatts/tsaqa_train.jsonl",
+      "audit": "data/chatts/tsaqa_train.audit.jsonl",
+      "split": "train"
+    }
+  ]
+}
