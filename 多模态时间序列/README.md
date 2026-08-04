@@ -2,6 +2,15 @@
 
 本目录收录时间序列与大语言模型、多模态问答及跨模态编码相关的调研与设计材料。
 
+## ChatTS Chronos-2 自包含权重
+
+将已有的 `Qwen3 + 已训练两层 projector` 检查点与本地 Chronos-2 合并为一个标准
+Hugging Face 模型目录。最终 state dict 同时包含 `ts_encoder.backbone.*`、
+`ts_encoder.projector.*` 和 Qwen3 权重，运行时不再需要第二个 Chronos 权重路径。
+模型代码以 `bytedance-research/ChatTS-8B` 官方非权重目录为基线，只做最小修改。
+
+- [合并脚本、修改后的 Python 文件与服务器命令](./ChatTS-Chronos2自包含模型/README.md)
+
 ## ChatTS × TimesFM 2.5 / Chronos-2 / ZEUS 适配实现
 
 基于 TS-Reasoner 的“冻结时间序列基础模型 + 可训练 projector + 两阶段训练”思路，
