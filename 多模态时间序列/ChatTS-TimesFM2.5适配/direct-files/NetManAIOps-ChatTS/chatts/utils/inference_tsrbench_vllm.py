@@ -47,9 +47,12 @@ TASK_ALIASES = {
     "pattern_decision": "qualitative_decision",
 }
 
-FALLBACK_ANSWER_INSTRUCTION = (
-    "Return only the correct uppercase option letter (A, B, C, ...)."
-)
+ANSWER_INSTRUCTION = """
+
+Return exactly one JSON object and no Markdown. It must contain:
+{"reasoning":"a concise justification","answer":"A"}
+The answer must be one uppercase option letter.
+""".rstrip()
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -154,28 +157,6 @@ def _append_choices(question: str, choices: Any) -> str:
     return question
 
 
-def _has_answer_format_instruction(question: str) -> bool:
-    lowered = question.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "option letter",
-            "start response",
-            "start your response",
-            "begin your response",
-            "<answer>",
-            '"answer"',
-        )
-    )
-
-
-def _append_fallback_answer_instruction(question: str) -> str:
-    """Add only the minimum MCQ format rule missing from the source row."""
-    if not _has_answer_format_instruction(question):
-        question += "\n\n" + FALLBACK_ANSWER_INSTRUCTION
-    return question
-
-
 def _standard_prompt(
     sample: dict[str, Any], dataset_name: str
 ) -> tuple[str, list[np.ndarray]]:
@@ -202,9 +183,6 @@ def _standard_prompt(
     if not series:
         raise ValueError("No numeric time series remained after preprocessing")
 
-    # Preserve the original TSRBench question. Only materialize choices stored
-    # in a separate field and add a one-line letter rule when the row itself
-    # contains no answer-format instruction.
     question = str(sample["question"]).strip()
     question = _append_choices(question, sample.get("choices"))
     placeholder_count = question.count("<ts><ts/>")
@@ -215,9 +193,8 @@ def _standard_prompt(
         raise ValueError(
             f"Prompt has {placeholder_count} <ts><ts/> placeholders but sample has {len(series)} series"
         )
-    question = _append_fallback_answer_instruction(question)
 
-    return question, series
+    return question + ANSWER_INSTRUCTION, series
 
 
 def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
@@ -270,8 +247,7 @@ def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
         "- Team A win probability: <ts><ts/>\n"
         "- Team B win probability: <ts><ts/>"
     )
-    question = _append_fallback_answer_instruction(question)
-    return question, [
+    return question + ANSWER_INSTRUCTION, [
         _as_1d_series(team_a, label="Team A win probability"),
         _as_1d_series(team_b, label="Team B win probability"),
     ]
@@ -321,12 +297,32 @@ def extract_answer(response: str | None) -> str | None:
 
 
 def canonicalize_response(response: str | None) -> tuple[str, str | None]:
-    """Keep raw failures; reduce parsed responses to an answer-only JSON."""
+    """Return an evaluator-friendly JSON response and its parsed answer."""
     raw = response or ""
     answer = extract_answer(raw)
     if answer is None:
         return raw, None
-    canonical = json.dumps({"answer": answer}, ensure_ascii=False)
+
+    reasoning = raw.strip()
+    cleaned = re.sub(
+        r"^```(?:json|python)?\s*|\s*```$", "", reasoning, flags=re.IGNORECASE
+    )
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            value = loader(cleaned)
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            reasoning = str(value.get("reasoning", reasoning)).strip()
+            break
+    else:
+        think_match = re.search(r"<think>(.*?)</think>", reasoning, re.DOTALL)
+        if think_match:
+            reasoning = think_match.group(1).strip()
+
+    canonical = json.dumps(
+        {"reasoning": reasoning, "answer": answer}, ensure_ascii=False
+    )
     return canonical, answer
 
 
