@@ -1,55 +1,71 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Evaluate one or more base/ChatTS checkpoints on only the multiple-choice
-# tinyBenchmarks tasks, then summarize retention relative to a baseline model.
-# No time-series input is used and no external judge/RAGAS service is needed.
+# Local tinyBenchmarks MCQ evaluation through the ChatTS vLLM implementation.
+# This script never runs pip/conda and never downloads benchmark data.
 
 PROJECT_ROOT="${PROJECT_ROOT:-/workspace/ChatTS/ChatTS-main}"
+DATASET_ROOT="${DATASET_ROOT:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/exp/tinybenchmarks_mcq}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 TASKS_CSV="${TASKS_CSV:-tinyArc,tinyHellaswag,tinyMMLU,tinyTruthfulQA,tinyWinogrande}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-}"
+NUM_GPUS="${NUM_GPUS:-auto}"
+REQUEST_CHUNK_SIZE="${REQUEST_CHUNK_SIZE:-32}"
+MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-8192}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 DTYPE="${DTYPE:-auto}"
-DEVICE="${DEVICE:-cuda:0}"
-PARALLELIZE="${PARALLELIZE:-auto}"
-APPLY_CHAT_TEMPLATE="${APPLY_CHAT_TEMPLATE:-0}"
-SEED="${SEED:-0,1234,1234,1234}"
+MAX_SAMPLES="${MAX_SAMPLES:-0}"
+ALLOW_SIZE_MISMATCH="${ALLOW_SIZE_MISMATCH:-0}"
 FORCE="${FORCE:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
-INSTALL_DEPS="${INSTALL_DEPS:-0}"
+OFFLINE="${OFFLINE:-1}"
 FORGETTING_THRESHOLD_PP="${FORGETTING_THRESHOLD_PP:-5.0}"
 SUMMARY_BASENAME="${SUMMARY_BASENAME:-tinybenchmarks_mcq_summary}"
-TINYBENCHMARKS_PKL_SHA256="${TINYBENCHMARKS_PKL_SHA256:-c3b6e426dfe7b100fe6d0ee960398e10a8763254bcead3be80cc6bc15abca284}"
+
+# Capture an explicit override once. Normally leave it empty: every ChatTS
+# checkpoint is detected independently from its own tensor names/shapes.
+ENCODER_TYPE_OVERRIDE="${CHATTS_TS_ENCODER_TYPE:-}"
 
 BASELINE_NAME="${BASELINE_NAME:-}"
 MODEL_SPECS=()
+TASK_FILE_SPECS=()
 
 usage() {
     cat <<'EOF'
 Usage:
+  DATASET_ROOT=/workspace/datasets/tinyBenchmarks \
   bash scripts/run_chatts_tinybenchmarks_mcq.sh \
-    --model base=/path/to/base-model \
-    --model chatts=/path/to/chatts-checkpoint \
+    --model base=/workspace/models/qwen3-base \
+    --model chatts=/workspace/checkpoints/chatts-final \
     --baseline base
 
 Options:
-  --model NAME=PATH   Repeat for every model/checkpoint to compare.
-  --baseline NAME    Reference model used to calculate score drops.
-  --summary-only     Do not run inference; rebuild tables from existing results.
-  --force            Run again even if a completed result already exists.
-  -h, --help         Show this help.
+  --model NAME=PATH       Repeat for each local model/checkpoint.
+  --baseline NAME         Reference row for catastrophic-forgetting deltas.
+  --dataset-root PATH     Root containing the five already-downloaded datasets.
+  --task-file TASK=PATH   Override discovery for one task; repeat as needed.
+  --summary-only          Rebuild tables from existing model result directories.
+  --force                 Re-run even when MODEL_OUTPUT/metrics.json exists.
+  --allow-size-mismatch   Permit a dataset split with a size other than 100.
+  -h, --help              Show this help.
 
-Environment highlights:
-  CUDA_VISIBLE_DEVICES=0,1  Select GPUs visible to the HF backend.
-  PARALLELIZE=auto|0|1      Spread one model across visible GPUs (default: auto).
-  BATCH_SIZE=1              Safest default; 'auto' is also supported.
-  APPLY_CHAT_TEMPLATE=0|1   Default 0 follows the official completion protocol.
-  INSTALL_DEPS=1            Run install_tinybenchmarks_mcq.sh first.
-  HF_HOME=/path/to/cache    Shared Hugging Face dataset/model cache.
-  HF_HUB_OFFLINE=1          Use only an already populated cache.
+No installation or network access is required. Supported local formats are
+JSON, JSONL, Parquet, and (only if `datasets` is already present) save_to_disk.
+
+Useful environment variables:
+  CUDA_VISIBLE_DEVICES=0,1        GPUs exposed to vLLM.
+  NUM_GPUS=2                      vLLM tensor-parallel size (default: auto).
+  REQUEST_CHUNK_SIZE=32           Candidate prompts submitted per call.
+  CHATTS_VLLM_MAX_MODEL_LEN=8192  vLLM context allocation.
+  MAX_SAMPLES=5                   Smoke-test only the first N examples.
+  OFFLINE=1                       Force local Hugging Face files (default: 1).
+
+For external TS encoders the checkpoint type is auto-detected. Only its local
+backbone path may still be needed by model construction:
+  CHATTS_TIMESFM_MODEL_PATH=/workspace/timesf
+  CHATTS_CHRONOS2_MODEL_PATH=/workspace/chronos-2
+  CHATTS_ZEUS_MODEL_PATH=/workspace/zeus
 EOF
 }
 
@@ -65,12 +81,26 @@ while (( $# > 0 )); do
             BASELINE_NAME="$2"
             shift 2
             ;;
+        --dataset-root)
+            [[ $# -ge 2 ]] || { echo "--dataset-root requires PATH" >&2; exit 2; }
+            DATASET_ROOT="$2"
+            shift 2
+            ;;
+        --task-file)
+            [[ $# -ge 2 ]] || { echo "--task-file requires TASK=PATH" >&2; exit 2; }
+            TASK_FILE_SPECS+=("$2")
+            shift 2
+            ;;
         --summary-only)
             SUMMARY_ONLY=1
             shift
             ;;
         --force)
             FORCE=1
+            shift
+            ;;
+        --allow-size-mismatch)
+            ALLOW_SIZE_MISMATCH=1
             shift
             ;;
         -h|--help)
@@ -85,8 +115,6 @@ while (( $# > 0 )); do
     esac
 done
 
-# Environment-only single-model compatibility.  A baseline comparison still
-# needs at least two --model entries (or BASE_MODEL_PATH + MODEL_PATH).
 if (( ${#MODEL_SPECS[@]} == 0 )); then
     if [[ -n "${BASE_MODEL_PATH:-}" ]]; then
         MODEL_SPECS+=("${BASE_MODEL_NAME:-base}=${BASE_MODEL_PATH}")
@@ -95,9 +123,8 @@ if (( ${#MODEL_SPECS[@]} == 0 )); then
         MODEL_SPECS+=("${MODEL_NAME:-chatts}=${MODEL_PATH}")
     fi
 fi
-
 if (( ${#MODEL_SPECS[@]} == 0 )); then
-    echo "No models supplied. Use --model NAME=PATH at least once." >&2
+    echo "No models supplied. Use --model NAME=PATH." >&2
     usage >&2
     exit 2
 fi
@@ -106,24 +133,11 @@ MODEL_NAMES=()
 MODEL_PATHS=()
 declare -A SEEN_NAMES=()
 for spec in "${MODEL_SPECS[@]}"; do
-    if [[ "$spec" != *=* ]]; then
-        echo "Invalid --model '$spec'; expected NAME=PATH." >&2
-        exit 2
-    fi
+    [[ "$spec" == *=* ]] || { echo "Invalid --model '$spec'; expected NAME=PATH." >&2; exit 2; }
     name="${spec%%=*}"
     path="${spec#*=}"
-    if [[ ! "$name" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-        echo "Invalid model name '$name'; use letters, digits, dot, underscore, or hyphen." >&2
-        exit 2
-    fi
-    if [[ -n "${SEEN_NAMES[$name]:-}" ]]; then
-        echo "Duplicate model name: $name" >&2
-        exit 2
-    fi
-    if [[ "$path" == *,* ]]; then
-        echo "Model paths containing commas are not supported by lm-eval model_args: $path" >&2
-        exit 2
-    fi
+    [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid model name: $name" >&2; exit 2; }
+    [[ -z "${SEEN_NAMES[$name]:-}" ]] || { echo "Duplicate model name: $name" >&2; exit 2; }
     if [[ -d "$path" ]]; then
         path="$(cd "$path" && pwd)"
     fi
@@ -135,144 +149,142 @@ done
 if [[ -z "$BASELINE_NAME" ]]; then
     BASELINE_NAME="${MODEL_NAMES[0]}"
 fi
-if [[ -z "${SEEN_NAMES[$BASELINE_NAME]:-}" ]]; then
-    echo "Baseline '$BASELINE_NAME' is not present in the supplied model list." >&2
+[[ -n "${SEEN_NAMES[$BASELINE_NAME]:-}" ]] || {
+    echo "Baseline '$BASELINE_NAME' is not in the model list." >&2
     exit 2
-fi
+}
 
-if [[ ! -d "$PROJECT_ROOT" ]]; then
-    echo "ChatTS project not found: $PROJECT_ROOT" >&2
-    exit 1
-fi
+[[ -d "$PROJECT_ROOT" ]] || { echo "ChatTS project not found: $PROJECT_ROOT" >&2; exit 1; }
 PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd)"
-
 mkdir -p "$OUTPUT_ROOT"
 OUTPUT_ROOT="$(cd "$OUTPUT_ROOT" && pwd)"
 
 if [[ "$SUMMARY_ONLY" != "1" ]]; then
-    if [[ "$INSTALL_DEPS" == "1" ]]; then
-        bash "$PROJECT_ROOT/scripts/install_tinybenchmarks_mcq.sh"
-    fi
+    [[ -n "$DATASET_ROOT" ]] || { echo "DATASET_ROOT or --dataset-root is required." >&2; exit 2; }
+    [[ -d "$DATASET_ROOT" ]] || { echo "Local dataset root not found: $DATASET_ROOT" >&2; exit 1; }
+    DATASET_ROOT="$(cd "$DATASET_ROOT" && pwd)"
 
-    "$PYTHON_BIN" -c 'import accelerate, lm_eval, tinyBenchmarks, torch, transformers' || {
-        echo "Missing tinyBenchmarks dependencies." >&2
-        echo "Run: bash scripts/install_tinybenchmarks_mcq.sh" >&2
+    "$PYTHON_BIN" -c 'import torch, transformers, vllm' || {
+        echo "The existing ChatTS vLLM environment is incomplete. No installation was attempted." >&2
         exit 1
     }
 
-    # The official tinyBenchmarks package reads tinyBenchmarks.pkl from cwd.
-    # Its normal wheel omits that asset, so the installer keeps an editable
-    # source tree and we stage the pinned file in an isolated runtime directory.
-    CALIBRATION_SOURCE="${TINYBENCHMARKS_PKL:-$($PYTHON_BIN -c 'from pathlib import Path; import tinyBenchmarks; print(Path(tinyBenchmarks.__file__).with_name("tinyBenchmarks.pkl"))')}"
-    if [[ ! -f "$CALIBRATION_SOURCE" ]]; then
-        echo "tinyBenchmarks calibration asset not found: $CALIBRATION_SOURCE" >&2
-        echo "Re-run: bash scripts/install_tinybenchmarks_mcq.sh" >&2
-        exit 1
+    if [[ "$NUM_GPUS" == "auto" ]]; then
+        NUM_GPUS="$($PYTHON_BIN -c 'import torch; print(max(1, torch.cuda.device_count()))')"
     fi
-    actual_calibration_sha="$($PYTHON_BIN -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$CALIBRATION_SOURCE")"
-    if [[ "$actual_calibration_sha" != "$TINYBENCHMARKS_PKL_SHA256" ]]; then
-        echo "tinyBenchmarks calibration SHA-256 mismatch." >&2
-        echo "Expected: $TINYBENCHMARKS_PKL_SHA256" >&2
-        echo "Actual:   $actual_calibration_sha" >&2
-        exit 1
-    fi
-    RUNTIME_DIR="$OUTPUT_ROOT/.tinybenchmarks_runtime"
-    mkdir -p "$RUNTIME_DIR"
-    if [[ ! -f "$RUNTIME_DIR/tinyBenchmarks.pkl" ]] || \
-       ! cmp -s "$CALIBRATION_SOURCE" "$RUNTIME_DIR/tinyBenchmarks.pkl"; then
-        cp "$CALIBRATION_SOURCE" "$RUNTIME_DIR/tinyBenchmarks.pkl"
-    fi
+    [[ "$NUM_GPUS" =~ ^[1-9][0-9]*$ ]] || { echo "NUM_GPUS must be a positive integer or auto." >&2; exit 2; }
 
-    if [[ "$PARALLELIZE" == "auto" ]]; then
-        visible_gpus="$($PYTHON_BIN -c 'import torch; print(torch.cuda.device_count())')"
-        if (( visible_gpus > 1 )); then
-            PARALLELIZE=1
-        else
-            PARALLELIZE=0
-        fi
+    if [[ "$OFFLINE" == "1" ]]; then
+        export HF_HUB_OFFLINE=1
+        export TRANSFORMERS_OFFLINE=1
     fi
-    case "$PARALLELIZE" in
-        1|true|True|TRUE) PARALLELIZE_ARG=true ;;
-        0|false|False|FALSE) PARALLELIZE_ARG=false ;;
-        *) echo "PARALLELIZE must be auto, 0, or 1." >&2; exit 2 ;;
-    esac
-
-    if "$PYTHON_BIN" -m lm_eval run --help >/dev/null 2>&1; then
-        LMEVAL=("$PYTHON_BIN" -m lm_eval run)
-    else
-        # Compatibility with the 0.4.x CLI before subcommands were introduced.
-        LMEVAL=("$PYTHON_BIN" -m lm_eval)
-    fi
-
     export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-fi
 
-if [[ "$SUMMARY_ONLY" != "1" ]]; then
+    COMMON_ARGS=(
+        --dataset-root "$DATASET_ROOT"
+        --tasks "$TASKS_CSV"
+        --num-gpus "$NUM_GPUS"
+        --request-chunk-size "$REQUEST_CHUNK_SIZE"
+        --max-model-len "$MAX_MODEL_LEN"
+        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+        --dtype "$DTYPE"
+        --max-samples "$MAX_SAMPLES"
+    )
+    for task_file in "${TASK_FILE_SPECS[@]}"; do
+        COMMON_ARGS+=(--task-file "$task_file")
+    done
+    if [[ "$ALLOW_SIZE_MISMATCH" == "1" ]]; then
+        COMMON_ARGS+=(--allow-size-mismatch)
+    fi
+
+    # Validate all paths and schemas before the first GPU allocation.
+    (
+        cd "$PROJECT_ROOT"
+        "$PYTHON_BIN" -m chatts.utils.inference_tinybenchmarks_mcq_vllm \
+            --model-path "${MODEL_PATHS[0]}" \
+            --model-name "${MODEL_NAMES[0]}" \
+            --output-dir "$OUTPUT_ROOT/.data_inspection" \
+            "${COMMON_ARGS[@]}" \
+            --inspect-data-only
+    )
+
     for index in "${!MODEL_NAMES[@]}"; do
         name="${MODEL_NAMES[$index]}"
         model_path="${MODEL_PATHS[$index]}"
         model_output="$OUTPUT_ROOT/$name"
 
-        if [[ ! -d "$model_path" ]]; then
-            echo "Warning: '$model_path' is not a local directory; Hugging Face Hub access will be attempted." >&2
-        elif [[ ! -f "$model_path/config.json" ]]; then
-            echo "Model directory has no config.json: $model_path" >&2
+        [[ -d "$model_path" && -f "$model_path/config.json" ]] || {
+            echo "Local model directory/config.json not found: $model_path" >&2
             exit 1
-        fi
-
-        existing_result="$(find "$model_output" -type f -name 'results_*.json' -print 2>/dev/null | sort | tail -n 1 || true)"
-        if [[ -n "$existing_result" && "$FORCE" != "1" ]]; then
-            echo "[$name] Existing completed result found; skipping: $existing_result"
+        }
+        if [[ -f "$model_output/metrics.json" && "$FORCE" != "1" ]]; then
+            echo "[$name] Existing completed result found; skipping: $model_output/metrics.json"
             continue
         fi
-
         mkdir -p "$model_output"
-        model_args="pretrained=${model_path},tokenizer=${model_path},trust_remote_code=True,backend=causal,dtype=${DTYPE},parallelize=${PARALLELIZE_ARG}"
+
+        is_chatts="$($PYTHON_BIN - "$model_path/config.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = json.load(stream)
+print("1" if any("TSForCausalLM" in str(item) for item in config.get("architectures", [])) else "0")
+PY
+)"
+
+        encoder_type="none"
+        if [[ "$is_chatts" == "1" ]]; then
+            if [[ -n "$ENCODER_TYPE_OVERRIDE" ]]; then
+                encoder_type="$ENCODER_TYPE_OVERRIDE"
+            else
+                encoder_type="$($PYTHON_BIN "$PROJECT_ROOT/scripts/inspect_chatts_ts_encoder_checkpoints.py" \
+                    "$model_path" --print-detected-only)"
+            fi
+        fi
+
         command=(
-            "${LMEVAL[@]}"
-            --model hf
-            --model_args "$model_args"
-            --tasks "$TASKS_CSV"
-            --batch_size "$BATCH_SIZE"
-            --device "$DEVICE"
-            --seed "$SEED"
-            --output_path "$model_output"
-            --log_samples
+            "$PYTHON_BIN" -m chatts.utils.inference_tinybenchmarks_mcq_vllm
+            --model-path "$model_path"
+            --model-name "$name"
+            --output-dir "$model_output"
+            "${COMMON_ARGS[@]}"
         )
-        if [[ "$BATCH_SIZE" == auto* && -n "$MAX_BATCH_SIZE" ]]; then
-            command+=(--max_batch_size "$MAX_BATCH_SIZE")
-        fi
-        if [[ "$APPLY_CHAT_TEMPLATE" == "1" ]]; then
-            command+=(--apply_chat_template)
-        fi
 
         echo "============================================================"
-        echo " tinyBenchmarks MCQ: $name"
+        echo " tinyBenchmarks MCQ via ChatTS vLLM: $name"
         echo " Model:          $model_path"
+        echo " Dataset root:   $DATASET_ROOT"
         echo " Tasks:          $TASKS_CSV"
-        echo " Backend:        Hugging Face causal LM (text only)"
-        echo " Parallelize:    $PARALLELIZE_ARG"
-        echo " Chat template:  $APPLY_CHAT_TEMPLATE"
+        echo " ChatTS model:   $is_chatts"
+        echo " TS encoder:     $encoder_type"
+        echo " Tensor parallel:$NUM_GPUS"
         echo " Output:         $model_output"
         echo "============================================================"
 
-        printf '%q ' "${command[@]}" > "$model_output/command.sh"
-        printf '\n' >> "$model_output/command.sh"
-        (
-            cd "$RUNTIME_DIR"
-            "${command[@]}"
-        ) 2>&1 | tee "$model_output/run.log"
+        if [[ "$is_chatts" == "1" ]]; then
+            printf 'CHATTS_TS_ENCODER_TYPE=%q ' "$encoder_type" > "$model_output/command.sh"
+            printf '%q ' "${command[@]}" >> "$model_output/command.sh"
+            printf '\n' >> "$model_output/command.sh"
+            (
+                cd "$PROJECT_ROOT"
+                CHATTS_TS_ENCODER_TYPE="$encoder_type" "${command[@]}"
+            ) 2>&1 | tee "$model_output/run.log"
+        else
+            printf 'env -u CHATTS_TS_ENCODER_TYPE ' > "$model_output/command.sh"
+            printf '%q ' "${command[@]}" >> "$model_output/command.sh"
+            printf '\n' >> "$model_output/command.sh"
+            (
+                cd "$PROJECT_ROOT"
+                env -u CHATTS_TS_ENCODER_TYPE "${command[@]}"
+            ) 2>&1 | tee "$model_output/run.log"
+        fi
     done
 fi
 
 SUMMARY_ARGS=()
 for index in "${!MODEL_NAMES[@]}"; do
     result_root="$OUTPUT_ROOT/${MODEL_NAMES[$index]}"
-    if [[ "$SUMMARY_ONLY" == "1" && -d "${MODEL_PATHS[$index]}" ]]; then
-        supplied_result="$(find "${MODEL_PATHS[$index]}" -type f -name 'results_*.json' -print -quit)"
-        if [[ -n "$supplied_result" ]]; then
-            result_root="${MODEL_PATHS[$index]}"
-        fi
+    if [[ "$SUMMARY_ONLY" == "1" && -f "${MODEL_PATHS[$index]}/metrics.json" ]]; then
+        result_root="${MODEL_PATHS[$index]}"
     fi
     SUMMARY_ARGS+=(--model "${MODEL_NAMES[$index]}=$result_root")
 done
@@ -285,5 +297,5 @@ done
     --basename "$SUMMARY_BASENAME"
 
 if (( ${#MODEL_NAMES[@]} < 2 )); then
-    echo "Warning: only one model was evaluated. Add the pre-ChatTS/base checkpoint to measure forgetting." >&2
+    echo "Warning: one model gives scores but cannot measure forgetting; add the pre-training base checkpoint." >&2
 fi

@@ -313,51 +313,51 @@ fallback warning。
 
 ## tinyBenchmarks 选择题：通用能力与灾难性遗忘筛查
 
-本适配只跑 tinyBenchmarks 中的五个选择题任务：
+这个版本不安装 `lm-eval`、`tinyBenchmarks` 或任何新环境，直接使用 ChatTS
+已经安装的 `vllm==0.8.5`。数据只从本地读取，模型也只从本地加载；默认设置
+`HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，不会偷偷联网。
+
+只跑五个选择题任务：
 
 ```text
 tinyArc, tinyHellaswag, tinyMMLU, tinyTruthfulQA, tinyWinogrande
 ```
 
-生成式的 `tinyGSM8k` 明确不在本次评测中。评测使用
-`lm-evaluation-harness` 的 Hugging Face causal-LM 后端计算选项
-log-likelihood，不使用 vLLM、RAGAS 或外部 judge。输入中没有时间序列，
-所以 TS encoder 不参与 forward，也不需要时序归一化。
+`tinyGSM8k` 不在本次评测中。评测器通过 vLLM 的 `prompt_logprobs`
+计算选项条件似然：ARC、HellaSwag、MMLU 和 Winogrande 采用长度归一化
+准确率，TruthfulQA 采用 MC2 正确答案概率质量。输入是纯文本，因此 TS
+encoder 不参与时序特征 forward，也不存在“是否归一化时间序列”的问题；
+但 ChatTS checkpoint 初始化时仍会按权重构建正确的 encoder 模块。
 
-先在 ChatTS 环境中安装固定版本的依赖：
+### 本地数据目录
 
-```bash
-cd /workspace/ChatTS/ChatTS-main
-bash scripts/install_tinybenchmarks_mcq.sh
-```
+`DATASET_ROOT` 是你已经下载的五个 tinyBenchmarks 数据集共同所在的上级目录。
+脚本会递归查找官方评测 split：
 
-该脚本只安装 lm-eval 的 Hugging Face 路径，不安装它的 vLLM extra，
-因此不会主动把 ChatTS 所需的 `vllm==0.8.5` 升级掉。如果评测服务器
-不能访问 GitHub，先把两个官方仓库复制到本地，再执行：
+- `tinyAI2_arc/ARC-Challenge/test-*.parquet`
+- `tinyHellaswag/.../validation-*.parquet`
+- `tinyMMLU/all/test-*.parquet`
+- `tinyTruthfulQA/multiple_choice/validation-*.parquet`
+- `tinyWinogrande/winogrande_xl/validation-*.parquet`
 
-```bash
-LM_EVAL_ROOT=/workspace/lm-evaluation-harness \
-TINYBENCHMARKS_ROOT=/workspace/tinyBenchmarks \
-bash scripts/install_tinybenchmarks_mcq.sh
-```
-
-安装脚本会以 editable 方式保留 tinyBenchmarks 官方
-`tinyBenchmarks.pkl` IRT 校准文件。运行时它会被自动复制到
-`${OUTPUT_ROOT}/.tinybenchmarks_runtime/`，避免官方包在普通 wheel 安装后
-因找不到 `.pkl` 而再次联网。也可以手动指定：
+也支持 JSON/JSONL。若自动发现的目录布局不同，可逐项明确指定：
 
 ```bash
-TINYBENCHMARKS_PKL=/workspace/tinyBenchmarks/tinyBenchmarks/tinyBenchmarks.pkl \
-bash scripts/run_chatts_tinybenchmarks_mcq.sh ...
+--task-file tinyArc=/workspace/datasets/tinyAI2_arc/ARC-Challenge/test-00000-of-00001.parquet
 ```
+
+脚本先检查五个文件的 schema 和样本数，确认都是 100 条后才分配 GPU。
+如果你的文件是 `datasets.save_to_disk` 格式，仅在当前环境本来就有
+`datasets` 包时读取；缺包时只给出转换 JSONL 的提示，不会自动安装。
 
 判断灾难性遗忘至少需要两个模型：开始 ChatTS 训练前的底座模型，
 以及训练后 checkpoint。也可以在中间加入 Stage 1/Stage 2：
 
 ```bash
+cd /workspace/ChatTS/ChatTS-main
 CUDA_VISIBLE_DEVICES=0,1 \
-PARALLELIZE=1 \
-BATCH_SIZE=1 \
+NUM_GPUS=2 \
+DATASET_ROOT=/workspace/datasets/tinyBenchmarks \
 bash scripts/run_chatts_tinybenchmarks_mcq.sh \
   --model base=/workspace/models/qwen3-8b-before-chatts \
   --model stage1=/workspace/checkpoints/chatts-stage1 \
@@ -365,16 +365,32 @@ bash scripts/run_chatts_tinybenchmarks_mcq.sh \
   --baseline base
 ```
 
-默认 `APPLY_CHAT_TEMPLATE=0`，跟随 tinyBenchmarks 官方 completion 协议。
-如果要评测 chat-template 协议，必须对底座和所有 ChatTS checkpoint
-统一设置 `APPLY_CHAT_TEMPLATE=1`，不能混用。脚本会比较每个任务的
-prompt/document/target 哈希；不一致时标记 `protocol_match=mismatch`，
-不对分数差作遗忘解释。
+每个模型在独立 Python 进程中启动和退出，前一个模型的 CUDA/vLLM 状态不会
+污染后一个模型。ChatTS checkpoint 的 encoder 类型由权重自动检测，支持：
+
+```text
+mlp-patch, timesfm2_5, chronos2, zeus
+```
+
+不必设置 `CHATTS_TS_ENCODER_TYPE`。外部 encoder 仍需给出本地 backbone：
+
+```bash
+CHATTS_TIMESFM_MODEL_PATH=/workspace/timesf
+CHATTS_CHRONOS2_MODEL_PATH=/workspace/chronos-2
+CHATTS_ZEUS_MODEL_PATH=/workspace/zeus
+```
+
+只设置当前 checkpoint 实际使用的那一个即可。显式设置
+`CHATTS_TS_ENCODER_TYPE` 仍会作为高级覆盖项，但多 checkpoint 混合评测时
+建议保持为空，让脚本逐个识别。
 
 输出位于：
 
 ```text
 /workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/
+  base/metrics.json
+  base/samples_tinyArc.jsonl
+  chatts/metrics.json
   tinybenchmarks_mcq_summary.csv
   tinybenchmarks_mcq_summary.json
   tinybenchmarks_mcq_summary.md
@@ -382,11 +398,15 @@ prompt/document/target 哈希；不一致时标记 `protocol_match=mismatch`，
 
 汇总表同时报告：
 
-- 官方 GPIRT/IRT++ 全量分数估计；
-- 每个 tiny 锚点集的原始准确率和实际样本数；
+- 五个 tiny 锚点集的原始分数和实际样本数；
 - 相对底座的每项和宏平均下降百分点；
 - 通用能力保留率 `retention_percent`；
 - 可配置的遗忘筛查标记。
+
+为了不安装官方估计器及其校准资产，本脚本明确不声称 GPIRT/IRT++ 的
+全量 benchmark 估计。这里的原始 100 条分数适合做训练前后 A/B 筛查。
+每个任务都会保存 prompt/document/target 的 SHA-256；若本地数据不同，
+汇总会标记 `protocol_match=mismatch`，不会把差异解释成遗忘。
 
 默认只在“五项宏平均下降至少 5 个百分点，且至少三项下降”时
 给出 `forgetting_warning`。这是低成本筛查，不是统计意义上的最终证明；
@@ -400,24 +420,25 @@ bash scripts/run_chatts_tinybenchmarks_mcq.sh --summary-only \
   --baseline base
 ```
 
-首次运行会从 Hugging Face 下载五个各 100 条的 tiny 数据集。无网运行时
-需同时准备已填充的 `HF_HOME` 和上述 IRT 校准 `.pkl`，然后设置
-`HF_HUB_OFFLINE=1`。
-
-可以更改输出位置和文件名：
+先用 5 条样本做 vLLM smoke test：
 
 ```bash
-SUMMARY_DIR=/workspace/results \
-SUMMARY_BASENAME=chronos2_grid \
-bash scripts/run_chatts_no_ragas_batch.sh --score-only
+MAX_SAMPLES=5 ALLOW_SIZE_MISMATCH=0 \
+DATASET_ROOT=/workspace/datasets/tinyBenchmarks \
+bash scripts/run_chatts_tinybenchmarks_mcq.sh \
+  --model chatts=/workspace/checkpoints/chatts-final
 ```
 
-`--infer-only` 不执行评分，因此不生成汇总表。如果某个模型本次运行失败，
-脚本仍会汇总其他模型，并把该行标记为失败，避免把旧 `result.json` 误当成本次结果。
-对已经评分完的现有结果，可以不重新推理或评分，只生成表格：
+smoke test 和正式评测应写到不同 `OUTPUT_ROOT`，或正式运行时加 `--force`，
+避免把 5 条结果当作完整结果跳过。
+
+对已经完成的结果只重建汇总表：
 
 ```bash
-bash scripts/run_chatts_no_ragas_batch.sh --summary-only
+bash scripts/run_chatts_tinybenchmarks_mcq.sh --summary-only \
+  --model base=/workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/base \
+  --model chatts=/workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/chatts \
+  --baseline base
 ```
 
 ## 正确启动标志
