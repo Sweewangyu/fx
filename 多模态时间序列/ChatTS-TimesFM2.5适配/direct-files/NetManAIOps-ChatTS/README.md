@@ -262,6 +262,21 @@ DATASETS="perception numerical_reasoning" MAX_SAMPLES=20 \
 bash scripts/run_chatts_tsrbench.sh
 ```
 
+TSRBench 适配默认对 Qwen3 显式设置 `enable_thinking=False`，不要求
+`<think>` 或 reasoning JSON，并尽量保留数据集原始 `question`。只在选项
+单独存在 `choices` 字段时把它们补到 prompt；只在原问题没有任何
+答案格式说明时，补一句“仅返回选项字母”。如需复现 thinking 模式，
+可显式设置 `ENABLE_THINKING=1`。
+
+更换新脚本后，已存在的 `generated_answer.json` 会被当作断点继续结果而
+跳过；要用非 thinking prompt 重新跑原来的样本，必须使用：
+
+```bash
+FORCE_INFERENCE=1 ENABLE_THINKING=0 \
+DATASETS="perception numerical_reasoning" MAX_SAMPLES=20 \
+bash scripts/run_chatts_tsrbench.sh
+```
+
 如果日志中出现下列组合：
 
 ```text

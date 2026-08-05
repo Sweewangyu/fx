@@ -22,6 +22,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 FORCE_INFERENCE="${FORCE_INFERENCE:-0}"
+ENABLE_THINKING="${ENABLE_THINKING:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # Optional encoder override. Leave empty when config/weights are unambiguous.
@@ -108,6 +109,9 @@ INFER_ARGS=(
 if [[ "$FORCE_INFERENCE" == "1" ]]; then
     INFER_ARGS+=(--force)
 fi
+if [[ "$ENABLE_THINKING" == "1" ]]; then
+    INFER_ARGS+=(--enable-thinking)
+fi
 
 echo "============================================================"
 echo " ChatTS x TSRBench (vLLM time-series embedding modality)"
@@ -118,6 +122,7 @@ echo " GPUs:         $NUM_GPUS (${NUM_GPUS_PER_PROCESS} per worker)"
 echo " vLLM engines: $((NUM_GPUS / NUM_GPUS_PER_PROCESS))"
 echo " Output:       $OUTPUT_ROOT"
 echo " Encoder:      ${TS_ENCODER_TYPE:-auto}"
+echo " Thinking:     $([[ "$ENABLE_THINKING" == "1" ]] && echo enabled || echo disabled)"
 echo "============================================================"
 
 cd "$PROJECT_ROOT"

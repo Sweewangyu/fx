@@ -47,12 +47,9 @@ TASK_ALIASES = {
     "pattern_decision": "qualitative_decision",
 }
 
-ANSWER_INSTRUCTION = """
-
-Return exactly one JSON object and no Markdown. It must contain:
-{"reasoning":"a concise justification","answer":"A"}
-The answer must be one uppercase option letter.
-""".rstrip()
+FALLBACK_ANSWER_INSTRUCTION = (
+    "Return only the correct uppercase option letter (A, B, C, ...)."
+)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -157,6 +154,28 @@ def _append_choices(question: str, choices: Any) -> str:
     return question
 
 
+def _has_answer_format_instruction(question: str) -> bool:
+    lowered = question.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "option letter",
+            "start response",
+            "start your response",
+            "begin your response",
+            "<answer>",
+            '"answer"',
+        )
+    )
+
+
+def _append_fallback_answer_instruction(question: str) -> str:
+    """Add only the minimum MCQ format rule missing from the source row."""
+    if not _has_answer_format_instruction(question):
+        question += "\n\n" + FALLBACK_ANSWER_INSTRUCTION
+    return question
+
+
 def _standard_prompt(
     sample: dict[str, Any], dataset_name: str
 ) -> tuple[str, list[np.ndarray]]:
@@ -183,7 +202,11 @@ def _standard_prompt(
     if not series:
         raise ValueError("No numeric time series remained after preprocessing")
 
-    question = _append_choices(str(sample["question"]).strip(), sample.get("choices"))
+    # Preserve the original TSRBench question. Only materialize choices stored
+    # in a separate field and add a one-line letter rule when the row itself
+    # contains no answer-format instruction.
+    question = str(sample["question"]).strip()
+    question = _append_choices(question, sample.get("choices"))
     placeholder_count = question.count("<ts><ts/>")
     if placeholder_count == 0:
         question += "\n\nNumeric time-series inputs:\n"
@@ -192,8 +215,9 @@ def _standard_prompt(
         raise ValueError(
             f"Prompt has {placeholder_count} <ts><ts/> placeholders but sample has {len(series)} series"
         )
+    question = _append_fallback_answer_instruction(question)
 
-    return question + ANSWER_INSTRUCTION, series
+    return question, series
 
 
 def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
@@ -246,7 +270,8 @@ def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
         "- Team A win probability: <ts><ts/>\n"
         "- Team B win probability: <ts><ts/>"
     )
-    return question + ANSWER_INSTRUCTION, [
+    question = _append_fallback_answer_instruction(question)
+    return question, [
         _as_1d_series(team_a, label="Team A win probability"),
         _as_1d_series(team_b, label="Team B win probability"),
     ]
@@ -296,33 +321,33 @@ def extract_answer(response: str | None) -> str | None:
 
 
 def canonicalize_response(response: str | None) -> tuple[str, str | None]:
-    """Return an official-evaluator-friendly JSON response and its answer."""
+    """Keep raw failures; reduce parsed responses to an answer-only JSON."""
     raw = response or ""
     answer = extract_answer(raw)
     if answer is None:
         return raw, None
-
-    reasoning = raw.strip()
-    cleaned = re.sub(
-        r"^```(?:json|python)?\s*|\s*```$", "", reasoning, flags=re.IGNORECASE
-    )
-    for loader in (json.loads, ast.literal_eval):
-        try:
-            value = loader(cleaned)
-        except Exception:
-            continue
-        if isinstance(value, dict):
-            reasoning = str(value.get("reasoning", reasoning)).strip()
-            break
-    else:
-        think_match = re.search(r"<think>(.*?)</think>", reasoning, re.DOTALL)
-        if think_match:
-            reasoning = think_match.group(1).strip()
-
-    canonical = json.dumps(
-        {"reasoning": reasoning, "answer": answer}, ensure_ascii=False
-    )
+    canonical = json.dumps({"answer": answer}, ensure_ascii=False)
     return canonical, answer
+
+
+def apply_chat_template(
+    tokenizer: Any,
+    prompt: str,
+    *,
+    system_prompt: str,
+    enable_thinking: bool,
+) -> str:
+    """Apply the checkpoint template with an explicit Qwen3 thinking switch."""
+    conversation = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt},
+    ]
+    return tokenizer.apply_chat_template(
+        conversation,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
 
 
 def _safe_model_name(model_path: str, requested_name: str | None) -> str:
@@ -365,6 +390,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-mm-per-prompt", type=int, default=50)
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable Qwen3 thinking mode (disabled by default).",
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -437,9 +467,19 @@ def main() -> None:
 
                 if not prompts:
                     continue
+                templated_prompts = [
+                    apply_chat_template(
+                        client.tokenizer,
+                        prompt,
+                        system_prompt=client.system_prompt,
+                        enable_thinking=args.enable_thinking,
+                    )
+                    for prompt in prompts
+                ]
                 responses = client.llm_batch_generate(
-                    prompts,
+                    templated_prompts,
                     series_batch,
+                    use_chat_template=False,
                     sampling_params=sampling_params,
                 )
                 for index, prompt, response in zip(valid_indices, prompts, responses):
