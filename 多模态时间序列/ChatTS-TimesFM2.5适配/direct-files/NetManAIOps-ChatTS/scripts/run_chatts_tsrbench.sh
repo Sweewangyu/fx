@@ -32,7 +32,7 @@ case "$PROMPT_MODE" in
         TEMPERATURE="${TEMPERATURE:-1.0}"
         MAX_RETRIES="${MAX_RETRIES:-10}"
         MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-8000}"
-        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-8512}"
+        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-12288}"
         ENABLE_THINKING="${ENABLE_THINKING:-0}"
         ;;
     answer_only)
@@ -41,7 +41,7 @@ case "$PROMPT_MODE" in
         TEMPERATURE="${TEMPERATURE:-0.0}"
         MAX_RETRIES="${MAX_RETRIES:-0}"
         MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-0}"
-        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-5000}"
+        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-12288}"
         ENABLE_THINKING="${ENABLE_THINKING:-0}"
         ;;
     *)
@@ -49,6 +49,14 @@ case "$PROMPT_MODE" in
         exit 1
         ;;
 esac
+
+# Reserve the requested output budget after vLLM expands every <ts><ts/>
+# marker into time-series patch tokens.
+MAX_PROCESSED_INPUT_TOKENS="${MAX_PROCESSED_INPUT_TOKENS:-$((CHATTS_VLLM_MAX_MODEL_LEN - MAX_NEW_TOKENS))}"
+if (( MAX_PROCESSED_INPUT_TOKENS < 1 )); then
+    echo "CHATTS_VLLM_MAX_MODEL_LEN must be larger than MAX_NEW_TOKENS." >&2
+    exit 1
+fi
 
 # Optional encoder override. Leave empty when config/weights are unambiguous.
 TS_ENCODER_TYPE="${TS_ENCODER_TYPE:-${CHATTS_TS_ENCODER_TYPE:-}}"
@@ -133,6 +141,7 @@ INFER_ARGS=(
     --temperature "$TEMPERATURE"
     --max-retries "$MAX_RETRIES"
     --max-input-tokens "$MAX_INPUT_TOKENS"
+    --max-processed-input-tokens "$MAX_PROCESSED_INPUT_TOKENS"
     --max-samples "$MAX_SAMPLES"
 )
 if [[ "$FORCE_INFERENCE" == "1" ]]; then
@@ -153,6 +162,7 @@ echo " Output:       $OUTPUT_ROOT"
 echo " Encoder:      ${TS_ENCODER_TYPE:-auto}"
 echo " Prompt mode:  $PROMPT_MODE"
 echo " Max model len:$CHATTS_VLLM_MAX_MODEL_LEN"
+echo " Max processed input: $MAX_PROCESSED_INPUT_TOKENS"
 echo " Max new tokens: $MAX_NEW_TOKENS"
 echo " Temperature:  $TEMPERATURE"
 if [[ "$PROMPT_MODE" == "official" ]]; then

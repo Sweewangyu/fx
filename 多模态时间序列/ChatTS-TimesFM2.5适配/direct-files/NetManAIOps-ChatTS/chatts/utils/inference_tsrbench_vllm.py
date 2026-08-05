@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -170,6 +171,44 @@ def _as_1d_series(value: Any, *, label: str) -> np.ndarray:
     if not np.isfinite(series).all():
         raise ValueError(f"{label} contains NaN or infinity")
     return series
+
+
+def estimate_vllm_prompt_tokens(
+    tokenizer: Any,
+    templated_prompt: str,
+    series: list[np.ndarray],
+    patch_size: int,
+) -> int:
+    """Estimate ChatTS vLLM tokens after time-series placeholder expansion.
+
+    The checkpoint processor replaces every two-token ``<ts><ts/>`` marker
+    with SP metadata tokens, then appends one placeholder per remaining
+    encoder patch.
+    This mirrors Qwen2TSMultiModalProcessor._get_prompt_updates().
+    """
+    if patch_size < 1:
+        raise ValueError(f"Invalid time-series patch size: {patch_size}")
+
+    text_tokens = len(tokenizer.encode(templated_prompt, add_special_tokens=False))
+    total_tokens = text_tokens - 2 * len(series)
+    for values in series:
+        mean = float(np.mean(values))
+        centered = values - mean
+        scale_factor = 1.0
+        if np.any(np.abs(centered) >= 3.0):
+            scale_factor = float(np.max(np.abs(centered)) / 3.0)
+        sp_prompt = (
+            f"[offset={-mean:.4f}|scaling={scale_factor:.4f}|"
+            f"length={len(values)}|max={float(np.max(values)):.4f}|"
+            f"min={float(np.min(values)):.4f}|left={float(values[0]):.4f}|"
+            f"right={float(values[-1]):.4f}]<ts>"
+        )
+        metadata_tokens = len(tokenizer.encode(sp_prompt, add_special_tokens=False))
+        patch_tokens = math.ceil(len(values) / patch_size)
+        # sp_prompt already ends in one <ts> placeholder.  vLLM appends
+        # patch_tokens - 1 more placeholders; it does not replace the metadata.
+        total_tokens += metadata_tokens + max(0, patch_tokens - 1)
+    return total_tokens
 
 
 def _append_choices(question: str, choices: Any) -> str:
@@ -468,6 +507,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-retries", type=int, default=0)
     parser.add_argument("--max-input-tokens", type=int, default=0)
+    parser.add_argument(
+        "--max-processed-input-tokens",
+        type=int,
+        default=0,
+        help="Input limit after ChatTS expands multimodal time-series tokens.",
+    )
     parser.add_argument("--max-mm-per-prompt", type=int, default=50)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument(
@@ -536,7 +581,11 @@ def main() -> None:
         raise ValueError("--num-gpus must be divisible by --gpus-per-model")
     if args.request_chunk_size < 1:
         raise ValueError("--request-chunk-size must be positive")
-    if args.max_retries < 0 or args.max_input_tokens < 0:
+    if (
+        args.max_retries < 0
+        or args.max_input_tokens < 0
+        or args.max_processed_input_tokens < 0
+    ):
         raise ValueError("token limits and retry count cannot be negative")
 
     datasets = discover_dataset_files(Path(args.dataset_root), args.datasets)
@@ -544,7 +593,14 @@ def main() -> None:
     output_root = Path(args.output_root).resolve()
 
     from chatts.utils.llm_utils import LLMClient
+    from transformers import AutoConfig
     from vllm import SamplingParams
+
+    model_config = AutoConfig.from_pretrained(
+        args.model_path, trust_remote_code=True
+    )
+    ts_patch_size = _chatts_vllm.get_time_series_patch_size(model_config)
+    print(f"[TSRBench] time-series encoder patch_size={ts_patch_size}")
 
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens,
@@ -612,19 +668,63 @@ def main() -> None:
                     )
                     for prompt in prompts
                 ]
-                if args.max_input_tokens > 0:
+                if (
+                    args.max_input_tokens > 0
+                    or args.max_processed_input_tokens > 0
+                ):
                     kept = []
                     for position, templated_prompt in enumerate(templated_prompts):
                         input_tokens = len(
-                            client.tokenizer(
+                            client.tokenizer.encode(
                                 templated_prompt, add_special_tokens=False
-                            )["input_ids"]
-                        )
-                        if input_tokens > args.max_input_tokens:
-                            print(
-                                f"[TSRBench] {dataset_name}[{valid_indices[position]}] "
-                                f"skipped: input tokens {input_tokens} > {args.max_input_tokens}"
                             )
+                        )
+                        processed_tokens = estimate_vllm_prompt_tokens(
+                            client.tokenizer,
+                            templated_prompt,
+                            series_batch[position],
+                            ts_patch_size,
+                        )
+                        reason = None
+                        if (
+                            args.max_input_tokens > 0
+                            and input_tokens > args.max_input_tokens
+                        ):
+                            reason = (
+                                f"text input tokens {input_tokens} > "
+                                f"{args.max_input_tokens}"
+                            )
+                        elif (
+                            args.max_processed_input_tokens > 0
+                            and processed_tokens > args.max_processed_input_tokens
+                        ):
+                            reason = (
+                                f"processed input tokens {processed_tokens} > "
+                                f"{args.max_processed_input_tokens} "
+                                "(text + multimodal time-series tokens)"
+                            )
+
+                        if reason is not None:
+                            index = valid_indices[position]
+                            print(
+                                f"[TSRBench] {dataset_name}[{index}] skipped: {reason}"
+                            )
+                            error = f"INPUT_SKIPPED: {reason}"
+                            completed[index] = {
+                                "idx": index,
+                                "question_text": (
+                                    templated_prompt
+                                    if args.prompt_mode == "official"
+                                    else prompts[position]
+                                ),
+                                "response": error,
+                                "raw_response": error,
+                                "answer": None,
+                                "prompt_mode": args.prompt_mode,
+                                "input_tokens": input_tokens,
+                                "processed_input_tokens": processed_tokens,
+                                "error": reason,
+                            }
                         else:
                             kept.append(position)
                     prompts = [prompts[position] for position in kept]
@@ -632,6 +732,8 @@ def main() -> None:
                     series_batch = [series_batch[position] for position in kept]
                     valid_indices = [valid_indices[position] for position in kept]
                     if not prompts:
+                        ordered = [completed[index] for index in sorted(completed)]
+                        _atomic_dump(ordered, result_path)
                         continue
 
                 responses = generate_with_retries(

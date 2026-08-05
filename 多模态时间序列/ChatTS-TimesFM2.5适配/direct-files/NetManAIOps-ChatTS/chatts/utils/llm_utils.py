@@ -153,7 +153,17 @@ def worker_vllm_ts(input_queue, output_queue, gpu_id, batch_size, sample_n, fini
         default_sampling_params = SamplingParams(temperature=0.5, top_p=0.95, max_tokens=CTX_LENGTH, stop_token_ids=[151643, 151645], stop=['<|endoftext|>', '<|im_end|>'], n=sample_n)
         max_model_len = int(os.environ.get("CHATTS_VLLM_MAX_MODEL_LEN", CTX_LENGTH))
         llm = LLM(model=model_path, trust_remote_code=True, max_model_len=max_model_len, tensor_parallel_size=len(gpu_id.split(',')), gpu_memory_utilization=0.95, limit_mm_per_prompt={"timeseries": 50}, enable_prefix_caching=False)
-        print(f"[worker {gpu_id}] Initialization finished (max_model_len={max_model_len}).")
+        effective_model_config = getattr(
+            getattr(llm, "llm_engine", None), "model_config", None
+        )
+        effective_max_model_len = getattr(
+            effective_model_config, "max_model_len", max_model_len
+        )
+        print(
+            f"[worker {gpu_id}] Initialization finished "
+            f"(requested_max_model_len={max_model_len}, "
+            f"effective_max_model_len={effective_max_model_len})."
+        )
         ready_cnt.value = ready_cnt.value + 1
 
         while not finished_flag.get():
@@ -181,7 +191,27 @@ def worker_vllm_ts(input_queue, output_queue, gpu_id, batch_size, sample_n, fini
                 else:
                     sampling_params = default_sampling_params
                 batch_sample_n = sampling_params.n
-                answers = llm.generate(batch_inputs, sampling_params, use_tqdm=False)
+                try:
+                    answers = llm.generate(
+                        batch_inputs, sampling_params, use_tqdm=False
+                    )
+                except ValueError as err:
+                    error_text = str(err)
+                    if (
+                        "prompt" in error_text.lower()
+                        and "maximum model length" in error_text.lower()
+                    ):
+                        # One malformed/oversized TSRBench item must not kill
+                        # the worker and leave LLMClient blocked forever.
+                        logger.error(
+                            f"[worker {gpu_id}] Rejected oversized input: "
+                            f"{error_text}"
+                        )
+                        response = f"VLLM_INPUT_REJECTED: {error_text}"
+                        for args in batch_args:
+                            output_queue.put((response, *args))
+                        continue
+                    raise
                 if batch_sample_n > 1:
                     answers = [i.outputs for i in answers]
                     answers = [[j.text for j in i] for i in answers]

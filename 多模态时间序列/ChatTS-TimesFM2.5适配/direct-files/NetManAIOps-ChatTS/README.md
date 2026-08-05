@@ -267,7 +267,7 @@ bash scripts/run_chatts_tsrbench.sh
 ```
 
 默认 `PROMPT_MODE=answer_only`：Qwen3 `enable_thinking=False`，只要求输出一个
-选项字母；`max_model_len=5000`、`max_new_tokens=32`、`temperature=0.0`，不做
+选项字母；`max_model_len=12288`、`max_new_tokens=32`、`temperature=0.0`，不做
 格式重试。若要复现 TSRBench 官方 ChatTS prompt 和显式参数，使用：
 
 ```bash
@@ -278,9 +278,17 @@ bash scripts/run_chatts_tsrbench.sh
 
 `official` 模式使用官方 `<think>...</think><answer>A</answer>` 指令、手写 ChatML
 包装、`max_new_tokens=512`、输入上限 `8000`、`temperature=1.0`、最多十次生成，
-以及官方的 `batch_size=1`；vLLM 的 `max_model_len` 相应设为 `8512`。这里的
+以及官方的 `batch_size=1`；vLLM 的 `max_model_len` 设为 `12288`，为多模态
+时序 tokens 预留额外空间。这里的
 thinking 是 TSRBench 用户 prompt 明确要求的推理，不是额外开启 Qwen3 chat
 template 的 thinking 开关。
+
+脚本会分别检查原始文本 token 数，以及 ChatTS processor 展开后的
+“文本 + 时序 patch”总输入 token 数。默认给输出保留完整的
+`MAX_NEW_TOKENS` 空间；超长样本会记录为 `INPUT_SKIPPED` 并继续评测，不会再让
+整个 vLLM worker 退出、导致进度条永久阻塞。若日志仍显示
+`effective_max_model_len=8192`，说明服务器保留了旧环境变量；请显式设置
+`CHATTS_VLLM_MAX_MODEL_LEN=12288` 后重启脚本。
 
 结果记录包含 `prompt_mode`，脚本不会把不同模式的断点结果混在一起；切换模式时仍
 建议设置 `FORCE_INFERENCE=1`，便于得到一份干净的完整结果。
