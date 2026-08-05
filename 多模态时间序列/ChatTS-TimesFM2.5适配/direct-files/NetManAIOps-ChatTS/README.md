@@ -295,6 +295,99 @@ fallback warning。
 `accuracy_strict=正确数/数据集总数` 与 `accuracy_parsed=正确数/成功解析数`，避免
 因漏答或格式错误而虚高。
 
+## tinyBenchmarks 选择题：通用能力与灾难性遗忘筛查
+
+本适配只跑 tinyBenchmarks 中的五个选择题任务：
+
+```text
+tinyArc, tinyHellaswag, tinyMMLU, tinyTruthfulQA, tinyWinogrande
+```
+
+生成式的 `tinyGSM8k` 明确不在本次评测中。评测使用
+`lm-evaluation-harness` 的 Hugging Face causal-LM 后端计算选项
+log-likelihood，不使用 vLLM、RAGAS 或外部 judge。输入中没有时间序列，
+所以 TS encoder 不参与 forward，也不需要时序归一化。
+
+先在 ChatTS 环境中安装固定版本的依赖：
+
+```bash
+cd /workspace/ChatTS/ChatTS-main
+bash scripts/install_tinybenchmarks_mcq.sh
+```
+
+该脚本只安装 lm-eval 的 Hugging Face 路径，不安装它的 vLLM extra，
+因此不会主动把 ChatTS 所需的 `vllm==0.8.5` 升级掉。如果评测服务器
+不能访问 GitHub，先把两个官方仓库复制到本地，再执行：
+
+```bash
+LM_EVAL_ROOT=/workspace/lm-evaluation-harness \
+TINYBENCHMARKS_ROOT=/workspace/tinyBenchmarks \
+bash scripts/install_tinybenchmarks_mcq.sh
+```
+
+安装脚本会以 editable 方式保留 tinyBenchmarks 官方
+`tinyBenchmarks.pkl` IRT 校准文件。运行时它会被自动复制到
+`${OUTPUT_ROOT}/.tinybenchmarks_runtime/`，避免官方包在普通 wheel 安装后
+因找不到 `.pkl` 而再次联网。也可以手动指定：
+
+```bash
+TINYBENCHMARKS_PKL=/workspace/tinyBenchmarks/tinyBenchmarks/tinyBenchmarks.pkl \
+bash scripts/run_chatts_tinybenchmarks_mcq.sh ...
+```
+
+判断灾难性遗忘至少需要两个模型：开始 ChatTS 训练前的底座模型，
+以及训练后 checkpoint。也可以在中间加入 Stage 1/Stage 2：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+PARALLELIZE=1 \
+BATCH_SIZE=1 \
+bash scripts/run_chatts_tinybenchmarks_mcq.sh \
+  --model base=/workspace/models/qwen3-8b-before-chatts \
+  --model stage1=/workspace/checkpoints/chatts-stage1 \
+  --model chatts=/workspace/checkpoints/chatts-final \
+  --baseline base
+```
+
+默认 `APPLY_CHAT_TEMPLATE=0`，跟随 tinyBenchmarks 官方 completion 协议。
+如果要评测 chat-template 协议，必须对底座和所有 ChatTS checkpoint
+统一设置 `APPLY_CHAT_TEMPLATE=1`，不能混用。脚本会比较每个任务的
+prompt/document/target 哈希；不一致时标记 `protocol_match=mismatch`，
+不对分数差作遗忘解释。
+
+输出位于：
+
+```text
+/workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/
+  tinybenchmarks_mcq_summary.csv
+  tinybenchmarks_mcq_summary.json
+  tinybenchmarks_mcq_summary.md
+```
+
+汇总表同时报告：
+
+- 官方 GPIRT/IRT++ 全量分数估计；
+- 每个 tiny 锚点集的原始准确率和实际样本数；
+- 相对底座的每项和宏平均下降百分点；
+- 通用能力保留率 `retention_percent`；
+- 可配置的遗忘筛查标记。
+
+默认只在“五项宏平均下降至少 5 个百分点，且至少三项下降”时
+给出 `forgetting_warning`。这是低成本筛查，不是统计意义上的最终证明；
+出现 warning 后应对对应全量 benchmark 复测。可以修改：
+
+```bash
+FORGETTING_THRESHOLD_PP=3.0 \
+bash scripts/run_chatts_tinybenchmarks_mcq.sh --summary-only \
+  --model base=/workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/base \
+  --model chatts=/workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/chatts \
+  --baseline base
+```
+
+首次运行会从 Hugging Face 下载五个各 100 条的 tiny 数据集。无网运行时
+需同时准备已填充的 `HF_HOME` 和上述 IRT 校准 `.pkl`，然后设置
+`HF_HUB_OFFLINE=1`。
+
 可以更改输出位置和文件名：
 
 ```bash
