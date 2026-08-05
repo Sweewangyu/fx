@@ -208,6 +208,78 @@ CSV 是 UTF-8 with BOM，可直接用 Excel 打开。每行包含：Dataset A/B 
 categorical/numerical 分数、两个数据集的分项平均、四项指标的
 `Macro Mean`、token 数和运行状态。表格默认按 `Macro Mean` 降序排名。
 
+## TSRBench：复用 ChatTS vLLM 推理后端
+
+本目录额外提供三个新的可直接复制到服务器的文件，并复用此前已经提供的 checkpoint
+检查器：
+
+- `chatts/utils/inference_tsrbench_vllm.py`：读取 TSRBench JSONL，复用现有
+  `LLMClient(engine="vllm-ts")`，模型只加载一次即可依次跑完全部任务；
+- `scripts/run_chatts_tsrbench.sh`：一键推理与评测；
+- `scripts/evaluate_tsrbench.py`：纯本地多选题评测，不使用 RAGAS 或 judge API。
+- `scripts/inspect_chatts_ts_encoder_checkpoints.py`：若 config 中没有
+  `ts_encoder_type`，启动前直接根据 checkpoint 权重识别 MLP、TimesFM 2.5、
+  Chronos-2 或 Zeus。
+
+将三个文件按相同相对路径复制到 ChatTS 项目后运行：
+
+```bash
+PROJECT_ROOT=/workspace/ChatTS/ChatTS-main \
+TSRBENCH_ROOT=/workspace/TSRBench \
+DATASET_ROOT=/workspace/TSRBench/dataset \
+MODEL_PATH=/path/to/your/chatts/checkpoint \
+MODEL_NAME=my-chatts \
+NUM_GPUS=8 \
+NUM_GPUS_PER_PROCESS=2 \
+bash scripts/run_chatts_tsrbench.sh
+```
+
+脚本会递归识别当前发布数据中的 12 个 JSONL 文件，同时兼容 TSRBench 旧代码里的
+三个名称：`math_reasoning -> numerical_reasoning`、
+`event_forecast -> event_prediction`、
+`pattern_decision -> qualitative_decision`。中途退出后用同一条命令重跑即可从已有
+`generated_answer.json` 继续；仅当 `FORCE_INFERENCE=1` 时才覆盖已有结果。
+
+原始时间序列直接传入 vLLM 的 `multi_modal_data["timeseries"]`，不要在脚本外再次
+归一化。ChatTS checkpoint 自带的 processor 会执行与 Dataset A/B 相同的 SP
+归一化。MLP-Patch、TimesFM 2.5、Chronos-2、Zeus 都走同一个输入接口；encoder
+类型和本地 backbone 路径的环境变量与 Dataset A/B 脚本完全相同。例如：
+
+```bash
+TS_ENCODER_TYPE=timesfm2_5 \
+TIMESFM_MODEL_PATH=/workspace/timesf \
+bash scripts/run_chatts_tsrbench.sh
+```
+
+通常无需指定 `TS_ENCODER_TYPE`：一键脚本会先用权重检查器自动识别。只有 768 维
+projector 且 checkpoint 同时没有可用 patch size 时，Chronos-2 与 Zeus 无法仅靠
+权重区分，此时才需要显式设置 `TS_ENCODER_TYPE=chronos2` 或 `zeus`。
+
+只做快速冒烟测试：
+
+```bash
+DATASETS="perception numerical_reasoning" MAX_SAMPLES=20 \
+bash scripts/run_chatts_tsrbench.sh
+```
+
+如果日志中出现下列组合：
+
+```text
+Qwen3TSForCausalLM has no vLLM implementation, falling back to Transformers
+KeyError: <class 'vllm.model_executor.models.transformers.TransformersForCausalLM'>
+```
+
+说明 vLLM spawn worker 没有执行 ChatTS 的模型与多模态 processor 注册。
+`inference_tsrbench_vllm.py` 已将 `import chatts.vllm.chatts_vllm` 固定在模块
+顶层，不要再把它移进 `main()` 或其他函数。启动成功时每个 worker
+都应使用 `Qwen3TSForCausalLM` 的 ChatTS vLLM 实现，不应再出现上述
+fallback warning。
+
+最终结果保存在 `${TSRBENCH_ROOT}/evaluation/results/embed/`，并额外生成
+`tsrbench_summary_<model>.json` 和可直接用 Excel 打开的 CSV。主报告同时给出
+`accuracy_strict=正确数/数据集总数` 与 `accuracy_parsed=正确数/成功解析数`，避免
+因漏答或格式错误而虚高。
+
 可以更改输出位置和文件名：
 
 ```bash

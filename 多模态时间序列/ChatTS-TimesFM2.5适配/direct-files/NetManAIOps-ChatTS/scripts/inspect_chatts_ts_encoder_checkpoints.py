@@ -504,6 +504,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow legacy pickle loading only for checkpoints you trust.",
     )
+    parser.add_argument(
+        "--print-detected-only",
+        action="store_true",
+        help="Inspect exactly one checkpoint and print only its encoder type.",
+    )
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
 
@@ -527,6 +532,25 @@ def main() -> int:
     checkpoints = discover_checkpoints(root, args.checkpoint_suffix)
     if not checkpoints:
         raise SystemExit(f"No checkpoint directories found under {root}")
+
+    if args.print_detected_only:
+        if len(checkpoints) != 1:
+            raise SystemExit(
+                "--print-detected-only requires a checkpoint directory, not a parent "
+                f"containing {len(checkpoints)} checkpoints."
+            )
+        report = inspect_checkpoint(
+            checkpoints[0],
+            allow_unsafe_torch_load=args.allow_unsafe_torch_load,
+            max_relevant_keys=max(1, args.max_relevant_keys),
+        )
+        if report.status not in ("OK",):
+            raise SystemExit(
+                f"Cannot select encoder automatically: {report.detected_encoder}: "
+                f"{report.reason}"
+            )
+        print(report.detected_encoder)
+        return 0
 
     reports = [
         inspect_checkpoint(
