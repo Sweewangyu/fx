@@ -56,7 +56,8 @@ datataste/
   → 数据契约与坏行检查
   → TSRBench 元信息/规则初标
   → 模板聚类
-  → DeepSeek 或其他模型复核
+  → Qwen 首轮复核
+  → DeepSeek V4 Flash 权威裁决不确定模板
   → 人工仲裁
   → 最终标签解析
   → 物化 15 类 ChatTS 训练文件
@@ -82,7 +83,7 @@ python scripts/annotate_tsr_taxonomy.py prepare \
   --output-dir artifacts/tsr-taxonomy-v2
 ```
 
-### 使用 DeepSeek V4 Flash 复核模板
+### 使用 DeepSeek V4 Flash 思考模式裁决不确定模板
 
 不要把密钥写入脚本或配置：
 
@@ -90,15 +91,19 @@ python scripts/annotate_tsr_taxonomy.py prepare \
 export DEEPSEEK_API_KEY='在终端中填写新密钥'
 
 python scripts/annotate_tsr_taxonomy.py annotate-online \
-  --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-deepseek-v4-flash.jsonl \
-  --base-url https://api.deepseek.com \
-  --model deepseek-v4-flash \
-  --api-key-env DEEPSEEK_API_KEY \
+  --input artifacts/tsr-taxonomy/final_labels.qwen.human_review.jsonl \
+  --output artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
+  --base-url http://localhost:30000/v1 \
+  --model /models \
+  --allow-no-key \
   --workers 8 \
+  --max-tokens 2048 \
   --json-mode \
-  --disable-thinking
+  --thinking-mode enabled \
+  --reasoning-effort max
 ```
+
+`--reasoning-effort` 支持 `high` 和 `max`；省略时使用服务端默认强度。思考正文不会写入投票文件，只记录是否返回了 `reasoning_content`。`content` 中的最终 JSON 才参与标签解析。
 
 ### 解析规则、模型和人工标签
 
@@ -106,11 +111,13 @@ python scripts/annotate_tsr_taxonomy.py annotate-online \
 python scripts/annotate_tsr_taxonomy.py resolve \
   --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
   --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --votes artifacts/tsr-taxonomy/vote-model-a.jsonl \
-          artifacts/tsr-taxonomy/vote-model-b.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --authoritative-votes artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
   --human artifacts/tsr-taxonomy/human-labels.csv \
   --output artifacts/tsr-taxonomy/final_labels-v2.jsonl
 ```
+
+解析优先级为：人工覆盖 > 规则 `auto_accept` > DeepSeek 权威票 > 普通模型共识 > 单模型与规则一致 > `human_review`。DeepSeek 权威票保留模型名、真实置信度、思考模式和思考强度，不伪装成人工标签。
 
 ### 物化 15 类训练集
 

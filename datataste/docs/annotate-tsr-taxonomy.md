@@ -47,11 +47,11 @@
             ↓
 按 source + 归一化问题模板聚类
             ↓
-两个独立模型只标低置信/冲突模板
+Qwen 首轮标低置信/冲突模板
             ↓
-规则与模型一致则接收；模型分歧进入双人人工标注
+规则与 Qwen 一致则接收；不确定模板交给 DeepSeek 权威裁决
             ↓
-第三人仲裁 + 分层抽检
+人工覆盖 + 分层抽检
             ↓
 生成标签索引，再物化成 15 个 ChatTS JSONL 训练桶
 ```
@@ -80,44 +80,70 @@ python scripts/annotate_tsr_taxonomy.py prepare \
 - `annotation_state.sqlite`：模板簇和成员数，可用于统计与恢复。
 - `prepare_manifest.json`：样本、标签、适配度和状态分布。
 
-### 第二步：两个模型独立标注模糊模板（可选）
+### 第二步：Qwen 首轮标注模糊模板
 
-管线兼容任何 OpenAI-compatible `/chat/completions` 服务。分别使用两个输出文件，不能让第二个模型看到第一个模型的结果。
+管线兼容任何 OpenAI-compatible `/chat/completions` 服务。Qwen 先处理全部待复核模板：
 
 ```bash
 python scripts/annotate_tsr_taxonomy.py annotate-online \
   --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-model-a.jsonl \
+  --output artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
   --base-url http://127.0.0.1:8000/v1 \
-  --model MODEL_A --allow-no-key
+  --model QWEN_MODEL --allow-no-key --json-mode
 
-python scripts/annotate_tsr_taxonomy.py annotate-online \
-  --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-model-b.jsonl \
-  --base-url http://127.0.0.1:8001/v1 \
-  --model MODEL_B --allow-no-key
+python scripts/annotate_tsr_taxonomy.py resolve \
+  --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
+  --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --output artifacts/tsr-taxonomy/final_labels.qwen.jsonl
 ```
 
-命令可断点续跑；已有 `cluster_id` 会自动跳过。使用云端 API 时不要加 `--allow-no-key`，并把密钥放在环境变量中，不要写入脚本。
+未解决模板会写到 `final_labels.qwen.human_review.jsonl`。
 
-### 第三步：解析一致标签并导出人工队列
+### 第三步：DeepSeek V4 Flash 权威裁决
+
+DeepSeek 只读取 Qwen 未解决模板。使用思考模式时，`high` 是默认深度，`max` 用于更强推理：
+
+```bash
+python scripts/annotate_tsr_taxonomy.py annotate-online \
+  --input artifacts/tsr-taxonomy/final_labels.qwen.human_review.jsonl \
+  --output artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
+  --base-url http://localhost:30000/v1 \
+  --model /models \
+  --allow-no-key \
+  --workers 8 \
+  --max-tokens 2048 \
+  --json-mode \
+  --thinking-mode enabled \
+  --reasoning-effort max
+```
+
+投票文件保存请求采用的思考模式、强度以及是否返回 `reasoning_content`，但不保存思考正文。只有最终 `content` 中的 JSON 参与解析。思考模式需要为最终 JSON 留出输出空间；如果出现 `model response has no final content`，应提高 `--max-tokens`，而不是把空内容当成标签。
+
+### 第四步：解析普通票、权威票和人工覆盖
 
 ```bash
 python scripts/annotate_tsr_taxonomy.py resolve \
   --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
   --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --votes artifacts/tsr-taxonomy/vote-model-a.jsonl \
-          artifacts/tsr-taxonomy/vote-model-b.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --authoritative-votes artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
   --output artifacts/tsr-taxonomy/final_labels.jsonl
 ```
 
-未达成一致的模板会写到 `final_labels.human_review.jsonl`。人工覆盖文件采用 JSONL，每行至少包含：
+解析顺序是：人工覆盖 > 规则 `auto_accept` > DeepSeek 权威票 > 普通模型共识 > 单模型与规则一致 > `human_review`。权威票的置信度不会被改成 1.0；低置信结果仍可在物化时通过 `--min-confidence` 排除。
+
+如果 DeepSeek 请求失败或没有合法权威票，该模板继续进入人工复核。
+
+### 第五步：人工覆盖（可选）
+
+人工覆盖文件采用 JSONL，每行至少包含：
 
 ```json
 {"cluster_id":"...","primary_label":"AD","secondary_labels":["TR"],"taxonomy_fit":"exact","rationale":"要求定位异常片段"}
 ```
 
-排除样本使用 `"primary_label": null, "taxonomy_fit": "out_of_scope"`。完成仲裁后再次运行 `resolve`，加上 `--human human-labels.jsonl`。
+排除样本使用 `"primary_label": null, "taxonomy_fit": "out_of_scope"`。
 
 如果希望在 Excel/Numbers 中标注，可导出 CSV：
 
@@ -127,9 +153,9 @@ python scripts/annotate_tsr_taxonomy.py export-human \
   --output artifacts/tsr-taxonomy/human-labels.csv
 ```
 
-填写 `human_primary_label`、`human_secondary_labels`、`human_taxonomy_fit`、`human_rationale` 和 `reviewer`。未完成的行保持 `human_taxonomy_fit` 为空；管线会忽略这些行。完成后可把 CSV 直接传给 `resolve --human artifacts/tsr-taxonomy/human-labels.csv`。
+填写后再次执行 `resolve` 并加上 `--human artifacts/tsr-taxonomy/human-labels.csv`。
 
-### 第四步：物化训练桶
+### 第六步：物化训练桶
 
 ```bash
 python scripts/annotate_tsr_taxonomy.py materialize \
@@ -141,7 +167,7 @@ python scripts/annotate_tsr_taxonomy.py materialize \
   --include-fit exact compatible
 ```
 
-输出的 15 个文件仍严格保持 ChatTS 的 `input + timeseries + output` 三字段格式。默认只物化 `train` split，并且不把 `closest`、`mixed` 和 `out_of_scope` 放入主训练桶；这些数据可另做辅助训练或先拆成单任务问题。
+输出的 15 个文件仍严格保持 ChatTS 三字段格式。
 
 ## 5. 数据集级先验（不能替代逐题判断）
 

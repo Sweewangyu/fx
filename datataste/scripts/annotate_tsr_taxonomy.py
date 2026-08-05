@@ -744,6 +744,48 @@ def _parse_model_json(content: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_thinking_config(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
+    thinking_mode = getattr(args, "thinking_mode", None)
+    disable_thinking = bool(getattr(args, "disable_thinking", False))
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    if disable_thinking:
+        if thinking_mode:
+            raise ValueError("--disable-thinking cannot be combined with --thinking-mode")
+        thinking_mode = "disabled"
+    if reasoning_effort and thinking_mode is None:
+        thinking_mode = "enabled"
+    if reasoning_effort and thinking_mode == "disabled":
+        raise ValueError("--reasoning-effort requires thinking mode to be enabled")
+    return thinking_mode, reasoning_effort
+
+
+def _build_annotation_payload(
+    args: argparse.Namespace, system: str, user: str
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    thinking_mode, reasoning_effort = _resolve_thinking_config(args)
+    payload: Dict[str, Any] = {
+        "model": args.model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "max_tokens": args.max_tokens,
+    }
+    # DeepSeek V4 ignores sampling parameters in thinking mode.  Omitting
+    # temperature also keeps the request valid for stricter compatible servers.
+    if thinking_mode != "enabled":
+        payload["temperature"] = 0
+    if getattr(args, "json_mode", False):
+        payload["response_format"] = {"type": "json_object"}
+    if thinking_mode:
+        payload["thinking"] = {"type": thinking_mode}
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    request_config = {
+        "thinking_mode": thinking_mode or "default",
+        "reasoning_effort": reasoning_effort,
+        "json_mode": bool(getattr(args, "json_mode", False)),
+    }
+    return payload, request_config
+
+
 def annotate_online_command(args: argparse.Namespace) -> int:
     try:
         import httpx
@@ -784,16 +826,7 @@ def annotate_online_command(args: argparse.Namespace) -> int:
                 "rule_proposal": item.get("provisional"),
             }
         )
-        payload = {
-            "model": args.model,
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": 0,
-            "max_tokens": args.max_tokens,
-        }
-        if args.json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if args.disable_thinking:
-            payload["thinking"] = {"type": "disabled"}
+        payload, request_config = _build_annotation_payload(args, system, user)
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = "Bearer " + key
@@ -802,12 +835,20 @@ def annotate_online_command(args: argparse.Namespace) -> int:
             try:
                 response = httpx.post(url, headers=headers, json=payload, timeout=args.timeout)
                 response.raise_for_status()
-                content = response.json()["choices"][0]["message"]["content"]
+                response_payload = response.json()
+                message = response_payload["choices"][0]["message"]
+                content = message.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("model response has no final content")
                 vote = _parse_model_json(content)
                 return {
                     "cluster_id": item["cluster_id"],
                     "model": args.model,
                     "taxonomy_version": TAXONOMY_VERSION,
+                    "inference": {
+                        **request_config,
+                        "reasoning_content_present": bool(message.get("reasoning_content")),
+                    },
                     "vote": vote,
                 }
             except Exception as exc:
@@ -848,8 +889,23 @@ def _load_votes(paths: Sequence[str]) -> Dict[str, List[Dict[str, Any]]]:
                 if not line.strip():
                     continue
                 item = json.loads(line)
+                if not isinstance(item.get("vote"), dict):
+                    raise ValueError(f"vote record has no vote object: {raw_path}")
+                item["vote"] = _parse_model_json(_json_dump(item["vote"]))
                 votes[item["cluster_id"]].append(item)
     return votes
+
+
+def _load_authoritative_votes(paths: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    grouped = _load_votes(paths)
+    duplicated = sorted(cluster_id for cluster_id, items in grouped.items() if len(items) != 1)
+    if duplicated:
+        preview = ", ".join(duplicated[:5])
+        raise ValueError(
+            "authoritative vote input must contain exactly one vote per cluster; "
+            f"duplicates: {preview}"
+        )
+    return {cluster_id: items[0] for cluster_id, items in grouped.items()}
 
 
 def _load_human(path: Optional[str]) -> Dict[str, Dict[str, Any]]:
@@ -951,6 +1007,7 @@ def export_human_command(args: argparse.Namespace) -> int:
 
 def resolve_command(args: argparse.Namespace) -> int:
     votes = _load_votes(args.votes or [])
+    authoritative_votes = _load_authoritative_votes(getattr(args, "authoritative_votes", []) or [])
     human = _load_human(args.human)
     output_path = Path(args.output)
     output_temp, output_stream = _atomic_writer(output_path)
@@ -982,6 +1039,20 @@ def resolve_command(args: argparse.Namespace) -> int:
                         "confidence": provisional["confidence"],
                         "status": "accepted",
                         "method": "rules",
+                    }
+                elif cluster_id in authoritative_votes:
+                    record = authoritative_votes[cluster_id]
+                    vote = record["vote"]
+                    final = {
+                        "primary_label": vote.get("primary_label"),
+                        "secondary_labels": vote.get("secondary_labels", []),
+                        "taxonomy_fit": vote["taxonomy_fit"],
+                        "confidence": round(float(vote.get("confidence", 0.0)), 4),
+                        "status": "accepted" if vote.get("primary_label") else "excluded",
+                        "method": "authoritative_model",
+                        "model": record.get("model", ""),
+                        "rationale": vote.get("rationale", ""),
+                        "inference": record.get("inference", {}),
                     }
                 else:
                     cluster_votes = [vote["vote"] for vote in votes.get(cluster_id, [])]
@@ -1282,8 +1353,23 @@ def build_parser() -> argparse.ArgumentParser:
     annotate.add_argument(
         "--json-mode", action="store_true", help="request response_format=json_object from compatible APIs"
     )
+    thinking = annotate.add_mutually_exclusive_group()
+    thinking.add_argument(
+        "--thinking-mode",
+        choices=["enabled", "disabled"],
+        default=None,
+        help="request DeepSeek-compatible thinking mode; omitted means use the server default",
+    )
+    thinking.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="deprecated alias for --thinking-mode disabled",
+    )
     annotate.add_argument(
-        "--disable-thinking", action="store_true", help="request non-thinking mode from compatible APIs"
+        "--reasoning-effort",
+        choices=["high", "max"],
+        default=None,
+        help="DeepSeek V4 thinking strength; providing it implicitly enables thinking mode",
     )
     annotate.set_defaults(func=annotate_online_command)
 
@@ -1297,6 +1383,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolve = subparsers.add_parser("resolve", help="resolve rules, model votes, and optional human overrides")
     resolve.add_argument("--provisional", required=True)
     resolve.add_argument("--votes", nargs="*", default=[])
+    resolve.add_argument(
+        "--authoritative-votes",
+        nargs="*",
+        default=[],
+        help="model votes that override ordinary votes for review samples while preserving model provenance",
+    )
     resolve.add_argument("--human", default=None)
     resolve.add_argument("--clusters", default=None)
     resolve.add_argument("--output", required=True)

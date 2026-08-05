@@ -3,15 +3,19 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from scripts.annotate_tsr_taxonomy import (
     SourceSpec,
+    _build_annotation_payload,
+    annotate_online_command,
     build_distribution_report,
     _load_human,
     _parse_model_json,
     iter_source,
     materialize_command,
     normalize_template,
+    resolve_command,
     rule_label,
 )
 
@@ -62,6 +66,274 @@ class RuleBoundaryTests(unittest.TestCase):
             '"confidence":0.9,"rationale":"anomaly"}\n```'
         )
         self.assertEqual(parsed["primary_label"], "AD")
+
+    def test_deepseek_thinking_payload_supports_effort(self):
+        payload, config = _build_annotation_payload(
+            SimpleNamespace(
+                model="/models",
+                max_tokens=300,
+                json_mode=True,
+                thinking_mode="enabled",
+                disable_thinking=False,
+                reasoning_effort="max",
+            ),
+            "system",
+            "user",
+        )
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertEqual(payload["reasoning_effort"], "max")
+        self.assertNotIn("temperature", payload)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertEqual(config["thinking_mode"], "enabled")
+
+    def test_reasoning_effort_implicitly_enables_thinking(self):
+        payload, _ = _build_annotation_payload(
+            SimpleNamespace(
+                model="/models",
+                max_tokens=300,
+                json_mode=False,
+                thinking_mode=None,
+                disable_thinking=False,
+                reasoning_effort="high",
+            ),
+            "system",
+            "user",
+        )
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+        self.assertNotIn("temperature", payload)
+
+    def test_reasoning_effort_rejects_disabled_thinking(self):
+        with self.assertRaisesRegex(ValueError, "requires thinking mode"):
+            _build_annotation_payload(
+                SimpleNamespace(
+                    model="/models",
+                    max_tokens=300,
+                    json_mode=False,
+                    thinking_mode="disabled",
+                    disable_thinking=False,
+                    reasoning_effort="max",
+                ),
+                "system",
+                "user",
+            )
+
+    @mock.patch("httpx.post")
+    def test_annotate_online_keeps_reasoning_private_and_parses_final_content(self, post):
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "reasoning_content": "private chain of thought",
+                        "content": json.dumps(
+                            {
+                                "primary_label": "AD",
+                                "secondary_labels": [],
+                                "taxonomy_fit": "exact",
+                                "confidence": 0.94,
+                                "rationale": "locates anomalies",
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_path = root / "review.jsonl"
+            input_path.write_text(
+                json.dumps(
+                    {
+                        "cluster_id": "cluster",
+                        "source": "time_mqa",
+                        "source_task": "anomaly detection",
+                        "question_type": "unknown",
+                        "representative_input": "Locate anomalies in <ts><ts/>.",
+                        "representative_output": "Point 5 is anomalous.",
+                        "provisional": {"primary_label": "AD"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output_path = root / "votes.jsonl"
+            result = annotate_online_command(
+                SimpleNamespace(
+                    input=str(input_path),
+                    output=str(output_path),
+                    base_url="http://localhost:30000/v1",
+                    model="/models",
+                    api_key_env="UNSET_TEST_API_KEY",
+                    allow_no_key=True,
+                    workers=1,
+                    limit=0,
+                    timeout=30.0,
+                    retries=0,
+                    max_tokens=2048,
+                    json_mode=True,
+                    thinking_mode="enabled",
+                    disable_thinking=False,
+                    reasoning_effort="max",
+                )
+            )
+            self.assertEqual(result, 0)
+            request_payload = post.call_args.kwargs["json"]
+            self.assertEqual(request_payload["thinking"], {"type": "enabled"})
+            self.assertEqual(request_payload["reasoning_effort"], "max")
+            vote = json.loads(output_path.read_text())
+            self.assertTrue(vote["inference"]["reasoning_content_present"])
+            self.assertNotIn("reasoning_content", vote)
+            self.assertNotIn("private chain of thought", output_path.read_text())
+            self.assertEqual(vote["vote"]["primary_label"], "AD")
+
+    def test_authoritative_vote_overrides_uncertain_model_but_not_auto_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provisional_path = root / "provisional.jsonl"
+            rows = [
+                {
+                    "sample_id": "auto",
+                    "source": "source",
+                    "split": "train",
+                    "source_index": 0,
+                    "cluster_id": "auto-cluster",
+                    "provisional": {
+                        "primary_label": "PR",
+                        "secondary_labels": [],
+                        "closest_label": "PR",
+                        "taxonomy_fit": "exact",
+                        "confidence": 0.99,
+                        "status": "auto_accept",
+                    },
+                },
+                {
+                    "sample_id": "review",
+                    "source": "source",
+                    "split": "train",
+                    "source_index": 1,
+                    "cluster_id": "review-cluster",
+                    "provisional": {
+                        "primary_label": "PR",
+                        "secondary_labels": [],
+                        "closest_label": "PR",
+                        "taxonomy_fit": "exact",
+                        "confidence": 0.8,
+                        "status": "review",
+                    },
+                },
+                {
+                    "sample_id": "excluded",
+                    "source": "source",
+                    "split": "train",
+                    "source_index": 2,
+                    "cluster_id": "excluded-cluster",
+                    "provisional": {
+                        "primary_label": None,
+                        "secondary_labels": [],
+                        "closest_label": "TSF",
+                        "taxonomy_fit": "out_of_scope",
+                        "confidence": 0.65,
+                        "status": "review",
+                    },
+                },
+            ]
+            provisional_path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+            )
+            qwen_path = root / "qwen.jsonl"
+            qwen_path.write_text(
+                json.dumps(
+                    {
+                        "cluster_id": "review-cluster",
+                        "model": "qwen",
+                        "vote": {
+                            "primary_label": "PR",
+                            "secondary_labels": [],
+                            "taxonomy_fit": "exact",
+                            "confidence": 0.9,
+                            "rationale": "qwen",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            authoritative_path = root / "deepseek.jsonl"
+            authoritative_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {
+                            "cluster_id": "auto-cluster",
+                            "model": "/models",
+                            "inference": {
+                                "thinking_mode": "enabled",
+                                "reasoning_effort": "max",
+                            },
+                            "vote": {
+                                "primary_label": "AD",
+                                "secondary_labels": [],
+                                "taxonomy_fit": "exact",
+                                "confidence": 0.91,
+                                "rationale": "should not override auto rule",
+                            },
+                        },
+                        {
+                            "cluster_id": "review-cluster",
+                            "model": "/models",
+                            "inference": {
+                                "thinking_mode": "enabled",
+                                "reasoning_effort": "max",
+                            },
+                            "vote": {
+                                "primary_label": "IR",
+                                "secondary_labels": ["PR"],
+                                "taxonomy_fit": "exact",
+                                "confidence": 0.93,
+                                "rationale": "DeepSeek final decision",
+                            },
+                        },
+                        {
+                            "cluster_id": "excluded-cluster",
+                            "model": "/models",
+                            "inference": {
+                                "thinking_mode": "enabled",
+                                "reasoning_effort": "high",
+                            },
+                            "vote": {
+                                "primary_label": None,
+                                "secondary_labels": [],
+                                "taxonomy_fit": "out_of_scope",
+                                "confidence": 0.97,
+                                "rationale": "not one of the fifteen tasks",
+                            },
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            output_path = root / "final.jsonl"
+            resolve_command(
+                SimpleNamespace(
+                    provisional=str(provisional_path),
+                    votes=[str(qwen_path)],
+                    authoritative_votes=[str(authoritative_path)],
+                    human=None,
+                    clusters=None,
+                    output=str(output_path),
+                )
+            )
+            final_rows = [json.loads(line) for line in output_path.read_text().splitlines()]
+            self.assertEqual(final_rows[0]["final"]["primary_label"], "PR")
+            self.assertEqual(final_rows[0]["final"]["method"], "rules")
+            self.assertEqual(final_rows[1]["final"]["primary_label"], "IR")
+            self.assertEqual(final_rows[1]["final"]["method"], "authoritative_model")
+            self.assertEqual(final_rows[1]["final"]["model"], "/models")
+            self.assertEqual(final_rows[1]["final"]["confidence"], 0.93)
+            self.assertEqual(final_rows[1]["final"]["inference"]["reasoning_effort"], "max")
+            self.assertEqual(final_rows[2]["final"]["status"], "excluded")
+            self.assertEqual(final_rows[2]["final"]["method"], "authoritative_model")
 
     def test_invalid_jsonl_row_can_be_audited_and_skipped(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -14,9 +14,10 @@
 1. 保持原始训练样本不变；
 2. 利用数据集自带元信息和高精度规则做第一轮标注；
 3. 将重复问题压缩为模板簇，减少模型和人工标注量；
-4. 用两个独立模型标注不确定模板；
-5. 用人工标注覆盖模型分歧和体系外任务；
-6. 将最终标签索引与原始数据流式对齐，生成 15 个 ChatTS 格式训练文件。
+4. 用 Qwen 首轮标注不确定模板；
+5. 用 DeepSeek V4 Flash 思考模式权威裁决 Qwen 未解决模板；
+6. 用人工标注覆盖剩余异常和体系外争议；
+7. 将最终标签索引与原始数据流式对齐，生成 15 个 ChatTS 格式训练文件。
 
 本文档描述的是当前代码的实际行为。简化版操作说明见 `docs/annotate-tsr-taxonomy.md`。
 
@@ -41,8 +42,9 @@ flowchart TD
     D --> E{"规则是否可自动接收？"}
     E -->|是| F["auto_accept"]
     E -->|否| G["review_clusters.jsonl"]
-    G --> H["模型 A 独立投票"]
-    G --> I["模型 B 独立投票"]
+    G --> H["Qwen 首轮投票"]
+    H --> P["Qwen-only preliminary resolve"]
+    P -->|不确定| I["DeepSeek V4 Flash<br/>权威思考裁决"]
     F --> J["resolve 冲突解析"]
     H --> J
     I --> J
@@ -67,7 +69,7 @@ flowchart TD
 | E | `status=auto_accept/review` | 决定规则结果能否直接接收 |
 | F | `provisional.status=auto_accept` 的样本 | 保存高精度规则结果，等待统一解析 |
 | G | `review_clusters.jsonl` | 只把不确定的模板送给模型或人工 |
-| H/I | `vote-model-a.jsonl`、`vote-model-b.jsonl` | 两个模型独立给出第二意见 |
+| H/I | `votes-qwen36-all.jsonl`、`vote-deepseek-v4-flash-authoritative.jsonl` | Qwen 首轮复核，DeepSeek 裁决不确定模板 |
 | J | `resolve` 子命令 | 按优先级合并规则、模型和人工结果 |
 | K | 共识判断逻辑 | 判断某模板能否成为最终标签 |
 | M | `human-labels.csv` | 处理模型分歧、体系外任务和低置信标签 |
@@ -450,53 +452,53 @@ artifacts/tsr-taxonomy/review_clusters.jsonl
 
 这里要区分“逐样本状态”和“模板代表状态”：模板是否导出由簇中第一条代表样本决定，`member_count` 统计该模板的全部成员；最终 `resolve` 仍对每条样本分别处理，原本 `auto_accept` 的成员不会被模型票覆盖。本次审计中，所有 266,825 条 review 样本都进入了复核模板范围，另有 1 条 auto-accept 样本与某个 review 模板同簇，因此复核簇的成员数求和会比逐样本 review 数多 1。
 
-### 3.8 G→H/I：两个模型独立标注同一批模板
+### 3.8 G→H/I：Qwen 首轮复核，DeepSeek 权威裁决
 
-#### 为什么要两个模型
+#### 为什么分成两阶段
 
-单模型容易受规则建议、关键词和自身偏好影响。两个独立模型的作用不是简单增加票数，而是暴露边界不清、任务体系不适配或问题本身多义的模板。
+Qwen 先覆盖全部待复核模板；规则与 Qwen 不一致、置信度不足或没有合法输出的模板再交给 DeepSeek V4 Flash。DeepSeek 不是普通的第二张票，而是这些不确定模板的权威裁决来源。这样既减少高成本思考调用，又避免 1:1 平票。
 
-#### 模型 A 怎么运行
+#### Qwen 怎么运行
 
 ```bash
 python scripts/annotate_tsr_taxonomy.py annotate-online \
   --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-model-a.jsonl \
+  --output artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
   --base-url http://127.0.0.1:8000/v1 \
-  --model MODEL_A \
+  --model QWEN_MODEL \
   --workers 8 \
   --allow-no-key
 ```
 
-#### 模型 B 怎么运行
+Qwen 完成后先生成不确定模板队列：
 
 ```bash
-python scripts/annotate_tsr_taxonomy.py annotate-online \
-  --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-model-b.jsonl \
-  --base-url http://127.0.0.1:8001/v1 \
-  --model MODEL_B \
-  --workers 8 \
-  --allow-no-key
+python scripts/annotate_tsr_taxonomy.py resolve \
+  --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
+  --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --output artifacts/tsr-taxonomy/final_labels.qwen.jsonl
 ```
 
-两个输出文件必须分开。模型 B 不能读取 `vote-model-a.jsonl`，否则不再是独立投票。
+输出的 `final_labels.qwen.human_review.jsonl` 是 DeepSeek 的输入。
 
-对于当前 DeepSeek V4 API，已经通过冒烟测试的参数是：
+#### DeepSeek V4 Flash 怎么运行
 
 ```bash
 python scripts/annotate_tsr_taxonomy.py annotate-online \
-  --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-deepseek-v4-flash.jsonl \
-  --base-url https://api.deepseek.com \
-  --model deepseek-v4-flash \
-  --api-key-env DEEPSEEK_API_KEY \
+  --input artifacts/tsr-taxonomy/final_labels.qwen.human_review.jsonl \
+  --output artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
+  --base-url http://localhost:30000/v1 \
+  --model /models \
+  --allow-no-key \
   --workers 8 \
+  --max-tokens 2048 \
   --json-mode \
-  --disable-thinking
+  --thinking-mode enabled \
+  --reasoning-effort max
 ```
 
-`--json-mode` 会发送 `response_format={"type":"json_object"}`，`--disable-thinking` 会发送 `thinking={"type":"disabled"}`。这两个参数是可选项，只有目标 API 支持相应字段时才应开启。
+`--thinking-mode enabled` 发送 `thinking={"type":"enabled"}`；`--reasoning-effort` 支持官方的 `high` 和 `max`。思考模式下不发送 `temperature`。响应中的 `reasoning_content` 不落盘，只记录是否存在；最终 `content` 中的 JSON 才会被解析为标签。省略思考参数时使用服务端默认值，旧参数 `--disable-thinking` 仍作为 `--thinking-mode disabled` 的兼容别名。思考被 `max_tokens` 截断而没有最终 `content` 时，该请求记为失败；DeepSeek `max` 强度建议从 `--max-tokens 2048` 起做冒烟测试。
 
 #### 每次请求给模型什么
 
@@ -555,8 +557,8 @@ rule proposal
 python scripts/annotate_tsr_taxonomy.py resolve \
   --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
   --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --votes artifacts/tsr-taxonomy/vote-model-a.jsonl \
-          artifacts/tsr-taxonomy/vote-model-b.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --authoritative-votes artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
   --output artifacts/tsr-taxonomy/final_labels.v1.jsonl
 ```
 
@@ -565,6 +567,7 @@ python scripts/annotate_tsr_taxonomy.py resolve \
 ```text
 人工覆盖
   > 规则 auto_accept
+  > DeepSeek 权威票
   > 两模型主标签共识
   > 单模型与规则一致
   > human_review
@@ -585,7 +588,11 @@ python scripts/annotate_tsr_taxonomy.py resolve \
 }
 ```
 
-#### 第三优先级：模型共识
+#### 第三优先级：DeepSeek 权威票
+
+对于 provisional 为 `review` 的样本，只要该簇有一条合法权威票，就直接采用其主标签、辅助标签、fit 和原始置信度，记录 `method=authoritative_model`、模型名、理由、思考模式和思考强度。权威主标签为空时状态为 `excluded`。同一个簇出现多条权威票会直接报错，避免悄悄选择某一条。
+
+#### 第四优先级：模型共识
 
 至少有两个投票，并且同一个 `primary_label` 至少获得两票时：
 
@@ -595,7 +602,7 @@ python scripts/annotate_tsr_taxonomy.py resolve \
 - confidence 取平均；
 - `method=model_consensus`。
 
-#### 第四优先级：一个模型与规则一致
+#### 第五优先级：一个模型与规则一致
 
 只有一个模型票时，模型主标签等于规则主标签或规则 `closest_label`，且模型置信度至少为 0.85，才接收为 `rule_model_agreement`。
 
@@ -609,6 +616,7 @@ K 节点只有两个出口。
 
 - 人工已标；
 - 规则已自动接收；
+- DeepSeek 已提供合法权威票；
 - 两个模型对主标签达成共识；
 - 单模型与规则满足一致条件。
 
@@ -701,8 +709,8 @@ reviewer = annotator_01
 python scripts/annotate_tsr_taxonomy.py resolve \
   --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
   --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --votes artifacts/tsr-taxonomy/vote-model-a.jsonl \
-          artifacts/tsr-taxonomy/vote-model-b.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --authoritative-votes artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
   --human artifacts/tsr-taxonomy/human-labels-adjudicated.csv \
   --output artifacts/tsr-taxonomy/final_labels.v2.jsonl
 ```
@@ -1361,33 +1369,44 @@ CREATE TABLE clusters (
 
 `annotate-online` 支持任何实现 OpenAI-compatible `/chat/completions` 的服务，例如 vLLM、SGLang、llama.cpp server 或兼容云 API。
 
-### 12.1 建议使用两个独立标注器
+### 12.1 建议使用 Qwen 初筛与 DeepSeek 权威裁决
 
-两个模型必须：
+两阶段必须：
 
-- 独立运行；
-- 各自写入不同投票文件；
-- 第二个模型不能看到第一个模型的答案；
-- 每个模型对每个 `cluster_id` 只产生一个投票。
+- Qwen 对全部 `review_clusters` 运行；
+- 用一次 Qwen-only `resolve` 生成不确定簇；
+- DeepSeek 只对不确定簇运行；
+- 普通票和权威票写入不同文件；
+- 每个权威 `cluster_id` 只能有一条 DeepSeek 记录。
 
 示例：
 
 ```bash
 python scripts/annotate_tsr_taxonomy.py annotate-online \
   --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-model-a.jsonl \
+  --output artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
   --base-url http://127.0.0.1:8000/v1 \
-  --model MODEL_A \
+  --model QWEN_MODEL \
   --allow-no-key \
   --workers 8
 
+python scripts/annotate_tsr_taxonomy.py resolve \
+  --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
+  --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --output artifacts/tsr-taxonomy/final_labels.qwen.jsonl
+
 python scripts/annotate_tsr_taxonomy.py annotate-online \
-  --input artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --output artifacts/tsr-taxonomy/vote-model-b.jsonl \
-  --base-url http://127.0.0.1:8001/v1 \
-  --model MODEL_B \
+  --input artifacts/tsr-taxonomy/final_labels.qwen.human_review.jsonl \
+  --output artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
+  --base-url http://localhost:30000/v1 \
+  --model /models \
   --allow-no-key \
-  --workers 8
+  --workers 8 \
+  --max-tokens 2048 \
+  --json-mode \
+  --thinking-mode enabled \
+  --reasoning-effort max
 ```
 
 本地服务可使用 `--allow-no-key`。云 API 应通过 `--api-key-env` 指定环境变量，不能把密钥写进命令历史或代码。
@@ -1463,7 +1482,7 @@ python scripts/annotate_tsr_taxonomy.py annotate-online \
 解析优先级从高到低为：
 
 ```text
-人工标签 > 规则 auto_accept > 模型共识 > 单模型与规则一致 > human_review
+人工标签 > 规则 auto_accept > DeepSeek 权威票 > 模型共识 > 单模型与规则一致 > human_review
 ```
 
 执行示例：
@@ -1472,8 +1491,8 @@ python scripts/annotate_tsr_taxonomy.py annotate-online \
 python scripts/annotate_tsr_taxonomy.py resolve \
   --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
   --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --votes artifacts/tsr-taxonomy/vote-model-a.jsonl \
-          artifacts/tsr-taxonomy/vote-model-b.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --authoritative-votes artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
   --output artifacts/tsr-taxonomy/final_labels.jsonl
 ```
 
@@ -1495,7 +1514,23 @@ status = accepted
 method = rules
 ```
 
-### 13.3 两个及以上模型达成共识
+### 13.3 DeepSeek 权威票
+
+对 `review` 样本，如果 `cluster_id` 存在一条 `--authoritative-votes` 记录，则直接使用：
+
+```text
+method = authoritative_model
+primary_label = DeepSeek 主标签
+taxonomy_fit = DeepSeek 适配度
+secondary_labels = DeepSeek 辅助标签
+confidence = DeepSeek 原始置信度
+model = 投票文件中的模型名
+inference = 思考模式、思考强度和 reasoning_content 是否存在
+```
+
+权威票不会覆盖规则 `auto_accept`，人工标签仍可覆盖权威票。权威主标签为空时状态是 `excluded`。低置信权威结果仍会保留在最终索引中，但可由 `materialize --min-confidence` 排除。
+
+### 13.4 两个及以上普通模型达成共识
 
 当至少有两个投票，并且同一个主标签获得至少两票时：
 
@@ -1511,7 +1546,7 @@ confidence = 同意该主标签的模型置信度平均值
 
 投票加载器假设每个投票文件对每个簇只有一条记录。不要把同一模型的重复输出当成两个独立投票。
 
-### 13.4 单模型与规则一致
+### 13.5 单模型与规则一致
 
 只有一个模型投票时，如果：
 
@@ -1522,7 +1557,7 @@ model.confidence >= 0.85
 
 则接收该投票，`method=rule_model_agreement`。
 
-### 13.5 未解决样本
+### 13.6 未解决样本
 
 不满足上述条件时：
 
@@ -1608,8 +1643,8 @@ human_rationale = 例如“任务是历史区间内部缺失值插补，不是�
 python scripts/annotate_tsr_taxonomy.py resolve \
   --provisional artifacts/tsr-taxonomy/provisional_labels.jsonl \
   --clusters artifacts/tsr-taxonomy/review_clusters.jsonl \
-  --votes artifacts/tsr-taxonomy/vote-model-a.jsonl \
-          artifacts/tsr-taxonomy/vote-model-b.jsonl \
+  --votes artifacts/tsr-taxonomy/votes-qwen36-all.jsonl \
+  --authoritative-votes artifacts/tsr-taxonomy/vote-deepseek-v4-flash-authoritative.jsonl \
   --human artifacts/tsr-taxonomy/human-labels.csv \
   --output artifacts/tsr-taxonomy/final_labels.v2.jsonl
 ```
@@ -1825,11 +1860,11 @@ python -m py_compile scripts/annotate_tsr_taxonomy.py
 
 ### 18.2 `annotate-online`
 
-模型投票支持断点续跑。成功记录追加到投票 JSONL，重新运行时按 `cluster_id` 跳过。
+模型投票支持断点续跑。成功记录追加到投票 JSONL，重新运行时按 `cluster_id` 跳过。DeepSeek 思考模式使用 `--thinking-mode enabled`，强度使用 `--reasoning-effort high|max`；投票记录不保存思考正文。
 
 ### 18.3 `resolve`
 
-解析是确定性的全量重建，输出使用原子替换。加入新模型票或人工 CSV 后，建议写入 `final_labels.v2.jsonl`、`v3.jsonl` 等新版本。
+解析是确定性的全量重建，输出使用原子替换。`--authoritative-votes` 对 review 样本高于普通票、低于人工和规则 auto-accept。加入新普通票、权威票或人工 CSV 后，建议写入 `final_labels.v2.jsonl`、`v3.jsonl` 等新版本。
 
 ### 18.4 `materialize`
 
