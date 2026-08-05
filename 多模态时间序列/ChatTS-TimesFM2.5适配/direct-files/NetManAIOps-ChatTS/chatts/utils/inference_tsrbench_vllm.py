@@ -138,6 +138,18 @@ def _format_choices(choices: Any) -> str:
     return ""
 
 
+def _format_choices_official(choices: Any) -> str:
+    """Match TSRBench's format_choices function byte-for-byte in behavior."""
+    labels = "ABCDEFG"
+    if isinstance(choices, dict):
+        return "\n".join(f"{key}. {value}" for key, value in sorted(choices.items()))
+    if isinstance(choices, list):
+        return "\n".join(
+            f"{labels[index]}. {value}" for index, value in enumerate(choices)
+        )
+    return str(choices)
+
+
 def _question_already_has_choices(question: str, choices: Any) -> bool:
     if not isinstance(choices, (list, dict)) or not choices:
         return False
@@ -184,7 +196,12 @@ def _standard_prompt(
     series: list[np.ndarray] = []
     names: list[str] = []
     for index, values in enumerate(raw_series):
-        name = str(raw_names[index]) if index < len(raw_names) else f"Time series {index + 1}"
+        default_name = (
+            f"Series {index + 1}"
+            if prompt_mode == "official"
+            else f"Time series {index + 1}"
+        )
+        name = str(raw_names[index]) if index < len(raw_names) else default_name
         if dataset_name == "temporal_relation_reasoning" and name.strip().lower() == "time stamps":
             continue
         series.append(_as_1d_series(values, label=name))
@@ -193,16 +210,19 @@ def _standard_prompt(
     if not series:
         raise ValueError("No numeric time series remained after preprocessing")
 
-    question = str(sample["question"]).strip()
+    question = str(sample["question"])
     if prompt_mode == "official":
         # Keep this deliberately equivalent to TSRBench's build_prompt_standard
         # / build_prompt_temporal implementation.
         question += " Here are the time series"
         for name in names:
             question += f" '{name}': <ts><ts/>. "
-        question += _official_answer_instruction(_format_choices(sample.get("choices")))
+        question += _official_answer_instruction(
+            _format_choices_official(sample.get("choices"))
+        )
         return question, series
 
+    question = question.strip()
     question = _append_choices(question, sample.get("choices"))
     placeholder_count = question.count("<ts><ts/>")
     if placeholder_count == 0:
@@ -281,7 +301,9 @@ def _abductive_prompt(
             " 'Team A Win Probability': <ts><ts/>. "
             " 'Team B Win Probability': <ts><ts/>. "
         )
-        question += _official_answer_instruction(_format_choices(mcq.get("choices")))
+        question += _official_answer_instruction(
+            _format_choices_official(mcq.get("choices"))
+        )
     else:
         question = (
             "Infer the most plausible missing basketball event between the observed past and future.\n\n"
