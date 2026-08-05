@@ -13,17 +13,42 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${TSRBENCH_ROOT}/evaluation/results/embed}"
 MODEL_PATH="${MODEL_PATH:-${PROJECT_ROOT}/ckpt}"
 MODEL_NAME="${MODEL_NAME:-$(basename "${MODEL_PATH%/}")}"
 DATASETS="${DATASETS:-all}"
+PROMPT_MODE="${PROMPT_MODE:-answer_only}"
 
 NUM_GPUS="${NUM_GPUS:-8}"
 NUM_GPUS_PER_PROCESS="${NUM_GPUS_PER_PROCESS:-2}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
 REQUEST_CHUNK_SIZE="${REQUEST_CHUNK_SIZE:-128}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
-TEMPERATURE="${TEMPERATURE:-0.0}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 FORCE_INFERENCE="${FORCE_INFERENCE:-0}"
-ENABLE_THINKING="${ENABLE_THINKING:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+
+case "$PROMPT_MODE" in
+    official)
+        # Literal TSRBench ChatTS settings: XML chain-of-thought prompt,
+        # input cutoff 8000, 512 generated tokens, temperature argument 1.0,
+        # ten total attempts, and batch size 1.
+        BATCH_SIZE="${BATCH_SIZE:-1}"
+        MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+        TEMPERATURE="${TEMPERATURE:-1.0}"
+        MAX_RETRIES="${MAX_RETRIES:-10}"
+        MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-8000}"
+        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-8512}"
+        ENABLE_THINKING="${ENABLE_THINKING:-0}"
+        ;;
+    answer_only)
+        BATCH_SIZE="${BATCH_SIZE:-16}"
+        MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
+        TEMPERATURE="${TEMPERATURE:-0.0}"
+        MAX_RETRIES="${MAX_RETRIES:-0}"
+        MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-0}"
+        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-5000}"
+        ENABLE_THINKING="${ENABLE_THINKING:-0}"
+        ;;
+    *)
+        echo "PROMPT_MODE must be answer_only or official, got: $PROMPT_MODE" >&2
+        exit 1
+        ;;
+esac
 
 # Optional encoder override. Leave empty when config/weights are unambiguous.
 TS_ENCODER_TYPE="${TS_ENCODER_TYPE:-${CHATTS_TS_ENCODER_TYPE:-}}"
@@ -76,6 +101,7 @@ fi
 export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export VLLM_ALLOW_INSECURE_SERIALIZATION="${VLLM_ALLOW_INSECURE_SERIALIZATION:-1}"
+export CHATTS_VLLM_MAX_MODEL_LEN
 
 if [[ -n "$TS_ENCODER_TYPE" ]]; then
     export CHATTS_TS_ENCODER_TYPE="$TS_ENCODER_TYPE"
@@ -102,8 +128,11 @@ INFER_ARGS=(
     --gpus-per-model "$NUM_GPUS_PER_PROCESS"
     --batch-size "$BATCH_SIZE"
     --request-chunk-size "$REQUEST_CHUNK_SIZE"
+    --prompt-mode "$PROMPT_MODE"
     --max-new-tokens "$MAX_NEW_TOKENS"
     --temperature "$TEMPERATURE"
+    --max-retries "$MAX_RETRIES"
+    --max-input-tokens "$MAX_INPUT_TOKENS"
     --max-samples "$MAX_SAMPLES"
 )
 if [[ "$FORCE_INFERENCE" == "1" ]]; then
@@ -122,7 +151,15 @@ echo " GPUs:         $NUM_GPUS (${NUM_GPUS_PER_PROCESS} per worker)"
 echo " vLLM engines: $((NUM_GPUS / NUM_GPUS_PER_PROCESS))"
 echo " Output:       $OUTPUT_ROOT"
 echo " Encoder:      ${TS_ENCODER_TYPE:-auto}"
-echo " Thinking:     $([[ "$ENABLE_THINKING" == "1" ]] && echo enabled || echo disabled)"
+echo " Prompt mode:  $PROMPT_MODE"
+echo " Max model len:$CHATTS_VLLM_MAX_MODEL_LEN"
+echo " Max new tokens: $MAX_NEW_TOKENS"
+echo " Temperature:  $TEMPERATURE"
+if [[ "$PROMPT_MODE" == "official" ]]; then
+    echo " Thinking:     enabled by TSRBench <think>/<answer> prompt"
+else
+    echo " Thinking:     $([[ "$ENABLE_THINKING" == "1" ]] && echo enabled || echo disabled)"
+fi
 echo "============================================================"
 
 cd "$PROJECT_ROOT"

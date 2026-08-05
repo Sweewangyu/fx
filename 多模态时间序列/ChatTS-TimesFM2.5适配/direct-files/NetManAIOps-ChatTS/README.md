@@ -210,9 +210,11 @@ categorical/numerical 分数、两个数据集的分项平均、四项指标的
 
 ## TSRBench：复用 ChatTS vLLM 推理后端
 
-本目录额外提供三个新的可直接复制到服务器的文件，并复用此前已经提供的 checkpoint
+本目录额外提供四个新的可直接复制到服务器的文件，并复用此前已经提供的 checkpoint
 检查器：
 
+- `chatts/utils/llm_utils.py`：修复 `worker_vllm_ts` 忽略调用方
+  `SamplingParams` 的问题，并支持 `CHATTS_VLLM_MAX_MODEL_LEN`；
 - `chatts/utils/inference_tsrbench_vllm.py`：读取 TSRBench JSONL，复用现有
   `LLMClient(engine="vllm-ts")`，模型只加载一次即可依次跑完全部任务；
 - `scripts/run_chatts_tsrbench.sh`：一键推理与评测；
@@ -221,7 +223,9 @@ categorical/numerical 分数、两个数据集的分项平均、四项指标的
   `ts_encoder_type`，启动前直接根据 checkpoint 权重识别 MLP、TimesFM 2.5、
   Chronos-2 或 Zeus。
 
-将三个文件按相同相对路径复制到 ChatTS 项目后运行：
+将四个文件按相同相对路径复制到 ChatTS 项目后运行。必须同时覆盖
+`chatts/utils/llm_utils.py`，否则 vLLM-TS worker 仍会使用旧版硬编码的
+`temperature=0.5, max_tokens=5000`：
 
 ```bash
 PROJECT_ROOT=/workspace/ChatTS/ChatTS-main \
@@ -262,22 +266,24 @@ DATASETS="perception numerical_reasoning" MAX_SAMPLES=20 \
 bash scripts/run_chatts_tsrbench.sh
 ```
 
-TSRBench 适配默认对 Qwen3 显式设置 `enable_thinking=False`，但保留
-首版适配的 JSON 任务格式：在原问题后要求返回
-`{"reasoning":"a concise justification","answer":"A"}`。这是用于分离
-“Qwen3 thinking 开关”和“任务 prompt”影响的单变量对照；它不使用
-TSRBench 官方的 `<think>/<answer>` XML 模式。如需重新开启 Qwen3
-thinking，可显式设置 `ENABLE_THINKING=1`。
-
-更换新脚本后，已存在的 `generated_answer.json` 会被当作断点继续结果而
-跳过；要用“非 thinking + 原 JSON prompt”重新跑原来的样本，
-必须使用：
+默认 `PROMPT_MODE=answer_only`：Qwen3 `enable_thinking=False`，只要求输出一个
+选项字母；`max_model_len=5000`、`max_new_tokens=32`、`temperature=0.0`，不做
+格式重试。若要复现 TSRBench 官方 ChatTS prompt 和显式参数，使用：
 
 ```bash
-FORCE_INFERENCE=1 ENABLE_THINKING=0 \
+PROMPT_MODE=official FORCE_INFERENCE=1 \
 DATASETS="perception numerical_reasoning" MAX_SAMPLES=20 \
 bash scripts/run_chatts_tsrbench.sh
 ```
+
+`official` 模式使用官方 `<think>...</think><answer>A</answer>` 指令、手写 ChatML
+包装、`max_new_tokens=512`、输入上限 `8000`、`temperature=1.0`、最多十次生成，
+以及官方的 `batch_size=1`；vLLM 的 `max_model_len` 相应设为 `8512`。这里的
+thinking 是 TSRBench 用户 prompt 明确要求的推理，不是额外开启 Qwen3 chat
+template 的 thinking 开关。
+
+结果记录包含 `prompt_mode`，脚本不会把不同模式的断点结果混在一起；切换模式时仍
+建议设置 `FORCE_INFERENCE=1`，便于得到一份干净的完整结果。
 
 如果日志中出现下列组合：
 

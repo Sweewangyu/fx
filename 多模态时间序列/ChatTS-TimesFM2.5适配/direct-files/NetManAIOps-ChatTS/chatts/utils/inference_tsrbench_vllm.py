@@ -47,12 +47,22 @@ TASK_ALIASES = {
     "pattern_decision": "qualitative_decision",
 }
 
-ANSWER_INSTRUCTION = """
+PROMPT_MODES = ("answer_only", "official")
 
-Return exactly one JSON object and no Markdown. It must contain:
-{"reasoning":"a concise justification","answer":"A"}
-The answer must be one uppercase option letter.
-""".rstrip()
+ANSWER_ONLY_INSTRUCTION = (
+    "\n\nReturn exactly one uppercase option letter (A-G) and no other text."
+)
+
+
+def _official_answer_instruction(choice_text: str) -> str:
+    """The answer instruction used by TSRBench's official ChatTS runner."""
+    return (
+        " Select from the options below:\n" + choice_text
+        + "\nOutput your reasoning process in <think> tags and final answer "
+        "as a single letter in <answer> tags. Format:\n"
+        "<think>Your reasoning here (less than 2048 tokens)</think>\n"
+        "<answer>A</answer>"
+    )
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -158,7 +168,7 @@ def _append_choices(question: str, choices: Any) -> str:
 
 
 def _standard_prompt(
-    sample: dict[str, Any], dataset_name: str
+    sample: dict[str, Any], dataset_name: str, prompt_mode: str
 ) -> tuple[str, list[np.ndarray]]:
     if "question" not in sample or "timeseries" not in sample:
         raise KeyError("A standard TSRBench sample requires question and timeseries")
@@ -184,6 +194,15 @@ def _standard_prompt(
         raise ValueError("No numeric time series remained after preprocessing")
 
     question = str(sample["question"]).strip()
+    if prompt_mode == "official":
+        # Keep this deliberately equivalent to TSRBench's build_prompt_standard
+        # / build_prompt_temporal implementation.
+        question += " Here are the time series"
+        for name in names:
+            question += f" '{name}': <ts><ts/>. "
+        question += _official_answer_instruction(_format_choices(sample.get("choices")))
+        return question, series
+
     question = _append_choices(question, sample.get("choices"))
     placeholder_count = question.count("<ts><ts/>")
     if placeholder_count == 0:
@@ -194,10 +213,12 @@ def _standard_prompt(
             f"Prompt has {placeholder_count} <ts><ts/> placeholders but sample has {len(series)} series"
         )
 
-    return question + ANSWER_INSTRUCTION, series
+    return question + ANSWER_ONLY_INSTRUCTION, series
 
 
-def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
+def _abductive_prompt(
+    sample: dict[str, Any], prompt_mode: str
+) -> tuple[str, list[np.ndarray]]:
     context = sample["context"]
     mcq = sample["multiple_choice_question"]
     numerical = sample["numerical_time_series"]
@@ -219,9 +240,15 @@ def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
 
     team_a = values_for("wp_Team A", 0)
     team_b = values_for("wp_Team B", 1)
+    all_times = history_times + future_times
+    min_length = min(len(all_times), len(team_a), len(team_b))
+    all_times = all_times[:min_length]
+    team_a = team_a[:min_length]
+    team_b = team_b[:min_length]
     critical = len(history_times)
     lower = max(0, critical - 10)
-    upper = min(len(team_a), len(team_b), critical + 10)
+    upper = min(min_length, critical + 10)
+    all_times = all_times[lower:upper]
     team_a = team_a[lower:upper]
     team_b = team_b[lower:upper]
 
@@ -234,34 +261,57 @@ def _abductive_prompt(sample: dict[str, Any]) -> tuple[str, list[np.ndarray]]:
         for time, event in zip(future_times[:10], future_events[:10])
     )
 
-    question = (
-        "Infer the most plausible missing basketball event between the observed past and future.\n\n"
-        f"Past events:\n{past}\n\n"
-        "[A CRITICAL EVENT IS MISSING HERE]\n\n"
-        f"Future events:\n{future}\n\n"
-        f"Question: {mcq['question']}"
-    )
-    question = _append_choices(question, mcq.get("choices"))
-    question += (
-        "\n\nNumeric time-series inputs around the missing event:\n"
-        "- Team A win probability: <ts><ts/>\n"
-        "- Team B win probability: <ts><ts/>"
-    )
-    return question + ANSWER_INSTRUCTION, [
+    if prompt_mode == "official":
+        time_series_table = "Time | Team A Win Prob | Team B Win Prob\n"
+        time_series_table += "-" * 60 + "\n"
+        for time_value, value_a, value_b in zip(all_times, team_a, team_b):
+            time_series_table += f"{time_value} | {value_a:.3f} | {value_b:.3f}\n"
+        question = (
+            "You are an expert in basketball game analysis. Your task is to perform abductive reasoning.\n"
+            "Given a sequence of past events, future events, and corresponding time series data from a game, "
+            "determine the most plausible event that occurred in between to link them.\n\n"
+            "--- CONTEXT ---\n"
+            f"Past Events (History):\n{past}\n"
+            "\n... [A CRITICAL EVENT HAPPENED HERE] ...\n\n"
+            f"Future Events:\n{future}\n\n"
+            f"Time Series Data (Win Probability):\n{time_series_table.strip()}\n\n"
+            "--- TASK ---\n"
+            f"{mcq['question']}"
+            " Here are the time series"
+            " 'Team A Win Probability': <ts><ts/>. "
+            " 'Team B Win Probability': <ts><ts/>. "
+        )
+        question += _official_answer_instruction(_format_choices(mcq.get("choices")))
+    else:
+        question = (
+            "Infer the most plausible missing basketball event between the observed past and future.\n\n"
+            f"Past events:\n{past}\n\n"
+            "[A CRITICAL EVENT IS MISSING HERE]\n\n"
+            f"Future events:\n{future}\n\n"
+            f"Question: {mcq['question']}"
+        )
+        question = _append_choices(question, mcq.get("choices"))
+        question += (
+            "\n\nNumeric time-series inputs around the missing event:\n"
+            "- Team A win probability: <ts><ts/>\n"
+            "- Team B win probability: <ts><ts/>"
+            + ANSWER_ONLY_INSTRUCTION
+        )
+    return question, [
         _as_1d_series(team_a, label="Team A win probability"),
         _as_1d_series(team_b, label="Team B win probability"),
     ]
 
 
 def prepare_sample(
-    sample: dict[str, Any], dataset_name: str
+    sample: dict[str, Any], dataset_name: str, prompt_mode: str = "answer_only"
 ) -> tuple[str, list[np.ndarray]]:
     if dataset_name == "abductive_reasoning" or (
         "multiple_choice_question" in sample and "numerical_time_series" in sample
     ):
-        prompt, series = _abductive_prompt(sample)
+        prompt, series = _abductive_prompt(sample, prompt_mode)
     else:
-        prompt, series = _standard_prompt(sample, dataset_name)
+        prompt, series = _standard_prompt(sample, dataset_name, prompt_mode)
 
     if prompt.count("<ts><ts/>") != len(series):
         raise ValueError("Internal error: placeholder count does not match time-series count")
@@ -288,6 +338,7 @@ def extract_answer(response: str | None) -> str | None:
         r"<answer>\s*([A-G])\s*</answer>",
         r"[\"']?answer[\"']?\s*[:=]\s*[\"']?([A-G])",
         r"(?:^|\n)\s*(?:final\s+answer\s*[:：]?\s*)?([A-G])[.)]",
+        r"^\s*([A-G])\s*$",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -296,34 +347,30 @@ def extract_answer(response: str | None) -> str | None:
     return None
 
 
-def canonicalize_response(response: str | None) -> tuple[str, str | None]:
-    """Return an evaluator-friendly JSON response and its parsed answer."""
+def canonicalize_response(
+    response: str | None, prompt_mode: str
+) -> tuple[str, str | None, str | None]:
+    """Return saved response, parsed answer, and optional reasoning path."""
     raw = response or ""
     answer = extract_answer(raw)
     if answer is None:
-        return raw, None
+        return raw, None, None
 
-    reasoning = raw.strip()
-    cleaned = re.sub(
-        r"^```(?:json|python)?\s*|\s*```$", "", reasoning, flags=re.IGNORECASE
-    )
-    for loader in (json.loads, ast.literal_eval):
-        try:
-            value = loader(cleaned)
-        except Exception:
-            continue
-        if isinstance(value, dict):
-            reasoning = str(value.get("reasoning", reasoning)).strip()
-            break
-    else:
-        think_match = re.search(r"<think>(.*?)</think>", reasoning, re.DOTALL)
-        if think_match:
-            reasoning = think_match.group(1).strip()
+    think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
+    reasoning_path = think_match.group(1).strip() if think_match else None
+    if prompt_mode == "official":
+        return raw, answer, reasoning_path
 
-    canonical = json.dumps(
-        {"reasoning": reasoning, "answer": answer}, ensure_ascii=False
-    )
-    return canonical, answer
+    canonical = json.dumps({"answer": answer}, ensure_ascii=False)
+    return canonical, answer, None
+
+
+def _is_valid_official_response(response: str | None) -> bool:
+    if not response:
+        return False
+    think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
+    answer_match = re.search(r"<answer>\s*([A-G])\s*</answer>", response, re.DOTALL)
+    return bool(think_match and think_match.group(1).strip() and answer_match)
 
 
 def apply_chat_template(
@@ -332,8 +379,18 @@ def apply_chat_template(
     *,
     system_prompt: str,
     enable_thinking: bool,
+    prompt_mode: str,
 ) -> str:
-    """Apply the checkpoint template with an explicit Qwen3 thinking switch."""
+    """Build the exact official ChatTS chat wrapper or the checkpoint template."""
+    if prompt_mode == "official":
+        # TSRBench's official ChatTS script builds this string manually.  Its
+        # thinking request lives in the user prompt, not in Qwen3's template.
+        return (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>"
+            f"<|im_start|>user\n{prompt}<|im_end|>"
+            f"<|im_start|>assistant\n"
+        )
+
     conversation = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
@@ -351,7 +408,7 @@ def _safe_model_name(model_path: str, requested_name: str | None) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "chatts"
 
 
-def _load_existing(path: Path) -> dict[int, dict[str, Any]]:
+def _load_existing(path: Path, prompt_mode: str) -> dict[int, dict[str, Any]]:
     if not path.is_file():
         return {}
     with path.open("r", encoding="utf-8") as stream:
@@ -359,7 +416,10 @@ def _load_existing(path: Path) -> dict[int, dict[str, Any]]:
     return {
         int(item["idx"]): item
         for item in rows
-        if isinstance(item, dict) and "idx" in item and item.get("response")
+        if isinstance(item, dict)
+        and "idx" in item
+        and item.get("response")
+        and item.get("prompt_mode") == prompt_mode
     }
 
 
@@ -382,10 +442,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpus-per-model", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--request-chunk-size", type=int, default=128)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-retries", type=int, default=0)
+    parser.add_argument("--max-input-tokens", type=int, default=0)
     parser.add_argument("--max-mm-per-prompt", type=int, default=50)
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=PROMPT_MODES,
+        default="answer_only",
+        help="answer_only disables reasoning; official reproduces TSRBench's ChatTS XML prompt.",
+    )
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
@@ -393,6 +461,49 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
+
+
+def generate_with_retries(
+    client: Any,
+    prompts: list[str],
+    series_batch: list[list[np.ndarray]],
+    sampling_params: Any,
+    *,
+    prompt_mode: str,
+    max_retries: int,
+) -> list[str | None]:
+    responses: list[str | None] = [None] * len(prompts)
+    remaining = list(range(len(prompts)))
+    total_attempts = max(1, max_retries)
+
+    for attempt in range(total_attempts):
+        generated = client.llm_batch_generate(
+            [prompts[index] for index in remaining],
+            [series_batch[index] for index in remaining],
+            use_chat_template=False,
+            sampling_params=sampling_params,
+        )
+        for index, response in zip(remaining, generated):
+            responses[index] = response
+
+        if prompt_mode == "official":
+            remaining = [
+                index for index in remaining
+                if not _is_valid_official_response(responses[index])
+            ]
+        else:
+            remaining = [
+                index for index in remaining
+                if extract_answer(responses[index]) is None
+            ]
+        if not remaining:
+            break
+        print(
+            f"[TSRBench] invalid output for {len(remaining)} sample(s); "
+            f"attempt {attempt + 1}/{total_attempts}"
+        )
+
+    return responses
 
 
 def main() -> None:
@@ -403,6 +514,8 @@ def main() -> None:
         raise ValueError("--num-gpus must be divisible by --gpus-per-model")
     if args.request_chunk_size < 1:
         raise ValueError("--request-chunk-size must be positive")
+    if args.max_retries < 0 or args.max_input_tokens < 0:
+        raise ValueError("token limits and retry count cannot be negative")
 
     datasets = discover_dataset_files(Path(args.dataset_root), args.datasets)
     model_name = _safe_model_name(args.model_path, args.model_name)
@@ -434,7 +547,9 @@ def main() -> None:
 
             result_dir = output_root / f"{dataset_name}_{model_name}"
             result_path = result_dir / "generated_answer.json"
-            completed = {} if args.force else _load_existing(result_path)
+            completed = (
+                {} if args.force else _load_existing(result_path, args.prompt_mode)
+            )
             pending = [index for index in range(len(rows)) if index not in completed]
             print(
                 f"[TSRBench] {dataset_name}: total={len(rows)}, "
@@ -449,7 +564,9 @@ def main() -> None:
 
                 for index in indices:
                     try:
-                        prompt, series = prepare_sample(rows[index], dataset_name)
+                        prompt, series = prepare_sample(
+                            rows[index], dataset_name, args.prompt_mode
+                        )
                         if len(series) > args.max_mm_per_prompt:
                             raise ValueError(
                                 f"sample has {len(series)} time series; limit is {args.max_mm_per_prompt}"
@@ -469,24 +586,59 @@ def main() -> None:
                         prompt,
                         system_prompt=client.system_prompt,
                         enable_thinking=args.enable_thinking,
+                        prompt_mode=args.prompt_mode,
                     )
                     for prompt in prompts
                 ]
-                responses = client.llm_batch_generate(
+                if args.max_input_tokens > 0:
+                    kept = []
+                    for position, templated_prompt in enumerate(templated_prompts):
+                        input_tokens = len(
+                            client.tokenizer(
+                                templated_prompt, add_special_tokens=False
+                            )["input_ids"]
+                        )
+                        if input_tokens > args.max_input_tokens:
+                            print(
+                                f"[TSRBench] {dataset_name}[{valid_indices[position]}] "
+                                f"skipped: input tokens {input_tokens} > {args.max_input_tokens}"
+                            )
+                        else:
+                            kept.append(position)
+                    prompts = [prompts[position] for position in kept]
+                    templated_prompts = [templated_prompts[position] for position in kept]
+                    series_batch = [series_batch[position] for position in kept]
+                    valid_indices = [valid_indices[position] for position in kept]
+                    if not prompts:
+                        continue
+
+                responses = generate_with_retries(
+                    client,
                     templated_prompts,
                     series_batch,
-                    use_chat_template=False,
-                    sampling_params=sampling_params,
+                    sampling_params,
+                    prompt_mode=args.prompt_mode,
+                    max_retries=args.max_retries,
                 )
-                for index, prompt, response in zip(valid_indices, prompts, responses):
-                    canonical_response, parsed_answer = canonicalize_response(response)
-                    completed[index] = {
+                for index, prompt, templated_prompt, response in zip(
+                    valid_indices, prompts, templated_prompts, responses
+                ):
+                    canonical_response, parsed_answer, reasoning_path = canonicalize_response(
+                        response, args.prompt_mode
+                    )
+                    result = {
                         "idx": index,
-                        "question_text": prompt,
+                        "question_text": (
+                            templated_prompt if args.prompt_mode == "official" else prompt
+                        ),
                         "response": canonical_response,
                         "raw_response": response or "",
                         "answer": parsed_answer,
+                        "prompt_mode": args.prompt_mode,
                     }
+                    if reasoning_path:
+                        result["reasoning_path"] = reasoning_path
+                    completed[index] = result
 
                 ordered = [completed[index] for index in sorted(completed)]
                 _atomic_dump(ordered, result_path)
