@@ -124,6 +124,20 @@ python scripts/annotate_tsr_taxonomy.py materialize \
   --include-fit exact compatible
 ```
 
+### 分数据集查看 15 类分布
+
+将五个 ChatTS 子集合并为 ChatTS，并与 Time-MQA、TSAQA 分列统计。默认只统计 `train`，15 类占比以各数据集已经接受且具有合法主标签的样本为分母：
+
+```bash
+python scripts/annotate_tsr_taxonomy.py report-distribution \
+  --labels artifacts/tsr-taxonomy/final_labels.jsonl \
+  --splits train \
+  --output-json artifacts/tsr-taxonomy/distribution-by-dataset.json \
+  --output-csv artifacts/tsr-taxonomy/distribution-by-dataset.csv
+```
+
+终端会打印 ChatTS、Time-MQA、TSAQA 的 15 类数量和组内占比，并单独显示每个数据集的 `accepted`、`excluded`、`human_review`，避免把未解决样本混入能力分布。
+
 ## 当前状态
 
 - 原始总行数：550,104；

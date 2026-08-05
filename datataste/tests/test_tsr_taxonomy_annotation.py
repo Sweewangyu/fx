@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from scripts.annotate_tsr_taxonomy import (
     SourceSpec,
+    build_distribution_report,
     _load_human,
     _parse_model_json,
     iter_source,
@@ -149,6 +150,46 @@ class RuleBoundaryTests(unittest.TestCase):
             self.assertEqual((output / "PR_pattern_recognition.jsonl").read_text().count("\n"), 1)
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["counts"]["EXCLUDED_SPLIT"], 1)
+
+    def test_distribution_report_groups_chatts_and_excludes_dev_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            labels = Path(directory) / "labels.jsonl"
+            rows = [
+                ("chatts_sft", "train", "PR", "accepted"),
+                ("chatts_ift", "train", "TSF", "accepted"),
+                ("chatts_dev", "dev", "AD", "accepted"),
+                ("time_mqa", "train", "AD", "accepted"),
+                ("time_mqa", "train", None, "human_review"),
+                ("tsaqa", "train", "CA", "accepted"),
+            ]
+            labels.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "sample_id": str(index),
+                            "source": source,
+                            "split": split,
+                            "source_index": index,
+                            "cluster_id": str(index),
+                            "final": {
+                                "primary_label": label,
+                                "status": status,
+                            },
+                        }
+                    )
+                    for index, (source, split, label, status) in enumerate(rows)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = build_distribution_report(labels, ["train"])
+            self.assertEqual(report["datasets"]["chatts"]["total"], 2)
+            self.assertEqual(report["datasets"]["chatts"]["dimensions"]["PR"], 1)
+            self.assertEqual(report["datasets"]["chatts"]["dimensions"]["TSF"], 1)
+            self.assertEqual(report["datasets"]["chatts"]["dimensions"]["AD"], 0)
+            self.assertEqual(report["datasets"]["time_mqa"]["statuses"]["human_review"], 1)
+            self.assertEqual(report["datasets"]["tsaqa"]["dimensions"]["CA"], 1)
+            self.assertEqual(report["datasets"]["chatts"]["percent_of_accepted"]["PR"], 50.0)
 
 
 if __name__ == "__main__":

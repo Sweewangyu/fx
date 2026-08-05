@@ -29,6 +29,12 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optio
 
 TAXONOMY_VERSION = "tsrbench-4x15-v1"
 PLACEHOLDER = "<ts><ts/>"
+DATASET_GROUP_ORDER = ("chatts", "time_mqa", "tsaqa")
+DATASET_GROUP_TITLES = {
+    "chatts": "ChatTS",
+    "time_mqa": "Time-MQA",
+    "tsaqa": "TSAQA",
+}
 
 TAXONOMY: Dict[str, Dict[str, str]] = {
     "PR": {
@@ -1107,6 +1113,138 @@ def materialize_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dataset_group(source: str) -> str:
+    if source.startswith("chatts_"):
+        return "chatts"
+    return source
+
+
+def build_distribution_report(labels_path: Path, allowed_splits: Sequence[str]) -> Dict[str, Any]:
+    allowed = set(allowed_splits)
+    raw: Dict[str, Dict[str, Any]] = {}
+
+    def bucket(group: str) -> Dict[str, Any]:
+        if group not in raw:
+            raw[group] = {
+                "total": 0,
+                "sources": Counter(),
+                "statuses": Counter(),
+                "dimensions": Counter(),
+            }
+        return raw[group]
+
+    with labels_path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if str(item.get("split", "train")) not in allowed:
+                continue
+            source = str(item.get("source", "unknown"))
+            current = bucket(_dataset_group(source))
+            current["total"] += 1
+            current["sources"][source] += 1
+            final = item.get("final", {})
+            status = str(final.get("status", "unknown"))
+            current["statuses"][status] += 1
+            primary = final.get("primary_label")
+            if status == "accepted" and primary in TAXONOMY:
+                current["dimensions"][primary] += 1
+
+    group_order = list(DATASET_GROUP_ORDER) + sorted(set(raw) - set(DATASET_GROUP_ORDER))
+    datasets: Dict[str, Any] = {}
+    for group in group_order:
+        current = raw.get(
+            group,
+            {"total": 0, "sources": Counter(), "statuses": Counter(), "dimensions": Counter()},
+        )
+        accepted = sum(int(current["dimensions"].get(label, 0)) for label in TAXONOMY)
+        dimensions = {label: int(current["dimensions"].get(label, 0)) for label in TAXONOMY}
+        percentages = {
+            label: round(100.0 * count / accepted, 4) if accepted else 0.0
+            for label, count in dimensions.items()
+        }
+        datasets[group] = {
+            "title": DATASET_GROUP_TITLES.get(group, group),
+            "total": int(current["total"]),
+            "accepted_with_dimension": accepted,
+            "sources": dict(sorted(current["sources"].items())),
+            "statuses": dict(sorted(current["statuses"].items())),
+            "dimensions": dimensions,
+            "percent_of_accepted": percentages,
+        }
+    return {
+        "taxonomy_version": TAXONOMY_VERSION,
+        "splits": list(allowed_splits),
+        "percentage_denominator": "accepted samples with a valid primary TSRBench dimension",
+        "datasets": datasets,
+    }
+
+
+def report_distribution_command(args: argparse.Namespace) -> int:
+    report = build_distribution_report(Path(args.labels), args.splits)
+    datasets = report["datasets"]
+    groups = list(datasets)
+
+    header = ["能力维度"]
+    divider = ["---"]
+    for group in groups:
+        title = datasets[group]["title"]
+        header.extend([f"{title} 数量", f"{title} 占比"])
+        divider.extend(["---:", "---:"])
+    print("| " + " | ".join(header) + " |")
+    print("| " + " | ".join(divider) + " |")
+    for label, metadata in TAXONOMY.items():
+        row = [f"{label} / {metadata['name']}"]
+        for group in groups:
+            count = datasets[group]["dimensions"][label]
+            percentage = datasets[group]["percent_of_accepted"][label]
+            row.extend([f"{count:,}", f"{percentage:.2f}%"])
+        print("| " + " | ".join(row) + " |")
+
+    print("\n状态汇总（未接受样本不进入上面的15类分母）：")
+    print("| 数据集 | 总样本 | accepted | excluded | human_review |")
+    print("| --- | ---: | ---: | ---: | ---: |")
+    for group in groups:
+        item = datasets[group]
+        statuses = item["statuses"]
+        print(
+            f"| {item['title']} | {item['total']:,} | "
+            f"{statuses.get('accepted', 0):,} | {statuses.get('excluded', 0):,} | "
+            f"{statuses.get('human_review', 0):,} |"
+        )
+
+    if args.output_json:
+        output_json = Path(args.output_json)
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        output_json.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"\nJSON: {output_json.resolve()}")
+
+    if args.output_csv:
+        output_csv = Path(args.output_csv)
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        with output_csv.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=["dataset", "label", "major", "name", "count", "percent_of_accepted"],
+            )
+            writer.writeheader()
+            for group in groups:
+                for label, metadata in TAXONOMY.items():
+                    writer.writerow(
+                        {
+                            "dataset": datasets[group]["title"],
+                            "label": label,
+                            "major": metadata["major"],
+                            "name": metadata["name"],
+                            "count": datasets[group]["dimensions"][label],
+                            "percent_of_accepted": datasets[group]["percent_of_accepted"][label],
+                        }
+                    )
+        print(f"CSV:  {output_csv.resolve()}")
+    return 0
+
+
 def taxonomy_command(args: argparse.Namespace) -> int:
     print(json.dumps({"version": TAXONOMY_VERSION, "taxonomy": TAXONOMY}, ensure_ascii=False, indent=2))
     return 0
@@ -1174,6 +1312,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-fit", nargs="+", choices=sorted(VALID_FITS), default=["exact", "compatible"]
     )
     materialize.set_defaults(func=materialize_command)
+
+    report = subparsers.add_parser(
+        "report-distribution", help="report the 15-dimension distribution separately for ChatTS, Time-MQA, and TSAQA"
+    )
+    report.add_argument("--labels", required=True)
+    report.add_argument("--splits", nargs="+", default=["train"])
+    report.add_argument("--output-json", default=None)
+    report.add_argument("--output-csv", default=None)
+    report.set_defaults(func=report_distribution_command)
     return parser
 
 
