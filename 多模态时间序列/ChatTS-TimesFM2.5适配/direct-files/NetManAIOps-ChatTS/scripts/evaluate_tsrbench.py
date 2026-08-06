@@ -74,6 +74,7 @@ def extract_answer(value: Any) -> str | None:
         r"<answer>\s*([A-G])\s*</answer>",
         r"[\"']?answer[\"']?\s*[:=]\s*[\"']?([A-G])",
         r"(?:^|\n)\s*(?:final\s+answer\s*[:：]?\s*)?([A-G])[.)]",
+        r"^\s*([A-G])\s*(?:\r?\n|$)",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)

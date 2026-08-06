@@ -399,7 +399,7 @@ def extract_answer(response: str | None) -> str | None:
         r"<answer>\s*([A-G])\s*</answer>",
         r"[\"']?answer[\"']?\s*[:=]\s*[\"']?([A-G])",
         r"(?:^|\n)\s*(?:final\s+answer\s*[:：]?\s*)?([A-G])[.)]",
-        r"^\s*([A-G])\s*$",
+        r"^\s*([A-G])\s*(?:\r?\n|$)",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -503,7 +503,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpus-per-model", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--request-chunk-size", type=int, default=128)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-retries", type=int, default=0)
     parser.add_argument("--max-input-tokens", type=int, default=0)
@@ -602,11 +602,17 @@ def main() -> None:
     ts_patch_size = _chatts_vllm.get_time_series_patch_size(model_config)
     print(f"[TSRBench] time-series encoder patch_size={ts_patch_size}")
 
+    stop_strings = ["<|im_end|>", "<|endoftext|>"]
+    if args.prompt_mode == "answer_only":
+        # The task asks for one option letter.  Stop before an unwanted
+        # explanation instead of generating and truncating it.
+        stop_strings.insert(0, "\n")
+
     sampling_params = SamplingParams(
         max_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=1.0,
-        stop=["<|im_end|>", "<|endoftext|>"],
+        stop=stop_strings,
     )
     client = LLMClient(
         model_path=os.path.abspath(args.model_path),

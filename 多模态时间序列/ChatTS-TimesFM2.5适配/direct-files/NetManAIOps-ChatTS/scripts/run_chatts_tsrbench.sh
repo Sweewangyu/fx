@@ -37,7 +37,7 @@ case "$PROMPT_MODE" in
         ;;
     answer_only)
         BATCH_SIZE="${BATCH_SIZE:-16}"
-        MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
+        MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8}"
         TEMPERATURE="${TEMPERATURE:-0.0}"
         MAX_RETRIES="${MAX_RETRIES:-0}"
         MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-0}"

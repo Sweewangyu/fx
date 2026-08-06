@@ -267,8 +267,9 @@ bash scripts/run_chatts_tsrbench.sh
 ```
 
 默认 `PROMPT_MODE=answer_only`：Qwen3 `enable_thinking=False`，只要求输出一个
-选项字母；`max_model_len=12288`、`max_new_tokens=32`、`temperature=0.0`，不做
-格式重试。若要复现 TSRBench 官方 ChatTS prompt 和显式参数，使用：
+选项字母；`max_model_len=12288`、`max_new_tokens=8`、`temperature=0.0`，并在
+首个换行处停止，避免模型继续生成并截断解释；默认不做格式重试。若要复现
+TSRBench 官方 ChatTS prompt 和显式参数，使用：
 
 ```bash
 PROMPT_MODE=official FORCE_INFERENCE=1 \
@@ -282,6 +283,10 @@ bash scripts/run_chatts_tsrbench.sh
 时序 tokens 预留额外空间。这里的
 thinking 是 TSRBench 用户 prompt 明确要求的推理，不是额外开启 Qwen3 chat
 template 的 thinking 开关。
+
+推理和评测解析器均接受“第一行是单个选项字母、后面带解释”的历史输出。因此旧的
+`generated_answer.json` 不需要重跑；更新 `scripts/evaluate_tsrbench.py` 后直接
+重新执行评测即可恢复这类答案。
 
 脚本会分别检查原始文本 token 数，以及 ChatTS processor 展开后的
 “文本 + 时序 patch”总输入 token 数。默认给输出保留完整的
