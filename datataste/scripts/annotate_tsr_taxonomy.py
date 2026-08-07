@@ -1117,15 +1117,229 @@ def resolve_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _eligible_for_materialization(
+    final: Mapping[str, Any], min_confidence: float, include_fit: Sequence[str]
+) -> bool:
+    primary = final.get("primary_label")
+    return bool(
+        final.get("status") == "accepted"
+        and primary in TAXONOMY
+        and float(final.get("confidence", 0)) >= min_confidence
+        and final.get("taxonomy_fit") in set(include_fit)
+    )
+
+
+def _build_template_sample_selection(
+    labels_path: Path,
+    sources: Sequence[SourceSpec],
+    allowed_splits: Sequence[str],
+    min_confidence: float,
+    include_fit: Sequence[str],
+    max_per_template: int,
+    sample_seed: int,
+    requested_sources: Sequence[str],
+) -> Tuple[Optional[set[str]], Dict[str, Any]]:
+    """Select an exact deterministic top-K of eligible samples per template.
+
+    ``cluster_id`` is produced from ``source + normalized question template``, so
+    the cap is source-aware by construction.  A disk-backed SQLite ranking keeps
+    memory bounded while SHA-256 ordering avoids the source-order bias of taking
+    the first K rows.
+    """
+
+    if max_per_template < 0:
+        raise ValueError("--max-per-template must be non-negative")
+    if max_per_template == 0:
+        if requested_sources:
+            raise ValueError("--template-cap-sources requires --max-per-template greater than zero")
+        return None, {
+            "enabled": False,
+            "max_per_template": 0,
+            "sample_seed": sample_seed,
+        }
+
+    source_by_name = {source.name: source for source in sources}
+    unknown_sources = sorted(set(requested_sources) - set(source_by_name))
+    if unknown_sources:
+        raise ValueError("unknown --template-cap-sources: " + ", ".join(unknown_sources))
+    allowed = set(allowed_splits)
+    cap_sources = list(
+        dict.fromkeys(
+            requested_sources
+            or [source.name for source in sources if source.split in allowed]
+        )
+    )
+    cap_source_set = set(cap_sources)
+
+    descriptor, database_name = tempfile.mkstemp(prefix="template_sample.", suffix=".sqlite")
+    os.close(descriptor)
+    database_path = Path(database_name)
+    connection = sqlite3.connect(str(database_path))
+    candidate_by_source: Counter = Counter()
+    candidate_by_label: Counter = Counter()
+    candidate_count = 0
+    try:
+        connection.executescript(
+            """
+            PRAGMA journal_mode=OFF;
+            PRAGMA synchronous=OFF;
+            PRAGMA temp_store=FILE;
+            CREATE TABLE candidates (
+                sample_id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                primary_label TEXT NOT NULL,
+                sample_score TEXT NOT NULL
+            );
+            """
+        )
+        batch: List[Tuple[str, str, str, str, str]] = []
+        with labels_path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                source_name = str(item.get("source", ""))
+                if source_name not in cap_source_set:
+                    continue
+                source = source_by_name[source_name]
+                if source.split not in allowed:
+                    continue
+                final = item.get("final")
+                if not isinstance(final, dict) or not _eligible_for_materialization(
+                    final, min_confidence, include_fit
+                ):
+                    continue
+                sample_id = str(item.get("sample_id", "")).strip()
+                cluster_id = str(item.get("cluster_id", "")).strip()
+                if not sample_id or not cluster_id:
+                    raise ValueError(
+                        f"eligible label row {line_number} lacks sample_id or cluster_id"
+                    )
+                primary = str(final["primary_label"])
+                score_payload = f"{sample_seed}\0{sample_id}".encode("utf-8")
+                score = hashlib.sha256(score_payload).hexdigest()
+                batch.append((sample_id, cluster_id, source_name, primary, score))
+                candidate_count += 1
+                candidate_by_source[source_name] += 1
+                candidate_by_label[primary] += 1
+                if len(batch) >= 10000:
+                    try:
+                        connection.executemany("INSERT INTO candidates VALUES (?, ?, ?, ?, ?)", batch)
+                    except sqlite3.IntegrityError as exc:
+                        raise ValueError("duplicate sample_id in final labels") from exc
+                    batch.clear()
+        if batch:
+            try:
+                connection.executemany("INSERT INTO candidates VALUES (?, ?, ?, ?, ?)", batch)
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("duplicate sample_id in final labels") from exc
+        connection.commit()
+        connection.execute(
+            "CREATE INDEX candidates_cluster_score ON candidates(cluster_id, sample_score, sample_id)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE selected AS
+            WITH ranked AS (
+                SELECT sample_id, source, primary_label,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cluster_id
+                           ORDER BY sample_score, sample_id
+                       ) AS template_rank,
+                       COUNT(*) OVER (PARTITION BY cluster_id) AS template_size
+                FROM candidates
+            )
+            SELECT sample_id, source, primary_label, template_size
+            FROM ranked WHERE template_rank <= ?
+            """,
+            (max_per_template,),
+        )
+        connection.execute("CREATE UNIQUE INDEX selected_sample_id ON selected(sample_id)")
+
+        selected_ids = {row[0] for row in connection.execute("SELECT sample_id FROM selected")}
+        selected_by_source = Counter(
+            {
+                row[0]: int(row[1])
+                for row in connection.execute("SELECT source, COUNT(*) FROM selected GROUP BY source")
+            }
+        )
+        selected_by_label = Counter(
+            {
+                row[0]: int(row[1])
+                for row in connection.execute(
+                    "SELECT primary_label, COUNT(*) FROM selected GROUP BY primary_label"
+                )
+            }
+        )
+        cluster_stats = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(MAX(template_size), 0),
+                   COALESCE(SUM(CASE WHEN template_size > ? THEN 1 ELSE 0 END), 0)
+            FROM (
+                SELECT cluster_id, COUNT(*) AS template_size
+                FROM candidates GROUP BY cluster_id
+            )
+            """,
+            (max_per_template,),
+        ).fetchone()
+        selected_count = len(selected_ids)
+        stats = {
+            "enabled": True,
+            "method": "sha256_top_k_per_source_normalized_template_cluster",
+            "max_per_template": max_per_template,
+            "sample_seed": sample_seed,
+            "cap_sources": cap_sources,
+            "candidate_samples": candidate_count,
+            "selected_samples": selected_count,
+            "filtered_samples": candidate_count - selected_count,
+            "template_clusters": int(cluster_stats[0]),
+            "capped_template_clusters": int(cluster_stats[2]),
+            "largest_template_cluster": int(cluster_stats[1]),
+            "candidate_by_source": dict(sorted(candidate_by_source.items())),
+            "selected_by_source": dict(sorted(selected_by_source.items())),
+            "filtered_by_source": {
+                source: candidate_by_source[source] - selected_by_source[source]
+                for source in sorted(candidate_by_source)
+            },
+            "candidate_by_label": dict(sorted(candidate_by_label.items())),
+            "selected_by_label": dict(sorted(selected_by_label.items())),
+            "filtered_by_label": {
+                label: candidate_by_label[label] - selected_by_label[label]
+                for label in sorted(candidate_by_label)
+            },
+        }
+        return selected_ids, stats
+    finally:
+        connection.close()
+        database_path.unlink(missing_ok=True)
+
+
 def materialize_command(args: argparse.Namespace) -> int:
     sources = load_registry(Path(args.registry))
     allowed_splits = set(args.splits)
     output_dir = Path(args.output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"materialize output directory is not empty: {output_dir}")
+    max_per_template = int(getattr(args, "max_per_template", 0))
+    template_sample_seed = int(getattr(args, "template_sample_seed", 42))
+    template_cap_sources = list(getattr(args, "template_cap_sources", []) or [])
+    selected_template_samples, template_sampling = _build_template_sample_selection(
+        Path(args.labels),
+        sources,
+        args.splits,
+        args.min_confidence,
+        args.include_fit,
+        max_per_template,
+        template_sample_seed,
+        template_cap_sources,
+    )
+    capped_source_set = set(template_sampling.get("cap_sources", []))
     output_dir.mkdir(parents=True, exist_ok=True)
     streams = {label: (output_dir / f"{label}_{TAXONOMY[label]['name']}.jsonl").open("w", encoding="utf-8") for label in TAXONOMY}
     counts = Counter()
+    capped_candidates_seen = 0
+    capped_selected_written = 0
     labels_stream = Path(args.labels).open(encoding="utf-8")
     try:
         for source in sources:
@@ -1153,19 +1367,30 @@ def materialize_command(args: argparse.Namespace) -> int:
                     primary = final.get("primary_label")
                     if source.split not in allowed_splits:
                         counts["EXCLUDED_SPLIT"] += 1
-                    elif (
-                        final.get("status") == "accepted"
-                        and primary in TAXONOMY
-                        and float(final.get("confidence", 0)) >= args.min_confidence
-                        and final.get("taxonomy_fit") in set(args.include_fit)
-                    ):
-                        streams[primary].write(_json_dump(sample) + "\n")
-                        counts[primary] += 1
+                    elif _eligible_for_materialization(final, args.min_confidence, args.include_fit):
+                        if selected_template_samples is not None and source.name in capped_source_set:
+                            capped_candidates_seen += 1
+                            if label_row["sample_id"] not in selected_template_samples:
+                                counts["FILTERED_TEMPLATE_CAP"] += 1
+                                source_index += 1
+                                continue
+                            capped_selected_written += 1
+                        streams[str(primary)].write(_json_dump(sample) + "\n")
+                        counts[str(primary)] += 1
                     else:
                         counts["EXCLUDED"] += 1
                     source_index += 1
         if labels_stream.readline().strip():
             raise ValueError("final label index has more rows than registry sources")
+        if template_sampling.get("enabled"):
+            if capped_candidates_seen != template_sampling["candidate_samples"]:
+                raise ValueError(
+                    "template candidate count changed between label ranking and source materialization"
+                )
+            if capped_selected_written != template_sampling["selected_samples"]:
+                raise ValueError(
+                    "not every selected template sample was found in the registered source data"
+                )
     finally:
         labels_stream.close()
         for stream in streams.values():
@@ -1177,6 +1402,7 @@ def materialize_command(args: argparse.Namespace) -> int:
         "min_confidence": args.min_confidence,
         "include_fit": args.include_fit,
         "splits": args.splits,
+        "template_sampling": template_sampling,
         "counts": dict(sorted(counts.items())),
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -1402,6 +1628,24 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--splits", nargs="+", default=["train"])
     materialize.add_argument(
         "--include-fit", nargs="+", choices=sorted(VALID_FITS), default=["exact", "compatible"]
+    )
+    materialize.add_argument(
+        "--max-per-template",
+        type=int,
+        default=0,
+        help="keep at most K eligible samples per source-aware normalized template cluster; 0 disables",
+    )
+    materialize.add_argument(
+        "--template-cap-sources",
+        nargs="+",
+        default=[],
+        help="optional registry source names to cap; omitted applies the cap to every selected split",
+    )
+    materialize.add_argument(
+        "--template-sample-seed",
+        type=int,
+        default=42,
+        help="seed for deterministic SHA-256 top-K template sampling",
     )
     materialize.set_defaults(func=materialize_command)
 

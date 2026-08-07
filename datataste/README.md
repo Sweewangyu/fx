@@ -125,11 +125,18 @@ python scripts/annotate_tsr_taxonomy.py resolve \
 python scripts/annotate_tsr_taxonomy.py materialize \
   --registry configs/tsr_annotation_sources.json \
   --labels artifacts/tsr-taxonomy/final_labels-v2.jsonl \
-  --output-dir data/chatts/tsr15-v2 \
+  --output-dir data/chatts/tsr15-v2-k8 \
   --splits train \
   --min-confidence 0.85 \
-  --include-fit exact compatible
+  --include-fit exact compatible \
+  --max-per-template 8 \
+  --template-cap-sources time_mqa tsaqa \
+  --template-sample-seed 42
 ```
+
+`--max-per-template 8` 表示每个“数据源 + 归一化问题模板”最多保留 8 条合格样本。程序按 `seed + sample_id` 的 SHA-256 排序取样，不会偏向源文件开头；同一 seed 重跑得到相同结果。这里建议只限制模板化较强的 Time-MQA 和 TSAQA，ChatTS alignment/SFT 不受影响。若希望所有训练源都执行 K 上限，省略 `--template-cap-sources`。
+
+输出目录的 `manifest.json` 会记录候选数、保留数、过滤数、被截断模板簇数、最大模板簇，以及按数据源和 15 类拆分的过滤前后数量。首轮建议 `K=8`，再做 `K=4/8/16` 消融；Stage 1 alignment 不建议使用激进模板截断。
 
 ### 分数据集查看 15 类分布
 

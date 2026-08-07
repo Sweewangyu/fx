@@ -161,13 +161,25 @@ python scripts/annotate_tsr_taxonomy.py export-human \
 python scripts/annotate_tsr_taxonomy.py materialize \
   --registry configs/tsr_annotation_sources.json \
   --labels artifacts/tsr-taxonomy/final_labels.jsonl \
-  --output-dir data/chatts/tsr15 \
+  --output-dir data/chatts/tsr15-k8 \
   --splits train \
   --min-confidence 0.85 \
-  --include-fit exact compatible
+  --include-fit exact compatible \
+  --max-per-template 8 \
+  --template-cap-sources time_mqa tsaqa \
+  --template-sample-seed 42
 ```
 
 输出的 15 个文件仍严格保持 ChatTS 三字段格式。
+
+模板上限发生在质量门槛之后：只有 `train + accepted + exact/compatible + confidence>=0.85` 的样本参与 K 选样。同一个 `cluster_id` 最多留下 K 条；因为 `cluster_id` 由数据源名和归一化问题模板共同生成，所以不会把不同数据源或不同训练角色的相似问题误合并。
+
+取样不是简单保留前 K 行，而是将 `seed + sample_id` 做 SHA-256 排序后选择前 K 条，因此固定 seed 可完全复现，并能避免源文件顺序偏差。`manifest.json` 中的 `template_sampling` 保存完整审计统计。推荐：
+
+- Stage 1 的 `align_256 + ift` 不做激进截断；
+- Stage 2 对 `time_mqa + tsaqa` 从 `K=8` 起步；
+- 用 `K=4/8/16` 做消融后再确定最终值；
+- 若要对所有已选 split 的数据源执行同一 K，上述命令中省略 `--template-cap-sources`。
 
 ## 5. 数据集级先验（不能替代逐题判断）
 

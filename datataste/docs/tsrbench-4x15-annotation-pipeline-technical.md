@@ -761,10 +761,13 @@ exact/compatible/closest/mixed/out_of_scope 数量
 python scripts/annotate_tsr_taxonomy.py materialize \
   --registry configs/tsr_annotation_sources.json \
   --labels artifacts/tsr-taxonomy/final_labels.v2.jsonl \
-  --output-dir data/chatts/tsr15-v2 \
+  --output-dir data/chatts/tsr15-v2-k8 \
   --splits train \
   --min-confidence 0.85 \
-  --include-fit exact compatible
+  --include-fit exact compatible \
+  --max-per-template 8 \
+  --template-cap-sources time_mqa tsaqa \
+  --template-sample-seed 42
 ```
 
 物化器按注册表顺序重新读取每个原始 JSONL，同时顺序读取最终标签。对每条有效源记录检查：
@@ -1692,7 +1695,45 @@ final.taxonomy_fit in --include-fit
 
 默认只选择 `train`，因此注册表中的 `chatts_dev` 不会混入训练集。
 
-### 15.3 输出文件
+### 15.3 确定性模板 K 采样
+
+通过质量门槛后，可对模板化严重的数据源增加每簇 K 上限：
+
+```text
+--max-per-template K
+--template-cap-sources source_a source_b
+--template-sample-seed SEED
+```
+
+其中 `K=0` 表示关闭。指定 `--template-cap-sources` 时只处理这些注册表数据源；省略时，对 `--splits` 选中的所有数据源执行 K 上限。模板簇沿用 `prepare` 阶段的 `cluster_id`：
+
+```text
+cluster_id = SHA256(source_name + normalized_question_template)[:24]
+```
+
+因此 K 的语义是“每个数据源内部，每种归一化问题模板最多 K 条”，不会跨 source 合并训练角色不同的样本。
+
+为避免“保留前 K 行”造成文件顺序偏差，每个候选样本计算：
+
+```text
+sample_score = SHA256(seed + NUL + sample_id)
+```
+
+然后在每个 `cluster_id` 内按 `sample_score, sample_id` 排序并取前 K 条。实现使用临时 SQLite 和窗口排序完成精确 top-K，结束后删除临时库；最终只在内存中保留被选中的 `sample_id`。同一份标签、同一 seed 和同一 K 会得到完全相同的训练集。
+
+`manifest.json.template_sampling` 记录：
+
+- `candidate_samples/selected_samples/filtered_samples`；
+- `template_clusters/capped_template_clusters/largest_template_cluster`；
+- `candidate/selected/filtered_by_source`；
+- `candidate/selected/filtered_by_label`；
+- K、seed、目标数据源和取样方法。
+
+同时 `counts.FILTERED_TEMPLATE_CAP` 记录实际被模板上限过滤的源样本数。物化器会核对两遍扫描中的候选数和实际写入数；任何标签/源数据漂移都会报错，而不是静默少写。
+
+建议对 Stage 2 的 `time_mqa`、`tsaqa` 从 `K=8` 起步，并比较 `K=4/8/16`。Stage 1 alignment 的重复数值序列仍承担模态对齐监督，不应默认套用同样的激进上限。
+
+### 15.4 输出文件
 
 物化器创建 15 个文件，即使某个类别暂时为空也会创建：
 
@@ -1817,6 +1858,7 @@ input + timeseries + output
 - 坏 JSONL 行隔离；
 - 人工 CSV 的空行忽略和标签读取；
 - 物化时默认排除非 train split；
+- 模板 K 采样的精确上限、固定 seed 可复现和指定数据源作用域；
 - Time-MQA/TSAQA 转 ChatTS 的格式和污染过滤测试。
 
 运行：

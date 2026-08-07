@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -422,6 +423,164 @@ class RuleBoundaryTests(unittest.TestCase):
             self.assertEqual((output / "PR_pattern_recognition.jsonl").read_text().count("\n"), 1)
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(manifest["counts"]["EXCLUDED_SPLIT"], 1)
+
+    def test_materialize_deterministically_caps_each_template(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "source.jsonl"
+            samples = [
+                {"input": f"question-{index}", "timeseries": [[index, index + 1]], "output": "answer"}
+                for index in range(6)
+            ]
+            source_path.write_text(
+                "\n".join(json.dumps(sample) for sample in samples) + "\n", encoding="utf-8"
+            )
+            registry = root / "registry.json"
+            registry.write_text(
+                json.dumps(
+                    {"sources": [{"name": "time_mqa", "path": str(source_path), "split": "train"}]}
+                ),
+                encoding="utf-8",
+            )
+            labels = root / "labels.jsonl"
+            final = {
+                "primary_label": "PR",
+                "secondary_labels": [],
+                "taxonomy_fit": "exact",
+                "confidence": 0.96,
+                "status": "accepted",
+                "method": "authoritative_model",
+            }
+            label_rows = [
+                {
+                    "sample_id": f"sample-{index}",
+                    "source": "time_mqa",
+                    "split": "train",
+                    "source_index": index,
+                    "cluster_id": "large-template" if index < 5 else "single-template",
+                    "final": final,
+                }
+                for index in range(6)
+            ]
+            labels.write_text(
+                "\n".join(json.dumps(row) for row in label_rows) + "\n", encoding="utf-8"
+            )
+
+            def run(output: Path) -> None:
+                materialize_command(
+                    SimpleNamespace(
+                        registry=str(registry),
+                        labels=str(labels),
+                        output_dir=str(output),
+                        min_confidence=0.85,
+                        include_fit=["exact", "compatible"],
+                        splits=["train"],
+                        max_per_template=2,
+                        template_cap_sources=[],
+                        template_sample_seed=17,
+                    )
+                )
+
+            first_output = root / "first"
+            second_output = root / "second"
+            run(first_output)
+            run(second_output)
+            first_text = (first_output / "PR_pattern_recognition.jsonl").read_text()
+            self.assertEqual(
+                first_text,
+                (second_output / "PR_pattern_recognition.jsonl").read_text(),
+            )
+            written = [json.loads(line)["input"] for line in first_text.splitlines()]
+            chosen_large = sorted(
+                range(5),
+                key=lambda index: hashlib.sha256(f"17\0sample-{index}".encode()).hexdigest(),
+            )[:2]
+            expected = {f"question-{index}" for index in chosen_large} | {"question-5"}
+            self.assertEqual(set(written), expected)
+
+            manifest = json.loads((first_output / "manifest.json").read_text())
+            sampling = manifest["template_sampling"]
+            self.assertTrue(sampling["enabled"])
+            self.assertEqual(sampling["candidate_samples"], 6)
+            self.assertEqual(sampling["selected_samples"], 3)
+            self.assertEqual(sampling["filtered_samples"], 3)
+            self.assertEqual(sampling["template_clusters"], 2)
+            self.assertEqual(sampling["capped_template_clusters"], 1)
+            self.assertEqual(sampling["largest_template_cluster"], 5)
+            self.assertEqual(manifest["counts"]["FILTERED_TEMPLATE_CAP"], 3)
+            self.assertEqual(manifest["counts"]["PR"], 3)
+
+    def test_materialize_template_cap_can_target_selected_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_specs = []
+            labels_rows = []
+            for source_name in ("chatts_sft", "tsaqa"):
+                source_path = root / f"{source_name}.jsonl"
+                samples = [
+                    {
+                        "input": f"{source_name}-{index}",
+                        "timeseries": [[index, index + 1]],
+                        "output": "answer",
+                    }
+                    for index in range(3)
+                ]
+                source_path.write_text(
+                    "\n".join(json.dumps(sample) for sample in samples) + "\n",
+                    encoding="utf-8",
+                )
+                source_specs.append(
+                    {"name": source_name, "path": str(source_path), "split": "train"}
+                )
+                labels_rows.extend(
+                    {
+                        "sample_id": f"{source_name}-{index}",
+                        "source": source_name,
+                        "split": "train",
+                        "source_index": index,
+                        "cluster_id": f"{source_name}-template",
+                        "final": {
+                            "primary_label": "TR",
+                            "secondary_labels": [],
+                            "taxonomy_fit": "exact",
+                            "confidence": 0.95,
+                            "status": "accepted",
+                            "method": "authoritative_model",
+                        },
+                    }
+                    for index in range(3)
+                )
+            registry = root / "registry.json"
+            registry.write_text(json.dumps({"sources": source_specs}), encoding="utf-8")
+            labels = root / "labels.jsonl"
+            labels.write_text(
+                "\n".join(json.dumps(row) for row in labels_rows) + "\n", encoding="utf-8"
+            )
+            output = root / "out"
+            materialize_command(
+                SimpleNamespace(
+                    registry=str(registry),
+                    labels=str(labels),
+                    output_dir=str(output),
+                    min_confidence=0.85,
+                    include_fit=["exact", "compatible"],
+                    splits=["train"],
+                    max_per_template=1,
+                    template_cap_sources=["tsaqa"],
+                    template_sample_seed=42,
+                )
+            )
+            rows = [
+                json.loads(line)
+                for line in (output / "TR_temporal_relation_reasoning.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(sum(row["input"].startswith("chatts_sft") for row in rows), 3)
+            self.assertEqual(sum(row["input"].startswith("tsaqa") for row in rows), 1)
+            sampling = json.loads((output / "manifest.json").read_text())["template_sampling"]
+            self.assertEqual(sampling["cap_sources"], ["tsaqa"])
+            self.assertEqual(sampling["candidate_samples"], 3)
+            self.assertEqual(sampling["selected_samples"], 1)
 
     def test_distribution_report_groups_chatts_and_excludes_dev_by_default(self):
         with tempfile.TemporaryDirectory() as directory:
