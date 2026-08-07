@@ -166,6 +166,7 @@ python scripts/annotate_tsr_taxonomy.py report-distribution \
 
 ## 文档入口
 
+- `docs/end-to-end-tsrbench-training-runbook.md`：从原始 QA、逐样本标签、Qwen/DeepSeek 模板复核，到 ChatTS 两阶段训练和 TSRBench 打榜的完整运行手册；
 - `docs/tsrbench-4x15-annotation-pipeline-technical.md`：按 A→O 数据流逐步解释完整标注管线；
 - `docs/annotate-tsr-taxonomy.md`：简明标注操作手册；
 - `docs/convert-tsqa-to-chatts.md`：Time-MQA/TSAQA 转 ChatTS 格式说明；
