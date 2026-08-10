@@ -53,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--learning-rate", required=True)
     parser.add_argument("--chronos2-model-path", required=True)
+    parser.add_argument("--input-model-dir")
+    parser.add_argument("--input-best-model-manifest")
     parser.add_argument("--patch-size", type=int, default=16)
     parser.add_argument("--chronos2-hidden-size", type=int, default=768)
     parser.add_argument("--cleanup-checkpoints", action="store_true")
@@ -68,6 +70,35 @@ def main() -> int:
         raise SystemExit("--seed must be non-negative")
     if args.patch_size < 1 or args.chronos2_hidden_size < 1:
         raise SystemExit("Patch and hidden sizes must be positive")
+
+    input_model_dir = None
+    if args.input_model_dir:
+        input_model_dir = Path(args.input_model_dir).expanduser().resolve()
+        if not (input_model_dir / "config.json").is_file():
+            raise SystemExit(f"Input model config not found: {input_model_dir / 'config.json'}")
+
+    input_best_model = None
+    if args.input_best_model_manifest:
+        input_manifest_path = Path(args.input_best_model_manifest).expanduser().resolve()
+        if not input_manifest_path.is_file():
+            raise SystemExit(f"Input best-model manifest not found: {input_manifest_path}")
+        with input_manifest_path.open(encoding="utf-8") as stream:
+            parent_manifest = json.load(stream)
+        if parent_manifest.get("stage") != "stage1":
+            raise SystemExit("Stage2 input manifest must describe a Stage1 best model")
+        parent_export = Path(parent_manifest.get("exported_model_dir", "")).expanduser().resolve()
+        if input_model_dir is not None and parent_export != input_model_dir:
+            raise SystemExit(
+                "Input model directory does not match Stage1 best-model manifest: "
+                f"{input_model_dir} != {parent_export}"
+            )
+        input_best_model = {
+            "manifest_path": str(input_manifest_path),
+            "stage": parent_manifest["stage"],
+            "exported_model_dir": str(parent_export),
+            "selected_checkpoint": parent_manifest.get("selected_checkpoint"),
+            "best_metric": parent_manifest.get("best_metric"),
+        }
 
     config_path = checkpoint_dir / "config.json"
     trainer_state_path = checkpoint_dir / "trainer_state.json"
@@ -136,6 +167,8 @@ def main() -> int:
         "best_metric": float(best_metric),
         "selected_checkpoint": best_checkpoint.name,
         "exported_model_dir": str(checkpoint_dir),
+        "input_model_dir": str(input_model_dir) if input_model_dir is not None else None,
+        "input_best_model": input_best_model,
         "ts_encoder_type": "chronos2",
         "chronos2_model_name_or_path": args.chronos2_model_path,
         "chronos2_hidden_size": args.chronos2_hidden_size,

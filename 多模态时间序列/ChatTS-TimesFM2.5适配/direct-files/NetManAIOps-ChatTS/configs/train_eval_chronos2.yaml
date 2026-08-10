@@ -1,0 +1,76 @@
+# ChatTS Chronos-2 two-stage training -> four-suite evaluation.
+# Inline environment variables still override values in this file.
+
+pipeline:
+  seed: 42
+  force_train: false
+  force_eval: false
+  preflight_only: false
+  max_samples: 0             # 0 = full evaluation
+  offline: true
+
+containers:
+  training: chatts
+  evaluation: ragas
+
+training:
+  project_root: /workspace/ChatTS-Training
+  script: /workspace/ChatTS-Training/scripts/full/run_chronos2_best_two_stage.sh
+  base_model_path: /share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B
+  output_root: /share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1
+  # Omit final_model_path to derive output_root/best_seed<seed> automatically.
+  chronos2_model_path: /workspace/chronos2
+  deepspeed_include: "localhost:0,1,2,3,4,5,6,7"
+  master_port: 19901
+
+  stage1:
+    learning_rate: "1e-5"
+    # Defaults to learning_rate when omitted.
+    timeseries_learning_rate: "1e-5"
+    datasets: "align_256,ift"
+    interleave_probs: "0.9,0.1"
+    mix_strategy: interleave_over
+    num_train_epochs: 3
+    max_steps: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 32
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.02
+    logging_steps: 1
+    save_steps: 200
+    eval_steps: 200
+    val_size: 0.05
+    per_device_eval_batch_size: 2
+    cutoff_len: 2048
+    preprocessing_num_workers: 96
+
+  stage2:
+    learning_rate: "1e-5"
+    timeseries_learning_rate: "1e-5"
+    datasets: "sft,align_random,finiverse_time_mqa,finiverse_tsaqa"
+    interleave_probs: null
+    mix_strategy: concat
+    num_train_epochs: 1
+    max_steps: 0
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 32
+    lr_scheduler_type: cosine
+    warmup_ratio: 0.02
+    logging_steps: 1
+    save_steps: 100
+    eval_steps: 100
+    val_size: 0.05
+    per_device_eval_batch_size: 4
+    cutoff_len: 2048
+    preprocessing_num_workers: 96
+
+evaluation:
+  project_root: /workspace/ChatTS/ChatTS-main
+  script: /workspace/ChatTS/ChatTS-main/scripts/run_all_chatts_benchmarks.sh
+  # Omit model_name/output_root to derive seed-specific defaults automatically.
+  chronos2_model_path: /workspace/chronos2
+  tsrbench_root: /share/airesearch/data/finiverse/TSRBench-dataset
+  tinybench_dataset_root: /share/airesearch/data/finiverse/tyb
+  ts_haystack_root: /workspace/TS-Haystack
+  timeseriesexam_root: /workspace/TimeSeriesExam
+  timeseriesexam_data_file: /workspace/TimeSeriesExam/output/round_3_folder/qa_dataset.json

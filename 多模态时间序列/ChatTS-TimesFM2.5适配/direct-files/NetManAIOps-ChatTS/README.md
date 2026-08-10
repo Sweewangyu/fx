@@ -11,6 +11,8 @@ checkpoint 兼容：
 - `scripts/run_chatts_timeseriesexam.sh`：用原始数值时序评测 TimeSeriesExam。
 - `scripts/run_all_chatts_benchmarks.sh`：四套 benchmark 串行执行，每套独占全部 8 张卡。
 - `scripts/run_train_then_eval.sh`：宿主机一键执行 `chatts` 训练，再执行 `ragas` 评测。
+- `configs/train_eval_chronos2.yaml`：两阶段训练、模型、数据和评测路径的集中配置。
+- `scripts/load_train_eval_config.py`：将 YAML 安全展开为流水线环境变量。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
@@ -570,13 +572,30 @@ Python 文件、四个子 runner 和 `run_all_chatts_benchmarks.sh`。
 
 ```bash
 cd /path/to/NetManAIOps-ChatTS
-SEED=42 bash scripts/run_train_then_eval.sh
+bash scripts/run_train_then_eval.sh
+```
+
+默认读取 `configs/train_eval_chronos2.yaml`。基础模型、输出目录、两阶段学习率、
+`timeseries_sft_lr`、数据集、混合策略、epoch、batch size、梯度累积、
+save/eval steps 以及四套评测数据路径均可在该 YAML 中修改。使用另一份配置：
+
+```bash
+CONFIG_FILE=/path/to/my_experiment.yaml bash scripts/run_train_then_eval.sh
+```
+
+命令行环境变量的优先级高于 YAML，例如临时做每套 2 条的冒烟评测：
+
+```bash
+MAX_SAMPLES=2 CONFIG_FILE=configs/train_eval_chronos2.yaml \
+  bash scripts/run_train_then_eval.sh
 ```
 
 它会先检查两个容器、8 张 GPU、代码和共享目录，再在 `chatts` 中依次完成
 Stage1/Stage2。LLaMAFactory 会在结束时把验证集 `eval_loss` 最优 checkpoint
 加载回内存并导出到阶段根目录；脚本验证该根目录后才删除 `checkpoint-*`。
-Stage2 成功后还会删除 Stage1 模型目录，最终只保留：
+Stage2 的 `--model_name_or_path` 明确指向 Stage1 最优导出目录；四套评测的
+`MODEL_PATH` 又明确指向 Stage2 最优导出目录。Stage2 成功后会删除
+Stage1 模型目录，最终只保留：
 
 ```text
 /share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1/best_seed42
@@ -585,9 +604,9 @@ Stage2 成功后还会删除 Stage1 模型目录，最终只保留：
 常用控制参数：
 
 ```bash
-PREFLIGHT_ONLY=1 SEED=42 bash scripts/run_train_then_eval.sh  # 只检查，不运行
-MAX_SAMPLES=2 SEED=42 bash scripts/run_train_then_eval.sh     # 训练后做四套冒烟评测
-FORCE_TRAIN=1 FORCE_EVAL=1 SEED=42 bash scripts/run_train_then_eval.sh
+PREFLIGHT_ONLY=1 bash scripts/run_train_then_eval.sh  # 只检查，不运行
+MAX_SAMPLES=2 bash scripts/run_train_then_eval.sh     # 训练后做四套冒烟评测
+FORCE_TRAIN=1 FORCE_EVAL=1 bash scripts/run_train_then_eval.sh
 ```
 
 正常重跑具有幂等性：`TRAINING_COMPLETE.json` 与参数一致时复用最终模型；目录存在

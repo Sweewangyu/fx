@@ -11,6 +11,12 @@ CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
 SEED="${SEED:-42}"
 S1_LR="${S1_LR:-1e-5}"
 S2_LR="${S2_LR:-1e-5}"
+STAGE1_DATASETS="${STAGE1_DATASETS:-align_256,ift}"
+STAGE2_DATASETS="${STAGE2_DATASETS:-sft,align_random,finiverse_time_mqa,finiverse_tsaqa}"
+STAGE1_MIX_STRATEGY="${STAGE1_MIX_STRATEGY:-interleave_over}"
+STAGE2_MIX_STRATEGY="${STAGE2_MIX_STRATEGY:-concat}"
+STAGE1_TIMESERIES_SFT_LR="${STAGE1_TIMESERIES_SFT_LR:-$S1_LR}"
+STAGE2_TIMESERIES_SFT_LR="${STAGE2_TIMESERIES_SFT_LR:-$S2_LR}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -118,6 +124,8 @@ echo " ChatTS Chronos-2 two-stage best-model training"
 echo " Base model:       $MODEL_PATH"
 echo " Stage1 LR:        $S1_LR"
 echo " Stage2 LR:        $S2_LR"
+echo " Stage1 datasets:  $STAGE1_DATASETS"
+echo " Stage2 datasets:  $STAGE2_DATASETS"
 echo " Seed:             $SEED"
 echo " Stage1 temporary: $STAGE1_OUT"
 echo " Final model:      $FINAL_MODEL_PATH"
@@ -154,6 +162,8 @@ else
 fi
 
 export PROJECT_ROOT MODEL_PATH OUTPUT_ROOT CHRONOS2_MODEL_PATH SEED FINALIZER
+export STAGE1_DATASETS STAGE2_DATASETS STAGE1_MIX_STRATEGY STAGE2_MIX_STRATEGY
+export STAGE1_TIMESERIES_SFT_LR STAGE2_TIMESERIES_SFT_LR
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') | Starting Stage1"
 TENSORBOARD_DIR="$LOG_ROOT/tensorboard/stage1" \
@@ -172,10 +182,17 @@ safe_remove_model_dir "$STAGE1_OUT" stage1
 
 READY_MARKER="$READY_MARKER" \
 FINAL_MODEL_PATH="$FINAL_MODEL_PATH" \
+MODEL_PATH="$MODEL_PATH" \
 LOG_ROOT="$LOG_ROOT" \
 SEED="$SEED" \
 S1_LR="$S1_LR" \
 S2_LR="$S2_LR" \
+STAGE1_DATASETS="$STAGE1_DATASETS" \
+STAGE2_DATASETS="$STAGE2_DATASETS" \
+STAGE1_MIX_STRATEGY="$STAGE1_MIX_STRATEGY" \
+STAGE2_MIX_STRATEGY="$STAGE2_MIX_STRATEGY" \
+STAGE1_TIMESERIES_SFT_LR="$STAGE1_TIMESERIES_SFT_LR" \
+STAGE2_TIMESERIES_SFT_LR="$STAGE2_TIMESERIES_SFT_LR" \
 "$PYTHON_BIN" - <<'PY'
 import json
 import os
@@ -189,6 +206,18 @@ with stage1_manifest.open(encoding="utf-8") as stream:
     stage1 = json.load(stream)
 with stage2_manifest.open(encoding="utf-8") as stream:
     stage2 = json.load(stream)
+stage1_export = Path(stage1["exported_model_dir"]).resolve()
+stage2_export = Path(stage2["exported_model_dir"]).resolve()
+final_model = Path(os.environ["FINAL_MODEL_PATH"]).resolve()
+stage2_input = stage2.get("input_best_model")
+if not isinstance(stage2_input, dict):
+    raise SystemExit("Stage2 manifest does not identify its Stage1 best-model input")
+if Path(stage2_input.get("exported_model_dir", "")).resolve() != stage1_export:
+    raise SystemExit("Stage2 was not initialized from the finalized Stage1 model")
+if stage2_input.get("selected_checkpoint") != stage1.get("selected_checkpoint"):
+    raise SystemExit("Stage2 input provenance does not match the Stage1 selected checkpoint")
+if stage2_export != final_model:
+    raise SystemExit("Stage2 best-model export does not match FINAL_MODEL_PATH")
 payload = {
     "status": "complete",
     "seed": int(os.environ["SEED"]),
@@ -196,7 +225,31 @@ payload = {
     "stage2_learning_rate": os.environ["S2_LR"],
     "stage1_best_eval_loss": stage1["best_metric"],
     "stage2_best_eval_loss": stage2["best_metric"],
-    "final_model_path": str(Path(os.environ["FINAL_MODEL_PATH"]).resolve()),
+    "final_model_path": str(final_model),
+    "training_lineage": {
+        "stage1": {
+            "input_model_path": str(Path(os.environ["MODEL_PATH"]).resolve()),
+            "datasets": os.environ["STAGE1_DATASETS"],
+            "mix_strategy": os.environ["STAGE1_MIX_STRATEGY"],
+            "learning_rate": os.environ["S1_LR"],
+            "timeseries_learning_rate": os.environ["STAGE1_TIMESERIES_SFT_LR"],
+            "selected_checkpoint": stage1["selected_checkpoint"],
+            "best_eval_loss": stage1["best_metric"],
+            "exported_best_model_path": stage1["exported_model_dir"],
+        },
+        "stage2": {
+            "input_model_path": stage1["exported_model_dir"],
+            "input_stage1_selected_checkpoint": stage1["selected_checkpoint"],
+            "datasets": os.environ["STAGE2_DATASETS"],
+            "mix_strategy": os.environ["STAGE2_MIX_STRATEGY"],
+            "learning_rate": os.environ["S2_LR"],
+            "timeseries_learning_rate": os.environ["STAGE2_TIMESERIES_SFT_LR"],
+            "selected_checkpoint": stage2["selected_checkpoint"],
+            "best_eval_loss": stage2["best_metric"],
+            "exported_best_model_path": stage2["exported_model_dir"],
+        },
+        "evaluation_model_path": stage2["exported_model_dir"],
+    },
     "stage1_model_retained": False,
     "completed_at_utc": datetime.now(timezone.utc).isoformat(),
 }

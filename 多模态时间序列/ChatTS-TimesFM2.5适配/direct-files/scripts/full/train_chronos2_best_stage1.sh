@@ -16,6 +16,21 @@ DEEPSPEED_INCLUDE="${DEEPSPEED_INCLUDE:-localhost:0,1,2,3,4,5,6,7}"
 MASTER_PORT="${MASTER_PORT:-19901}"
 STAGE1_NUM_TRAIN_EPOCHS="${STAGE1_NUM_TRAIN_EPOCHS:-3}"
 STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-0}"
+STAGE1_TIMESERIES_SFT_LR="${STAGE1_TIMESERIES_SFT_LR:-$LR}"
+STAGE1_DATASETS="${STAGE1_DATASETS:-align_256,ift}"
+STAGE1_INTERLEAVE_PROBS="${STAGE1_INTERLEAVE_PROBS:-0.9,0.1}"
+STAGE1_MIX_STRATEGY="${STAGE1_MIX_STRATEGY:-interleave_over}"
+STAGE1_PER_DEVICE_TRAIN_BATCH_SIZE="${STAGE1_PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
+STAGE1_GRADIENT_ACCUMULATION_STEPS="${STAGE1_GRADIENT_ACCUMULATION_STEPS:-32}"
+STAGE1_LR_SCHEDULER_TYPE="${STAGE1_LR_SCHEDULER_TYPE:-cosine}"
+STAGE1_WARMUP_RATIO="${STAGE1_WARMUP_RATIO:-0.02}"
+STAGE1_LOGGING_STEPS="${STAGE1_LOGGING_STEPS:-1}"
+STAGE1_SAVE_STEPS="${STAGE1_SAVE_STEPS:-200}"
+STAGE1_EVAL_STEPS="${STAGE1_EVAL_STEPS:-200}"
+STAGE1_VAL_SIZE="${STAGE1_VAL_SIZE:-0.05}"
+STAGE1_PER_DEVICE_EVAL_BATCH_SIZE="${STAGE1_PER_DEVICE_EVAL_BATCH_SIZE:-2}"
+STAGE1_CUTOFF_LEN="${STAGE1_CUTOFF_LEN:-2048}"
+STAGE1_PREPROCESSING_NUM_WORKERS="${STAGE1_PREPROCESSING_NUM_WORKERS:-96}"
 
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer." >&2; exit 2; }
 [[ "$LR" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || { echo "Invalid learning rate: $LR" >&2; exit 2; }
@@ -38,8 +53,13 @@ TRAIN_LENGTH_ARGS=(--num_train_epochs "$STAGE1_NUM_TRAIN_EPOCHS")
 if (( STAGE1_MAX_STEPS > 0 )); then
     TRAIN_LENGTH_ARGS+=(--max_steps "$STAGE1_MAX_STEPS")
 fi
+DATASET_ARGS=(--dataset "$STAGE1_DATASETS" --mix_strategy "$STAGE1_MIX_STRATEGY")
+if [[ -n "$STAGE1_INTERLEAVE_PROBS" ]]; then
+    DATASET_ARGS+=(--interleave_probs "$STAGE1_INTERLEAVE_PROBS")
+fi
 
-echo "[Stage1] seed=$SEED lr=$LR base=$MODEL_PATH output=$STAGE1_OUT"
+echo "[Stage1] seed=$SEED lr=$LR ts_lr=$STAGE1_TIMESERIES_SFT_LR base=$MODEL_PATH output=$STAGE1_OUT"
+echo "[Stage1] datasets=$STAGE1_DATASETS mix=$STAGE1_MIX_STRATEGY interleave_probs=${STAGE1_INTERLEAVE_PROBS:-<none>}"
 cd "$PROJECT_ROOT"
 deepspeed --include "$DEEPSPEED_INCLUDE" --master_port="$MASTER_PORT" src/train.py \
     --deepspeed ds_config/ds_config_2.json \
@@ -47,37 +67,35 @@ deepspeed --include "$DEEPSPEED_INCLUDE" --master_port="$MASTER_PORT" src/train.
     --model_name_or_path "$MODEL_PATH" \
     --ts_encoder_type chronos2 \
     --chronos2_model_name_or_path "$CHRONOS2_MODEL_PATH" \
-    --dataset "align_256,ift" \
-    --interleave_probs "0.9,0.1" \
+    "${DATASET_ARGS[@]}" \
     --do_train \
-    --mix_strategy interleave_over \
     --template chatts \
     --finetuning_type full \
     --output_dir "$STAGE1_OUT" \
-    --per_device_train_batch_size 2 \
-    --gradient_accumulation_steps 32 \
-    --lr_scheduler_type cosine \
-    --logging_steps 1 \
+    --per_device_train_batch_size "$STAGE1_PER_DEVICE_TRAIN_BATCH_SIZE" \
+    --gradient_accumulation_steps "$STAGE1_GRADIENT_ACCUMULATION_STEPS" \
+    --lr_scheduler_type "$STAGE1_LR_SCHEDULER_TYPE" \
+    --logging_steps "$STAGE1_LOGGING_STEPS" \
     --save_strategy steps \
-    --save_steps 200 \
+    --save_steps "$STAGE1_SAVE_STEPS" \
     --save_total_limit 1 \
     --learning_rate "$LR" \
-    --timeseries_sft_lr "$LR" \
-    --warmup_ratio 0.02 \
+    --timeseries_sft_lr "$STAGE1_TIMESERIES_SFT_LR" \
+    --warmup_ratio "$STAGE1_WARMUP_RATIO" \
     "${TRAIN_LENGTH_ARGS[@]}" \
     --plot_loss \
     --bf16 \
     --save_only_model True \
     --save_safetensors False \
-    --preprocessing_num_workers 96 \
+    --preprocessing_num_workers "$STAGE1_PREPROCESSING_NUM_WORKERS" \
     --overwrite_cache \
     --trust_remote_code True \
     --flash_attn fa2 \
-    --cutoff_len 2048 \
-    --val_size 0.05 \
-    --per_device_eval_batch_size 2 \
+    --cutoff_len "$STAGE1_CUTOFF_LEN" \
+    --val_size "$STAGE1_VAL_SIZE" \
+    --per_device_eval_batch_size "$STAGE1_PER_DEVICE_EVAL_BATCH_SIZE" \
     --eval_strategy steps \
-    --eval_steps 200 \
+    --eval_steps "$STAGE1_EVAL_STEPS" \
     --load_best_model_at_end True \
     --metric_for_best_model eval_loss \
     --greater_is_better False \
@@ -92,4 +110,5 @@ python3 "$FINALIZER" \
     --seed "$SEED" \
     --learning-rate "$LR" \
     --chronos2-model-path "$CHRONOS2_MODEL_PATH" \
+    --input-model-dir "$MODEL_PATH" \
     --cleanup-checkpoints

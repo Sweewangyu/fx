@@ -4,6 +4,23 @@ set -Eeuo pipefail
 # Host-side one-click entrypoint.  This script intentionally does not use -it:
 # docker exec exits only after each container-side stage has completed.
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOST_PYTHON_BIN="${HOST_PYTHON_BIN:-python3}"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/../configs/train_eval_chronos2.yaml}"
+CONFIG_LOADER="${CONFIG_LOADER:-${SCRIPT_DIR}/load_train_eval_config.py}"
+
+command -v "$HOST_PYTHON_BIN" >/dev/null 2>&1 || {
+    echo "Host Python not found: $HOST_PYTHON_BIN" >&2
+    exit 1
+}
+[[ -f "$CONFIG_LOADER" ]] || { echo "Configuration loader not found: $CONFIG_LOADER" >&2; exit 1; }
+[[ -f "$CONFIG_FILE" ]] || { echo "Configuration file not found: $CONFIG_FILE" >&2; exit 1; }
+
+# The loader only emits a fixed whitelist of shell assignments and quotes every
+# value. Variables already exported by the caller take precedence over YAML.
+CONFIG_EXPORTS="$("$HOST_PYTHON_BIN" "$CONFIG_LOADER" "$CONFIG_FILE")"
+eval "$CONFIG_EXPORTS"
+
 TRAIN_CONTAINER="${TRAIN_CONTAINER:-chatts}"
 EVAL_CONTAINER="${EVAL_CONTAINER:-ragas}"
 TRAIN_PROJECT_ROOT="${TRAIN_PROJECT_ROOT:-/workspace/ChatTS-Training}"
@@ -35,6 +52,30 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 OFFLINE="${OFFLINE:-1}"
+
+TRAIN_PARAMETER_NAMES=(
+    DEEPSPEED_INCLUDE MASTER_PORT
+    STAGE1_TIMESERIES_SFT_LR STAGE1_DATASETS STAGE1_INTERLEAVE_PROBS
+    STAGE1_MIX_STRATEGY STAGE1_NUM_TRAIN_EPOCHS STAGE1_MAX_STEPS
+    STAGE1_PER_DEVICE_TRAIN_BATCH_SIZE STAGE1_GRADIENT_ACCUMULATION_STEPS
+    STAGE1_LR_SCHEDULER_TYPE STAGE1_WARMUP_RATIO STAGE1_LOGGING_STEPS
+    STAGE1_SAVE_STEPS STAGE1_EVAL_STEPS STAGE1_VAL_SIZE
+    STAGE1_PER_DEVICE_EVAL_BATCH_SIZE STAGE1_CUTOFF_LEN
+    STAGE1_PREPROCESSING_NUM_WORKERS
+    STAGE2_TIMESERIES_SFT_LR STAGE2_DATASETS STAGE2_INTERLEAVE_PROBS
+    STAGE2_MIX_STRATEGY STAGE2_NUM_TRAIN_EPOCHS STAGE2_MAX_STEPS
+    STAGE2_PER_DEVICE_TRAIN_BATCH_SIZE STAGE2_GRADIENT_ACCUMULATION_STEPS
+    STAGE2_LR_SCHEDULER_TYPE STAGE2_WARMUP_RATIO STAGE2_LOGGING_STEPS
+    STAGE2_SAVE_STEPS STAGE2_EVAL_STEPS STAGE2_VAL_SIZE
+    STAGE2_PER_DEVICE_EVAL_BATCH_SIZE STAGE2_CUTOFF_LEN
+    STAGE2_PREPROCESSING_NUM_WORKERS
+)
+TRAIN_PARAMETER_ENV=()
+for parameter_name in "${TRAIN_PARAMETER_NAMES[@]}"; do
+    if [[ -n "${!parameter_name+x}" ]]; then
+        TRAIN_PARAMETER_ENV+=(-e "$parameter_name=${!parameter_name}")
+    fi
+done
 
 for flag_name in FORCE_TRAIN FORCE_EVAL PREFLIGHT_ONLY OFFLINE; do
     flag_value="${!flag_name}"
@@ -96,6 +137,7 @@ require_container_gpus "$EVAL_CONTAINER"
 
 echo "============================================================"
 echo " ChatTS host pipeline: train -> evaluate"
+echo " Configuration:       $CONFIG_FILE"
 echo " Training container:  $TRAIN_CONTAINER"
 echo " Evaluation container:$EVAL_CONTAINER"
 echo " Seed:                $SEED"
@@ -106,6 +148,7 @@ echo "============================================================"
 
 run_training() {
     docker exec \
+        "${TRAIN_PARAMETER_ENV[@]}" \
         -e PROJECT_ROOT="$TRAIN_PROJECT_ROOT" \
         -e MODEL_PATH="$BASE_MODEL_PATH" \
         -e OUTPUT_ROOT="$TRAIN_OUTPUT_ROOT" \

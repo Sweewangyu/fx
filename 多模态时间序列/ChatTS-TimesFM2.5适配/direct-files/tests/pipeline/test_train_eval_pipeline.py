@@ -19,6 +19,12 @@ EVAL_RUNNER = (
     / "scripts"
     / "run_all_chatts_benchmarks.sh"
 )
+CONFIG_LOADER = (
+    DIRECT_FILES
+    / "NetManAIOps-ChatTS"
+    / "scripts"
+    / "load_train_eval_config.py"
+)
 
 
 def write_json(path: Path, payload: object) -> None:
@@ -29,7 +35,20 @@ def write_json(path: Path, payload: object) -> None:
 class FinalizeCheckpointTest(unittest.TestCase):
     def test_finalizer_stamps_metadata_and_removes_only_checkpoint_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary) / "stage2"
+            temporary_root = Path(temporary)
+            root = temporary_root / "stage2"
+            stage1 = temporary_root / "stage1"
+            stage1.mkdir()
+            write_json(stage1 / "config.json", {})
+            write_json(
+                stage1 / "best_model_manifest.json",
+                {
+                    "stage": "stage1",
+                    "exported_model_dir": str(stage1),
+                    "selected_checkpoint": "checkpoint-50",
+                    "best_metric": 0.25,
+                },
+            )
             selected = root / "checkpoint-100"
             selected.mkdir(parents=True)
             (root / "pytorch_model-00001-of-00001.bin").write_bytes(b"root-best-weights")
@@ -54,6 +73,10 @@ class FinalizeCheckpointTest(unittest.TestCase):
                     "1e-5",
                     "--chronos2-model-path",
                     "/workspace/chronos2",
+                    "--input-model-dir",
+                    str(stage1),
+                    "--input-best-model-manifest",
+                    str(stage1 / "best_model_manifest.json"),
                     "--cleanup-checkpoints",
                 ],
                 check=True,
@@ -71,6 +94,10 @@ class FinalizeCheckpointTest(unittest.TestCase):
             )
             self.assertEqual(manifest["selected_checkpoint"], "checkpoint-100")
             self.assertEqual(manifest["best_metric"], 0.125)
+            self.assertEqual(manifest["input_model_dir"], str(stage1.resolve()))
+            self.assertEqual(
+                manifest["input_best_model"]["selected_checkpoint"], "checkpoint-50"
+            )
 
     def test_finalizer_rejects_missing_selected_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,6 +135,50 @@ class FinalizeCheckpointTest(unittest.TestCase):
 
 
 class PipelineShellTest(unittest.TestCase):
+    def test_yaml_loader_maps_training_data_and_environment_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "experiment.yaml"
+            config.write_text(
+                """
+pipeline:
+  seed: 7
+training:
+  base_model_path: /models/qwen
+  stage1:
+    learning_rate: "3e-5"
+    datasets: [align_256, ift]
+  stage2:
+    learning_rate: "8e-6"
+    datasets: "sft,my_private_data"
+evaluation:
+  model_name: yaml-name
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["S1_LR"] = "9e-5"
+            for name in ("SEED", "BASE_MODEL_PATH", "STAGE1_DATASETS", "S2_LR", "STAGE2_DATASETS", "MODEL_NAME"):
+                env.pop(name, None)
+            env["S1_LR"] = "9e-5"
+            result = subprocess.run(
+                [sys.executable, str(CONFIG_LOADER), str(config)],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assignments = dict(
+                line.split("=", 1) for line in result.stdout.splitlines() if line
+            )
+            self.assertEqual(assignments["SEED"], "7")
+            self.assertEqual(assignments["BASE_MODEL_PATH"], "/models/qwen")
+            self.assertEqual(assignments["STAGE1_DATASETS"], "align_256,ift")
+            self.assertNotIn("S1_LR", assignments)
+            self.assertEqual(assignments["S2_LR"], "8e-6")
+            self.assertEqual(assignments["STAGE2_DATASETS"], "sft,my_private_data")
+            self.assertEqual(assignments["MODEL_NAME"], "yaml-name")
+
     def test_training_preflight_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
