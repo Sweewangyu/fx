@@ -1,0 +1,27 @@
+# coding agent instructions
+CLAUDE.md
+
+# data
+/data/
+data.csv
+checkpoints/
+
+# training results and checkpoints
+results/
+configs/full_sweep/
+configs/paper/_runs/
+wandb/
+
+# TS-Haystack test plots output
+src/datasets/ts_haystack/test/plots/
+
+# others
+__pycache__/
+.env
+.DS_Store
+.vscode/
+/core
+aws/
+
+# paper LaTEX
+/paper/
