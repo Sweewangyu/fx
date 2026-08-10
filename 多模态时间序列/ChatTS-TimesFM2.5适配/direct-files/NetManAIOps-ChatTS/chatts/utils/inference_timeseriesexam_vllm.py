@@ -557,6 +557,7 @@ def main() -> None:
         num_gpus=args.num_gpus,
         gpus_per_model=args.gpus_per_model,
         batch_size=args.batch_size,
+        seed=args.seed,
     )
     try:
         client.wait_for_ready()

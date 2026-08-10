@@ -9,7 +9,8 @@ checkpoint 兼容：
 - `scripts/run_chatts_no_ragas_batch.sh`：逐 checkpoint 权重识别、评测和结果汇总脚本。
 - `scripts/inspect_chatts_ts_encoder_checkpoints.py`：只读扫描权重并盘点真实编码器。
 - `scripts/run_chatts_timeseriesexam.sh`：用原始数值时序评测 TimeSeriesExam。
-- `scripts/run_all_chatts_benchmarks.sh`：顺序执行四套 benchmark 并汇总运行状态。
+- `scripts/run_all_chatts_benchmarks.sh`：四套 benchmark 串行执行，每套独占全部 8 张卡。
+- `scripts/run_train_then_eval.sh`：宿主机一键执行 `chatts` 训练，再执行 `ragas` 评测。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
@@ -502,15 +503,25 @@ bash scripts/run_chatts_tinybenchmarks_mcq.sh --summary-only \
 
 ## 一次跑完四套 benchmark
 
-`scripts/run_all_chatts_benchmarks.sh` 会顺序执行 TSRBench 全任务、
+`scripts/run_all_chatts_benchmarks.sh` 会依次执行 TSRBench 全任务、
 tinyBenchmarks 五个 MCQ 任务、TS-Haystack 全域和 TimeSeriesExam 全量数据。
-每套评测在独立子进程中加载/释放模型，输出目录和日志彼此隔离；某套失败时默认继续
-执行其余评测，结束后统一打印 PASS/FAIL，并以非零状态退出。
+每套任务运行期间独占 `0,1,2,3,4,5,6,7`。三个时序评测各启动 4 个双卡
+vLLM worker；tinyBenchmarks 使用单个 8 卡 tensor-parallel 引擎。某套失败不会
+阻止后续评测继续执行；全部结束后统一生成
+`benchmark_status.tsv`、`run_manifest.json` 和 `all_benchmarks_summary.md`，只要
+存在失败任务，总脚本就返回非零状态。
 
 这个总控脚本固定使用 Chronos-2，不再自动判断或切换其他 encoder；四个子评测
-都会显式收到 `CHATTS_TS_ENCODER_TYPE=chronos2`。默认模型路径已经对应本项目的
-1.7B checkpoint，通常只需覆盖 TS-Haystack、TimeSeriesExam 的实际根目录和
-Chronos-2 本地主干路径：
+都会显式收到 `CHATTS_TS_ENCODER_TYPE=chronos2`。默认模型是训练流水线产生的
+8B Stage2 最佳权重：
+
+```text
+/share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1/best_seed42
+```
+
+四套评测统一使用 `seed=42`；TSRBench 与 tinyBenchmarks 已补齐 vLLM engine 和
+SamplingParams 的 seed，TS-Haystack 与 TimeSeriesExam 沿用各自已有的 seed 参数。
+通常只需确认 TS-Haystack、TimeSeriesExam 和 Chronos-2 的本地路径：
 
 ```bash
 cd /workspace/ChatTS/ChatTS-main
@@ -527,16 +538,61 @@ bash scripts/run_all_chatts_benchmarks.sh
 PREFLIGHT_ONLY=1 bash scripts/run_all_chatts_benchmarks.sh
 ```
 
-默认断点续跑，不覆盖已经完成的结果。全部重算时使用
-`FORCE_ALL=1`；只想跑部分套件时，将对应开关设为 0，例如：
+默认断点续跑，不覆盖已经完成的结果。全部重算时使用：
 
 ```bash
-RUN_TS_HAYSTACK=0 RUN_TIMESERIESEXAM=0 \
-bash scripts/run_all_chatts_benchmarks.sh
+FORCE_EVAL=1 bash scripts/run_all_chatts_benchmarks.sh
 ```
 
-tinyBenchmarks 默认同时评测训练前底座与 ChatTS checkpoint；若只需要 ChatTS
-绝对分数，可设置 `RUN_TINY_BASELINE=0`。详细路径和运行参数都集中在总控脚本顶部。
+tinyBenchmarks 在这个总控流程中只评测 Stage2 最佳模型，不加载训练前底座。
+冒烟测试可设置 `MAX_SAMPLES=2`，全量评测保持默认 `MAX_SAMPLES=0`。
+
+## 宿主机一键训练再评测
+
+训练文件需要复制到 `chatts` 容器挂载的 ChatTS-Training 项目：
+
+```bash
+cp /path/to/direct-files/scripts/finalize_chatts_best_checkpoint.py \
+  /workspace/ChatTS-Training/scripts/
+cp /path/to/direct-files/scripts/full/train_chronos2_best_stage1.sh \
+  /workspace/ChatTS-Training/scripts/full/
+cp /path/to/direct-files/scripts/full/train_chronos2_best_stage2.sh \
+  /workspace/ChatTS-Training/scripts/full/
+cp /path/to/direct-files/scripts/full/run_chronos2_best_two_stage.sh \
+  /workspace/ChatTS-Training/scripts/full/
+```
+
+评测文件按原相对路径复制到 `ragas` 中的
+`/workspace/ChatTS/ChatTS-main`，尤其要同时更新 `llm_utils.py`、四个 inference
+Python 文件、四个子 runner 和 `run_all_chatts_benchmarks.sh`。
+
+最后在宿主机运行本目录的入口，不需要手工进入任何容器：
+
+```bash
+cd /path/to/NetManAIOps-ChatTS
+SEED=42 bash scripts/run_train_then_eval.sh
+```
+
+它会先检查两个容器、8 张 GPU、代码和共享目录，再在 `chatts` 中依次完成
+Stage1/Stage2。LLaMAFactory 会在结束时把验证集 `eval_loss` 最优 checkpoint
+加载回内存并导出到阶段根目录；脚本验证该根目录后才删除 `checkpoint-*`。
+Stage2 成功后还会删除 Stage1 模型目录，最终只保留：
+
+```text
+/share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1/best_seed42
+```
+
+常用控制参数：
+
+```bash
+PREFLIGHT_ONLY=1 SEED=42 bash scripts/run_train_then_eval.sh  # 只检查，不运行
+MAX_SAMPLES=2 SEED=42 bash scripts/run_train_then_eval.sh     # 训练后做四套冒烟评测
+FORCE_TRAIN=1 FORCE_EVAL=1 SEED=42 bash scripts/run_train_then_eval.sh
+```
+
+正常重跑具有幂等性：`TRAINING_COMPLETE.json` 与参数一致时复用最终模型；目录存在
+但没有有效完成标记时会停止，不会静默覆盖。只有显式设置 `FORCE_TRAIN=1` 才会删除
+该 seed 对应的 Stage1 临时目录和最终模型目录。
 
 ## 正确启动标志
 

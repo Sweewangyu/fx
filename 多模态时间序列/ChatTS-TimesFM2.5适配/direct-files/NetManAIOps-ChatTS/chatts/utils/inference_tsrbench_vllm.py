@@ -505,6 +505,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-chunk-size", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-retries", type=int, default=0)
     parser.add_argument("--max-input-tokens", type=int, default=0)
     parser.add_argument(
@@ -581,6 +582,8 @@ def main() -> None:
         raise ValueError("--num-gpus must be divisible by --gpus-per-model")
     if args.request_chunk_size < 1:
         raise ValueError("--request-chunk-size must be positive")
+    if args.seed < 0:
+        raise ValueError("--seed must be non-negative")
     if (
         args.max_retries < 0
         or args.max_input_tokens < 0
@@ -612,6 +615,7 @@ def main() -> None:
         max_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=1.0,
+        seed=args.seed,
         stop=stop_strings,
     )
     client = LLMClient(
@@ -620,6 +624,7 @@ def main() -> None:
         num_gpus=args.num_gpus,
         gpus_per_model=args.gpus_per_model,
         batch_size=args.batch_size,
+        seed=args.seed,
     )
 
     try:

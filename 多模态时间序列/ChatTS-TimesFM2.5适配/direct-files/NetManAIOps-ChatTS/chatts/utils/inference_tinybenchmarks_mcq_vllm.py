@@ -471,6 +471,7 @@ def evaluate_task(
     output_dir: Path,
     request_chunk_size: int,
     max_model_len: int,
+    seed: int,
 ) -> dict[str, Any]:
     from vllm import SamplingParams
 
@@ -493,6 +494,7 @@ def evaluate_task(
         max_tokens=1,
         prompt_logprobs=0,
         detokenize=False,
+        seed=seed,
     )
     for start in range(0, len(encoded), request_chunk_size):
         batch = encoded[start : start + request_chunk_size]
@@ -578,6 +580,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--dtype", default="auto")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--allow-size-mismatch", action="store_true")
     parser.add_argument("--inspect-data-only", action="store_true")
@@ -588,6 +591,8 @@ def main() -> int:
     args = parse_args()
     if args.num_gpus < 1 or args.request_chunk_size < 1 or args.max_model_len < 2:
         raise SystemExit("GPU count, request chunk size, and max model length must be positive")
+    if args.seed < 0:
+        raise SystemExit("--seed must be non-negative")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise SystemExit("--gpu-memory-utilization must be in (0, 1]")
     task_names = [canonical_task(item.strip()) for item in args.tasks.split(",") if item.strip()]
@@ -641,6 +646,7 @@ def main() -> int:
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "dtype": args.dtype,
         "enable_prefix_caching": False,
+        "seed": args.seed,
     }
     if _is_chatts_config(config):
         llm_kwargs["limit_mm_per_prompt"] = {"timeseries": 50}
@@ -663,6 +669,7 @@ def main() -> int:
             output_dir,
             args.request_chunk_size,
             args.max_model_len,
+            args.seed,
         )
 
     macro = math.fsum(item["score"] for item in task_results.values()) / len(task_results)
@@ -674,6 +681,7 @@ def main() -> int:
         "tasks": task_results,
         "macro_score": macro,
         "num_tasks": len(task_results),
+        "seed": args.seed,
         "note": (
             "Raw 100-item tiny-set metrics only; no GPIRT/IRT++ extrapolation is applied. "
             "tinyTruthfulQA is MC2 probability mass; other tasks are length-normalized accuracy."

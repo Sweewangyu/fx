@@ -15,6 +15,7 @@ REQUEST_CHUNK_SIZE="${REQUEST_CHUNK_SIZE:-32}"
 MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-8192}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 DTYPE="${DTYPE:-auto}"
+SEED="${SEED:-42}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 ALLOW_SIZE_MISMATCH="${ALLOW_SIZE_MISMATCH:-0}"
 FORCE="${FORCE:-0}"
@@ -59,6 +60,7 @@ Useful environment variables:
   REQUEST_CHUNK_SIZE=32           Candidate prompts submitted per call.
   CHATTS_VLLM_MAX_MODEL_LEN=8192  vLLM context allocation.
   MAX_SAMPLES=5                   Smoke-test only the first N examples.
+  SEED=42                         vLLM engine/sampling seed.
   OFFLINE=1                       Force local Hugging Face files (default: 1).
 
 For external TS encoders the checkpoint type is auto-detected. Only its local
@@ -188,6 +190,7 @@ if [[ "$SUMMARY_ONLY" != "1" ]]; then
         --max-model-len "$MAX_MODEL_LEN"
         --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
         --dtype "$DTYPE"
+        --seed "$SEED"
         --max-samples "$MAX_SAMPLES"
     )
     for task_file in "${TASK_FILE_SPECS[@]}"; do
@@ -257,6 +260,7 @@ PY
         echo " ChatTS model:   $is_chatts"
         echo " TS encoder:     $encoder_type"
         echo " Tensor parallel:$NUM_GPUS"
+        echo " Seed:           $SEED"
         echo " Output:         $model_output"
         echo "============================================================"
 

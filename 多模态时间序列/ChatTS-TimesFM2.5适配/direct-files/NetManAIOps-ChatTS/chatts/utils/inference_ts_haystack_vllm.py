@@ -487,6 +487,7 @@ def main() -> None:
         gpus_per_model=args.gpus_per_model,
         batch_size=args.batch_size,
         system_prompt=args.system_prompt,
+        seed=args.seed,
     )
 
     try:

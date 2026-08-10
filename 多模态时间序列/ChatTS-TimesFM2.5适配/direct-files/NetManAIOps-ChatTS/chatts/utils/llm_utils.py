@@ -49,6 +49,7 @@ NUM_GPUS = _DATAGEN_CONFIG["num_gpus"]  # Num of GPUs to use
 GPUS_PER_MODEL = _DATAGEN_CONFIG["gpu_per_model"]  # Num of GPUs per model
 BATCH_SIZE = 32
 ENGINE = 'vllm'
+DEFAULT_SEED = int(os.environ.get("CHATTS_VLLM_SEED", "42"))
 
 
 def worker_llama_cpp(input_queue, output_queue, gpu_id, batch_size, sample_n, finished_flag, ready_cnt, model_path=MODEL_PATH):
@@ -101,14 +102,14 @@ def worker_llama_cpp(input_queue, output_queue, gpu_id, batch_size, sample_n, fi
         logger.error(f"[worker {gpu_id}] {err}")
         time.sleep(5)
 
-def worker_vllm(input_queue, output_queue, gpu_id, batch_size, sample_n, finished_flag, ready_cnt, model_path=MODEL_PATH):
+def worker_vllm(input_queue, output_queue, gpu_id, batch_size, sample_n, finished_flag, ready_cnt, model_path=MODEL_PATH, seed=DEFAULT_SEED):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
     try:
         from vllm import LLM, SamplingParams
-        default_sampling_params = SamplingParams(temperature=0.5, top_p=0.95, max_tokens=CTX_LENGTH, stop_token_ids=[151643, 151645], stop=['<|endoftext|>', '<|im_end|>'], n=sample_n)
-        llm = LLM(model=model_path, trust_remote_code=True, max_model_len=CTX_LENGTH, tensor_parallel_size=len(gpu_id.split(',')), gpu_memory_utilization=0.95, dtype='half')
-        print(f"[worker {gpu_id}] Initialization finished.")
+        default_sampling_params = SamplingParams(temperature=0.5, top_p=0.95, max_tokens=CTX_LENGTH, stop_token_ids=[151643, 151645], stop=['<|endoftext|>', '<|im_end|>'], n=sample_n, seed=seed)
+        llm = LLM(model=model_path, trust_remote_code=True, max_model_len=CTX_LENGTH, tensor_parallel_size=len(gpu_id.split(',')), gpu_memory_utilization=0.95, dtype='half', seed=seed)
+        print(f"[worker {gpu_id}] Initialization finished (seed={seed}).")
         ready_cnt.value = ready_cnt.value + 1
 
         while not finished_flag.get():
@@ -159,15 +160,15 @@ def worker_vllm(input_queue, output_queue, gpu_id, batch_size, sample_n, finishe
         traceback.print_exc()
         time.sleep(5)
 
-def worker_vllm_ts(input_queue, output_queue, gpu_id, batch_size, sample_n, finished_flag, ready_cnt, model_path=MODEL_PATH):
+def worker_vllm_ts(input_queue, output_queue, gpu_id, batch_size, sample_n, finished_flag, ready_cnt, model_path=MODEL_PATH, seed=DEFAULT_SEED):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
     try:
         from vllm import LLM, SamplingParams
         import chatts.vllm.chatts_vllm
-        default_sampling_params = SamplingParams(temperature=0.5, top_p=0.95, max_tokens=CTX_LENGTH, stop_token_ids=[151643, 151645], stop=['<|endoftext|>', '<|im_end|>'], n=sample_n)
+        default_sampling_params = SamplingParams(temperature=0.5, top_p=0.95, max_tokens=CTX_LENGTH, stop_token_ids=[151643, 151645], stop=['<|endoftext|>', '<|im_end|>'], n=sample_n, seed=seed)
         max_model_len = int(os.environ.get("CHATTS_VLLM_MAX_MODEL_LEN", CTX_LENGTH))
-        llm = LLM(model=model_path, trust_remote_code=True, max_model_len=max_model_len, tensor_parallel_size=len(gpu_id.split(',')), gpu_memory_utilization=0.95, limit_mm_per_prompt={"timeseries": 50}, enable_prefix_caching=False)
+        llm = LLM(model=model_path, trust_remote_code=True, max_model_len=max_model_len, tensor_parallel_size=len(gpu_id.split(',')), gpu_memory_utilization=0.95, limit_mm_per_prompt={"timeseries": 50}, enable_prefix_caching=False, seed=seed)
         effective_model_config = getattr(
             getattr(llm, "llm_engine", None), "model_config", None
         )
@@ -177,7 +178,7 @@ def worker_vllm_ts(input_queue, output_queue, gpu_id, batch_size, sample_n, fini
         print(
             f"[worker {gpu_id}] Initialization finished "
             f"(requested_max_model_len={max_model_len}, "
-            f"effective_max_model_len={effective_max_model_len})."
+            f"effective_max_model_len={effective_max_model_len}, seed={seed})."
         )
         ready_cnt.value = ready_cnt.value + 1
 
@@ -278,7 +279,7 @@ def worker_dryrun(input_queue: multiprocessing.Queue, output_queue, gpu_id, batc
 
 
 class LLMClient:
-    def __init__(self, model_path=MODEL_PATH, engine=ENGINE, num_gpus=NUM_GPUS, gpu_range: Optional[List[int]]=None, gpus_per_model=GPUS_PER_MODEL, batch_size=BATCH_SIZE, sample_n: int=1, chat_template: Optional[str]=None, system_prompt: str="You are a helpful assistant."):
+    def __init__(self, model_path=MODEL_PATH, engine=ENGINE, num_gpus=NUM_GPUS, gpu_range: Optional[List[int]]=None, gpus_per_model=GPUS_PER_MODEL, batch_size=BATCH_SIZE, sample_n: int=1, chat_template: Optional[str]=None, system_prompt: str="You are a helpful assistant.", seed: int=DEFAULT_SEED):
         # Create clients
         manager = multiprocessing.Manager()
         self.input_queue = manager.Queue()
@@ -287,6 +288,9 @@ class LLMClient:
         self.ready_cnt = manager.Value('i', 0)
         self.engine = engine
         self.sample_n = sample_n
+        self.seed = int(seed)
+        if self.seed < 0:
+            raise ValueError(f"seed must be non-negative, got {self.seed}")
 
         # Apply chat template
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -296,7 +300,28 @@ class LLMClient:
             self.tokenizer.chat_template = chat_template
 
         if gpu_range is None:
-            gpu_range = list(range(num_gpus))
+            # Preserve an outer CUDA_VISIBLE_DEVICES allocation.  The old
+            # range(num_gpus) logic made a suite launched on physical GPUs
+            # 4,5 overwrite its worker mask with 0,1 and collide with another
+            # parallel suite.  Tokens may also be GPU UUIDs, so keep strings.
+            visible_devices = [
+                item.strip()
+                for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+                if item.strip()
+            ]
+            if visible_devices:
+                if len(visible_devices) < num_gpus:
+                    raise ValueError(
+                        f"CUDA_VISIBLE_DEVICES exposes {len(visible_devices)} GPU(s), "
+                        f"but num_gpus={num_gpus}"
+                    )
+                gpu_range = visible_devices[:num_gpus]
+                print(
+                    "[LLMClient] Respecting outer CUDA_VISIBLE_DEVICES: "
+                    f"{','.join(gpu_range)}"
+                )
+            else:
+                gpu_range = list(range(num_gpus))
         else:
             print(f"[LLMClient] Using GPU range: {gpu_range}")
 
@@ -307,9 +332,9 @@ class LLMClient:
             if engine == 'llama':
                 p = multiprocessing.Process(target=worker_llama_cpp, args=(self.input_queue, self.output_queue, gpu_id_str, batch_size, sample_n, self.finished_flag, self.ready_cnt, model_path))
             elif engine == 'vllm':
-                p = multiprocessing.Process(target=worker_vllm, args=(self.input_queue, self.output_queue, gpu_id_str, batch_size, sample_n, self.finished_flag, self.ready_cnt, model_path))
+                p = multiprocessing.Process(target=worker_vllm, args=(self.input_queue, self.output_queue, gpu_id_str, batch_size, sample_n, self.finished_flag, self.ready_cnt, model_path, self.seed))
             elif engine == 'vllm-ts':
-                p = multiprocessing.Process(target=worker_vllm_ts, args=(self.input_queue, self.output_queue, gpu_id_str, batch_size, sample_n, self.finished_flag, self.ready_cnt, model_path))
+                p = multiprocessing.Process(target=worker_vllm_ts, args=(self.input_queue, self.output_queue, gpu_id_str, batch_size, sample_n, self.finished_flag, self.ready_cnt, model_path, self.seed))
             elif engine == 'dryrun':
                 p = multiprocessing.Process(target=worker_dryrun, args=(self.input_queue, self.output_queue, gpu_id_str, batch_size, sample_n, self.finished_flag, self.ready_cnt, model_path))
             else:
@@ -317,7 +342,7 @@ class LLMClient:
             self.processes.append(p)
             p.start()
 
-        print(f"[LLMClient] {len(self.processes)} workers started.")
+        print(f"[LLMClient] {len(self.processes)} workers started (seed={self.seed}).")
 
     def wait_for_ready(self):
         while self.ready_cnt.value < len(self.processes):

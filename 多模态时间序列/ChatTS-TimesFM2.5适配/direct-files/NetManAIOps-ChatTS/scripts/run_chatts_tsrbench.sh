@@ -20,6 +20,7 @@ NUM_GPUS_PER_PROCESS="${NUM_GPUS_PER_PROCESS:-2}"
 REQUEST_CHUNK_SIZE="${REQUEST_CHUNK_SIZE:-128}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 FORCE_INFERENCE="${FORCE_INFERENCE:-0}"
+SEED="${SEED:-42}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 case "$PROMPT_MODE" in
@@ -139,6 +140,7 @@ INFER_ARGS=(
     --prompt-mode "$PROMPT_MODE"
     --max-new-tokens "$MAX_NEW_TOKENS"
     --temperature "$TEMPERATURE"
+    --seed "$SEED"
     --max-retries "$MAX_RETRIES"
     --max-input-tokens "$MAX_INPUT_TOKENS"
     --max-processed-input-tokens "$MAX_PROCESSED_INPUT_TOKENS"
@@ -165,6 +167,7 @@ echo " Max model len:$CHATTS_VLLM_MAX_MODEL_LEN"
 echo " Max processed input: $MAX_PROCESSED_INPUT_TOKENS"
 echo " Max new tokens: $MAX_NEW_TOKENS"
 echo " Temperature:  $TEMPERATURE"
+echo " Seed:         $SEED"
 if [[ "$PROMPT_MODE" == "official" ]]; then
     echo " Thinking:     enabled by TSRBench <think>/<answer> prompt"
 else
