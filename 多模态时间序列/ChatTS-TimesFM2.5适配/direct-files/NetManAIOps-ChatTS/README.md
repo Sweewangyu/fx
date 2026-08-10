@@ -9,6 +9,7 @@ checkpoint 兼容：
 - `scripts/run_chatts_no_ragas_batch.sh`：逐 checkpoint 权重识别、评测和结果汇总脚本。
 - `scripts/inspect_chatts_ts_encoder_checkpoints.py`：只读扫描权重并盘点真实编码器。
 - `scripts/run_chatts_timeseriesexam.sh`：用原始数值时序评测 TimeSeriesExam。
+- `scripts/run_all_chatts_benchmarks.sh`：顺序执行四套 benchmark 并汇总运行状态。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
@@ -498,6 +499,44 @@ bash scripts/run_chatts_tinybenchmarks_mcq.sh --summary-only \
   --model chatts=/workspace/ChatTS/ChatTS-main/exp/tinybenchmarks_mcq/chatts \
   --baseline base
 ```
+
+## 一次跑完四套 benchmark
+
+`scripts/run_all_chatts_benchmarks.sh` 会顺序执行 TSRBench 全任务、
+tinyBenchmarks 五个 MCQ 任务、TS-Haystack 全域和 TimeSeriesExam 全量数据。
+每套评测在独立子进程中加载/释放模型，输出目录和日志彼此隔离；某套失败时默认继续
+执行其余评测，结束后统一打印 PASS/FAIL，并以非零状态退出。
+
+这个总控脚本固定使用 Chronos-2，不再自动判断或切换其他 encoder；四个子评测
+都会显式收到 `CHATTS_TS_ENCODER_TYPE=chronos2`。默认模型路径已经对应本项目的
+1.7B checkpoint，通常只需覆盖 TS-Haystack、TimeSeriesExam 的实际根目录和
+Chronos-2 本地主干路径：
+
+```bash
+cd /workspace/ChatTS/ChatTS-main
+
+TS_HAYSTACK_ROOT=/workspace/TS-Haystack \
+TIMESERIESEXAM_ROOT=/workspace/TimeSeriesExam \
+CHRONOS2_MODEL_PATH=/workspace/chronos2 \
+bash scripts/run_all_chatts_benchmarks.sh
+```
+
+先只检查模型、数据、runner 与 GPU 路径而不启动推理：
+
+```bash
+PREFLIGHT_ONLY=1 bash scripts/run_all_chatts_benchmarks.sh
+```
+
+默认断点续跑，不覆盖已经完成的结果。全部重算时使用
+`FORCE_ALL=1`；只想跑部分套件时，将对应开关设为 0，例如：
+
+```bash
+RUN_TS_HAYSTACK=0 RUN_TIMESERIESEXAM=0 \
+bash scripts/run_all_chatts_benchmarks.sh
+```
+
+tinyBenchmarks 默认同时评测训练前底座与 ChatTS checkpoint；若只需要 ChatTS
+绝对分数，可设置 `RUN_TINY_BASELINE=0`。详细路径和运行参数都集中在总控脚本顶部。
 
 ## 正确启动标志
 
