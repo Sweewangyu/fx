@@ -1,0 +1,25 @@
+{
+  "data_version": "datav2",
+  "total_rows": 794235,
+  "total_unique_templates": 229834,
+  "overall_template_compression_ratio": 3.456,
+  "invalid_rows": 0,
+  "datasets": [
+    {"name": "chatts_align_256", "rows": 102374, "templates": 30861, "compression_ratio": 3.317},
+    {"name": "chatts_align_random", "rows": 103190, "templates": 31058, "compression_ratio": 3.322},
+    {"name": "chatts_ift", "rows": 6373, "templates": 6336, "compression_ratio": 1.006},
+    {"name": "chatts_sft", "rows": 44802, "templates": 42992, "compression_ratio": 1.042},
+    {"name": "chatts_dev", "rows": 1000, "templates": 484, "compression_ratio": 2.066},
+    {"name": "time_mqa", "rows": 151367, "templates": 32976, "compression_ratio": 4.59},
+    {"name": "tsaqa", "rows": 140865, "templates": 59031, "compression_ratio": 2.386},
+    {"name": "time_r1", "rows": 623, "templates": 7, "compression_ratio": 89.0},
+    {"name": "opentslm_tsqa", "rows": 43259, "templates": 4, "compression_ratio": 10814.75},
+    {"name": "opentslm_har_cot", "rows": 68542, "templates": 80, "compression_ratio": 856.775},
+    {"name": "opentslm_sleep_cot", "rows": 8284, "templates": 11, "compression_ratio": 753.091},
+    {"name": "opentslm_ecg_qa_cot", "rows": 21817, "templates": 18871, "compression_ratio": 1.156},
+    {"name": "opentslm_pamap2_cot", "rows": 4793, "templates": 216, "compression_ratio": 22.19},
+    {"name": "opentslm_m4_caption", "rows": 89808, "templates": 18, "compression_ratio": 4989.333},
+    {"name": "timemaster_ctu", "rows": 250, "templates": 1, "compression_ratio": 250.0},
+    {"name": "nba_quarter_events", "rows": 6888, "templates": 6888, "compression_ratio": 1.0}
+  ]
+}

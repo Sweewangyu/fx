@@ -1,0 +1,80 @@
+# datav2 是 datataste/data 下去重后的完整规范数据版本，共 794,235 条。
+# 路径相对于本 YAML；服务器保持 SFT_CURATOR 与 datataste 为同级目录即可直接使用。
+# 顺序按“先用较少模板覆盖较多样本，再处理高成本来源”排列。
+datasets:
+  - name: time_r1
+    input: ../datataste/data/versions/datav2/files/time_r1.jsonl
+    output: labels/time_r1.quality-difficulty.jsonl
+
+  - name: opentslm_tsqa
+    input: ../datataste/data/versions/datav2/files/opentslm_tsqa.jsonl
+    output: labels/opentslm_tsqa.quality-difficulty.jsonl
+
+  - name: opentslm_har_cot
+    input: ../datataste/data/versions/datav2/files/opentslm_har_cot.jsonl
+    output: labels/opentslm_har_cot.quality-difficulty.jsonl
+
+  - name: opentslm_sleep_cot
+    input: ../datataste/data/versions/datav2/files/opentslm_sleep_cot.jsonl
+    output: labels/opentslm_sleep_cot.quality-difficulty.jsonl
+
+  - name: opentslm_pamap2_cot
+    input: ../datataste/data/versions/datav2/files/opentslm_pamap2_cot.jsonl
+    output: labels/opentslm_pamap2_cot.quality-difficulty.jsonl
+
+  - name: opentslm_m4_caption
+    input: ../datataste/data/versions/datav2/files/opentslm_m4_caption.jsonl
+    output: labels/opentslm_m4_caption.quality-difficulty.jsonl
+
+  - name: timemaster_ctu
+    input: ../datataste/data/versions/datav2/files/timemaster_ctu.jsonl
+    output: labels/timemaster_ctu.quality-difficulty.jsonl
+
+  - name: chatts_dev
+    input: ../datataste/data/versions/datav2/files/chatts_dev.jsonl
+    output: labels/chatts_dev.quality-difficulty.jsonl
+
+  - name: nba_quarter_events
+    input: ../datataste/data/versions/datav2/files/nba_quarter_events.jsonl
+    output: labels/nba_quarter_events.quality-difficulty.jsonl
+
+  - name: chatts_ift
+    input: ../datataste/data/versions/datav2/files/chatts_ift.jsonl
+    output: labels/chatts_ift.quality-difficulty.jsonl
+
+  - name: opentslm_ecg_qa_cot
+    input: ../datataste/data/versions/datav2/files/opentslm_ecg_qa_cot.jsonl
+    output: labels/opentslm_ecg_qa_cot.quality-difficulty.jsonl
+
+  - name: time_mqa
+    input: ../datataste/data/versions/datav2/files/time_mqa.jsonl
+    output: labels/time_mqa.quality-difficulty.jsonl
+
+  - name: tsaqa
+    input: ../datataste/data/versions/datav2/files/tsaqa.jsonl
+    output: labels/tsaqa.quality-difficulty.jsonl
+
+  - name: chatts_sft
+    input: ../datataste/data/versions/datav2/files/chatts_sft.jsonl
+    output: labels/chatts_sft.quality-difficulty.jsonl
+
+  - name: chatts_align_256
+    input: ../datataste/data/versions/datav2/files/chatts_align_256.jsonl
+    output: labels/chatts_align_256.quality-difficulty.jsonl
+
+  - name: chatts_align_random
+    input: ../datataste/data/versions/datav2/files/chatts_align_random.jsonl
+    output: labels/chatts_align_random.quality-difficulty.jsonl
+
+deepseek:
+  base_url: http://localhost:30000/v1
+  model: /models
+  api_key_env: DEEPSEEK_API_KEY
+  concurrency: 8
+  timeout_seconds: 120
+  retries: 2
+  max_tokens: 256
+  thinking: true
+  reasoning_effort: max
+  trust_env: false
+  progress_every_templates: 50
