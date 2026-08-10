@@ -14,10 +14,12 @@
 
 from transformers import AutoTokenizer
 import multiprocessing
+import queue
 from tqdm import tqdm
 import json
 import yaml
 import os
+from pathlib import Path
 from loguru import logger
 from json_repair import repair_json
 import re
@@ -28,10 +30,23 @@ from typing import *
 
 
 # Config
-MODEL_PATH = yaml.safe_load(open("config/datagen_config.yaml"))["local_llm_path"]  # Path to the local LLM model
+# Resolve this file relative to the ChatTS checkout instead of the process CWD.
+# The TS-Haystack adapter deliberately runs with TS-Haystack as CWD because its
+# official loaders use ``data/...`` paths.  vLLM spawn workers import this
+# module again, so a CWD-relative config path would make them fail before model
+# registration/loading starts.
+_DATAGEN_CONFIG_PATH = (
+    Path(os.environ.get("CHATTS_DATAGEN_CONFIG", "")).expanduser()
+    if os.environ.get("CHATTS_DATAGEN_CONFIG")
+    else Path(__file__).resolve().parents[2] / "config" / "datagen_config.yaml"
+)
+with _DATAGEN_CONFIG_PATH.open("r", encoding="utf-8") as _config_stream:
+    _DATAGEN_CONFIG = yaml.safe_load(_config_stream)
+
+MODEL_PATH = _DATAGEN_CONFIG["local_llm_path"]  # Path to the local LLM model
 CTX_LENGTH = 5000
-NUM_GPUS = yaml.safe_load(open("config/datagen_config.yaml"))["num_gpus"]  # Num of GPUs to use
-GPUS_PER_MODEL = yaml.safe_load(open("config/datagen_config.yaml"))["gpu_per_model"]  # Num of GPUs per model
+NUM_GPUS = _DATAGEN_CONFIG["num_gpus"]  # Num of GPUs to use
+GPUS_PER_MODEL = _DATAGEN_CONFIG["gpu_per_model"]  # Num of GPUs per model
 BATCH_SIZE = 32
 ENGINE = 'vllm'
 
@@ -306,6 +321,16 @@ class LLMClient:
 
     def wait_for_ready(self):
         while self.ready_cnt.value < len(self.processes):
+            stopped = [
+                (process.pid, process.exitcode)
+                for process in self.processes
+                if not process.is_alive()
+            ]
+            if stopped:
+                raise RuntimeError(
+                    "LLM worker stopped before initialization completed: "
+                    f"{stopped}. Check the worker traceback above."
+                )
             time.sleep(1)
         print(f"[LLMClient] All workers are ready!")
 
@@ -354,7 +379,20 @@ class LLMClient:
 
         with tqdm(total=total_cnt, desc="Generating") as pbar:
             while len(answer_dict) < total_cnt:
-                line = self.output_queue.get()
+                try:
+                    line = self.output_queue.get(timeout=5)
+                except queue.Empty:
+                    stopped = [
+                        (process.pid, process.exitcode)
+                        for process in self.processes
+                        if not process.is_alive()
+                    ]
+                    if stopped:
+                        raise RuntimeError(
+                            "LLM worker stopped before all generations returned: "
+                            f"{stopped}. Check the worker traceback above."
+                        )
+                    continue
                 pbar.update()
 
                 # Append to answer

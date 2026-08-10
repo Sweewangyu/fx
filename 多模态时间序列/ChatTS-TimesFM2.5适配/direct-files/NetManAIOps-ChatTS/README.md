@@ -316,6 +316,32 @@ fallback warning。
 `accuracy_strict=正确数/数据集总数` 与 `accuracy_parsed=正确数/成功解析数`，避免
 因漏答或格式错误而虚高。
 
+## TS-Haystack：四域长上下文评测
+
+新增的 `inference_ts_haystack_vllm.py` 直接复用
+`AI-X-Labs/TS-Haystack` 官方 dataset class，支持 Capture24、Sleep PSG
+stages/arousals、LTAF ECG 与 UK-DALE。信号加载/重建、prompt、答案
+类型解析、时间段 IoU 和 timestamp 容差都调用官方实现，不使用
+judge model，也不会暗中下采样超长信号。
+
+完整的数据布局、文件覆盖、四种 encoder 运行示例、长序列覆盖率与
+汇总表定义见 [`TS_HAYSTACK.md`](./TS_HAYSTACK.md)。最小冒烟测试：
+
+```bash
+PROJECT_ROOT=/workspace/ChatTS/ChatTS-main \
+TS_HAYSTACK_ROOT=/workspace/TS-Haystack \
+MODEL_PATH=/workspace/checkpoints/my-chatts \
+DATASETS="capture24 uk_dale" \
+TASKS="existence localization" \
+CONTEXT_LENGTHS="100 900" \
+MAX_SAMPLES=20 \
+bash scripts/run_chatts_ts_haystack.sh
+```
+
+结果会生成逐样本 JSON，以及包含 overall/per-dataset/per-task/per-context
+的 JSON/CSV 汇总。`Strict` 把输入过长样本留在总分母中，`GenAcc`
+只统计实际生成的样本，因此不会把 encoder 的上下文覆盖差异藏起来。
+
 ## tinyBenchmarks 选择题：通用能力与灾难性遗忘筛查
 
 这个版本不安装 `lm-eval`、`tinyBenchmarks` 或任何新环境，直接使用 ChatTS
