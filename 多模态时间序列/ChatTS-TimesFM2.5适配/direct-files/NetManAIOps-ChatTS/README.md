@@ -8,6 +8,7 @@ checkpoint 兼容：
 - `chatts/vllm/zeus_modeling.py`：Zeus 官方 checkpoint 兼容的 eager-attention 结构。
 - `scripts/run_chatts_no_ragas_batch.sh`：逐 checkpoint 权重识别、评测和结果汇总脚本。
 - `scripts/inspect_chatts_ts_encoder_checkpoints.py`：只读扫描权重并盘点真实编码器。
+- `scripts/run_chatts_timeseriesexam.sh`：用原始数值时序评测 TimeSeriesExam。
 
 适配基线为 NetManAIOps/ChatTS `a16ca1a`。用户报错栈中的原文件行号与该基线一致。
 
@@ -341,6 +342,32 @@ bash scripts/run_chatts_ts_haystack.sh
 结果会生成逐样本 JSON，以及包含 overall/per-dataset/per-task/per-context
 的 JSON/CSV 汇总。`Strict` 把输入过长样本留在总分母中，`GenAcc`
 只统计实际生成的样本，因此不会把 encoder 的上下文覆盖差异藏起来。
+
+## TimeSeriesExam：基础时序理解考试
+
+新增适配直接读取官方 TimeSeriesExam 的单序列 `ts` 或双序列 `ts1/ts2` 原始
+数组，通过 ChatTS vLLM `timeseries` 模态推理，不需要转图片或逗号文本。
+它支持 MLP-Patch、TimesFM 2.5、Chronos-2、Zeus，并默认对齐官方评测 shell：
+固定 one-shot 示例、hint、最多 3 个 concepts 及示例、`temperature=0`、
+`seed=42`、`max_new_tokens=1024`；额外 Qwen3 thinking 保持关闭。
+
+完整的数据下载、文件覆盖、四后端命令、prompt 消融和指标定义见
+[`TIMESERIESEXAM.md`](./TIMESERIESEXAM.md)。最小冒烟测试：
+
+```bash
+PROJECT_ROOT=/workspace/ChatTS/ChatTS-main \
+TIMESERIESEXAM_ROOT=/workspace/TimeSeriesExam \
+MODEL_PATH=/workspace/checkpoints/my-chatts \
+NUM_GPUS=2 \
+NUM_GPUS_PER_PROCESS=2 \
+MAX_SAMPLES=20 \
+OUTPUT_ROOT=/workspace/results/timeseriesexam-smoke \
+bash scripts/run_chatts_timeseriesexam.sh
+```
+
+主表同时给出官方 `B) 选项正文` substring 规则的 `Official`、官方最后一行
+`Strict`，以及稳健字母解析的 `LetterAcc`。这样既能复现论文协议，也能识别
+“字母答对但输出格式没完全对齐”造成的误判。
 
 ## tinyBenchmarks 选择题：通用能力与灾难性遗忘筛查
 
