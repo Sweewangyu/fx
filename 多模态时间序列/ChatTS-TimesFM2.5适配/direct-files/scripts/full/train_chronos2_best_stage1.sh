@@ -64,6 +64,8 @@ fi
 echo "[Stage1] seed=$SEED lr=$LR ts_lr=$STAGE1_TIMESERIES_SFT_LR base=$MODEL_PATH output=$STAGE1_OUT"
 echo "[Stage1] dataset_dir=$DATASET_DIR datasets=$STAGE1_DATASETS mix=$STAGE1_MIX_STRATEGY interleave_probs=${STAGE1_INTERLEAVE_PROBS:-<none>}"
 cd "$PROJECT_ROOT"
+# DeepSpeed must retain optimizer/scheduler state for Trainer to reload the
+# best checkpoint at the end, so save_only_model must remain False.
 deepspeed --include "$DEEPSPEED_INCLUDE" --master_port="$MASTER_PORT" src/train.py \
     --deepspeed ds_config/ds_config_2.json \
     --stage sft \
@@ -88,7 +90,7 @@ deepspeed --include "$DEEPSPEED_INCLUDE" --master_port="$MASTER_PORT" src/train.
     "${TRAIN_LENGTH_ARGS[@]}" \
     --plot_loss \
     --bf16 \
-    --save_only_model True \
+    --save_only_model False \
     --save_safetensors False \
     --preprocessing_num_workers "$STAGE1_PREPROCESSING_NUM_WORKERS" \
     --overwrite_cache \

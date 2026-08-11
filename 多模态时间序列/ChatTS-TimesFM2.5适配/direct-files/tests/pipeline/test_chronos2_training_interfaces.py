@@ -92,6 +92,22 @@ printf '%s\n' "$@" >> "$CAPTURE_PATH"
             positions = [index for index, value in enumerate(args) if value == "--dataset_dir"]
             self.assertEqual(len(positions), 2)
             self.assertEqual({args[index + 1] for index in positions}, {str(dataset)})
+            save_only_positions = [
+                index for index, value in enumerate(args) if value == "--save_only_model"
+            ]
+            self.assertEqual(len(save_only_positions), 2)
+            self.assertEqual(
+                {args[index + 1] for index in save_only_positions}, {"False"}
+            )
+            best_model_positions = [
+                index
+                for index, value in enumerate(args)
+                if value == "--load_best_model_at_end"
+            ]
+            self.assertEqual(len(best_model_positions), 2)
+            self.assertEqual(
+                {args[index + 1] for index in best_model_positions}, {"True"}
+            )
 
 
 class PipelineModeTest(unittest.TestCase):
