@@ -16,7 +16,6 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-
 KEY_TO_ENV = {
     "pipeline.seed": "SEED",
     "pipeline.force_train": "FORCE_TRAIN",
@@ -32,6 +31,8 @@ KEY_TO_ENV = {
     "training.output_root": "TRAIN_OUTPUT_ROOT",
     "training.final_model_path": "FINAL_MODEL_PATH",
     "training.chronos2_model_path": "TRAIN_CHRONOS2_MODEL_PATH",
+    "training.dataset_dir": "DATASET_DIR",
+    "training.keep_stage1": "KEEP_STAGE1",
     "training.deepspeed_include": "DEEPSPEED_INCLUDE",
     "training.master_port": "MASTER_PORT",
     "training.stage1.learning_rate": "S1_LR",
@@ -80,6 +81,12 @@ KEY_TO_ENV = {
     "evaluation.ts_haystack_root": "TS_HAYSTACK_ROOT",
     "evaluation.timeseriesexam_root": "TIMESERIESEXAM_ROOT",
     "evaluation.timeseriesexam_data_file": "TIMESERIESEXAM_DATA_FILE",
+    "evaluation.benchmarks": "BENCHMARKS",
+    "evaluation.run_id": "RUN_ID",
+    "evaluation.protocol_hash": "EVAL_PROTOCOL_HASH",
+    "evaluation.haystack_split": "HAYSTACK_SPLIT",
+    "evaluation.tiny_data_partition": "TINY_DATA_PARTITION",
+    "evaluation.tiny_partition_seed": "TINY_PARTITION_SEED",
 }
 
 
@@ -154,7 +161,7 @@ def load_yaml(path: Path) -> dict[str, Any]:
     if payload is None:
         return {}
     if not isinstance(payload, dict):
-        raise ValueError("top-level YAML value must be a mapping")
+        raise TypeError("top-level YAML value must be a mapping")
     return payload
 
 
@@ -164,7 +171,7 @@ def flatten(value: Any, prefix: str = "") -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, child in value.items():
         if not isinstance(key, str):
-            raise ValueError(f"configuration key under {prefix or '<root>'} is not a string")
+            raise TypeError(f"configuration key under {prefix or '<root>'} is not a string")
         child_prefix = f"{prefix}.{key}" if prefix else key
         result.update(flatten(child, child_prefix))
     return result
@@ -204,7 +211,7 @@ def main() -> int:
             if env_name in os.environ:
                 continue
             print(f"{env_name}={shlex.quote(shell_value(value))}")
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError) as exc:
         raise SystemExit(f"Invalid pipeline YAML {path}: {exc}") from exc
     return 0
 

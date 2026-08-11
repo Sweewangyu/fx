@@ -577,7 +577,8 @@ bash scripts/run_train_then_eval.sh
 
 默认读取 `configs/train_eval_chronos2.yaml`。基础模型、输出目录、两阶段学习率、
 `timeseries_sft_lr`、数据集、混合策略、epoch、batch size、梯度累积、
-save/eval steps 以及四套评测数据路径均可在该 YAML 中修改。使用另一份配置：
+save/eval steps、`dataset_dir`、是否保留 Stage1、benchmark 子集、评测协议/分区以及
+四套评测数据路径均可在该 YAML 中修改。使用另一份配置：
 
 ```bash
 CONFIG_FILE=/path/to/my_experiment.yaml bash scripts/run_train_then_eval.sh
@@ -595,7 +596,8 @@ Stage1/Stage2。LLaMAFactory 会在结束时把验证集 `eval_loss` 最优 chec
 加载回内存并导出到阶段根目录；脚本验证该根目录后才删除 `checkpoint-*`。
 Stage2 的 `--model_name_or_path` 明确指向 Stage1 最优导出目录；四套评测的
 `MODEL_PATH` 又明确指向 Stage2 最优导出目录。Stage2 成功后会删除
-Stage1 模型目录，最终只保留：
+Stage1 模型目录；若需要让后续 Stage2-only 实验复用它，在 YAML 中设置
+`training.keep_stage1: true`。默认最终只保留：
 
 ```text
 /share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1/best_seed42
@@ -612,6 +614,14 @@ FORCE_TRAIN=1 FORCE_EVAL=1 bash scripts/run_train_then_eval.sh
 正常重跑具有幂等性：`TRAINING_COMPLETE.json` 与参数一致时复用最终模型；目录存在
 但没有有效完成标记时会停止，不会静默覆盖。只有显式设置 `FORCE_TRAIN=1` 才会删除
 该 seed 对应的 Stage1 临时目录和最终模型目录。
+
+只有评测命令成功并且以下三个聚合产物均存在，一键脚本才会报告成功：
+
+```text
+<evaluation.output_root>/benchmark_status.tsv
+<evaluation.output_root>/all_benchmarks_summary.md
+<evaluation.output_root>/metrics.json
+```
 
 ## 正确启动标志
 

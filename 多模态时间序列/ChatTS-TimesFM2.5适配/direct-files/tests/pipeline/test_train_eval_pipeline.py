@@ -27,6 +27,7 @@ CONFIG_LOADER = (
     / "scripts"
     / "load_train_eval_config.py"
 )
+HOST_PIPELINE = CHATTS_REPO / "scripts" / "run_train_then_eval.sh"
 
 
 def write_json(path: Path, payload: object) -> None:
@@ -150,6 +151,8 @@ pipeline:
   seed: 7
 training:
   base_model_path: /models/qwen
+  dataset_dir: /datasets/snapshot
+  keep_stage1: true
   stage1:
     learning_rate: "3e-5"
     datasets: [align_256, ift]
@@ -158,13 +161,34 @@ training:
     datasets: "sft,my_private_data"
 evaluation:
   model_name: yaml-name
+  benchmarks: tsrbench,timeseriesexam
+  run_id: yaml-run
+  protocol_hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  haystack_split: validation
+  tiny_data_partition: search-dev
+  tiny_partition_seed: 42
 """.strip()
                 + "\n",
                 encoding="utf-8",
             )
             env = os.environ.copy()
             env["S1_LR"] = "9e-5"
-            for name in ("SEED", "BASE_MODEL_PATH", "STAGE1_DATASETS", "S2_LR", "STAGE2_DATASETS", "MODEL_NAME"):
+            for name in (
+                "SEED",
+                "BASE_MODEL_PATH",
+                "DATASET_DIR",
+                "KEEP_STAGE1",
+                "STAGE1_DATASETS",
+                "S2_LR",
+                "STAGE2_DATASETS",
+                "MODEL_NAME",
+                "BENCHMARKS",
+                "RUN_ID",
+                "EVAL_PROTOCOL_HASH",
+                "HAYSTACK_SPLIT",
+                "TINY_DATA_PARTITION",
+                "TINY_PARTITION_SEED",
+            ):
                 env.pop(name, None)
             env["S1_LR"] = "9e-5"
             result = subprocess.run(
@@ -179,11 +203,220 @@ evaluation:
             )
             self.assertEqual(assignments["SEED"], "7")
             self.assertEqual(assignments["BASE_MODEL_PATH"], "/models/qwen")
+            self.assertEqual(assignments["DATASET_DIR"], "/datasets/snapshot")
+            self.assertEqual(assignments["KEEP_STAGE1"], "1")
             self.assertEqual(assignments["STAGE1_DATASETS"], "align_256,ift")
             self.assertNotIn("S1_LR", assignments)
             self.assertEqual(assignments["S2_LR"], "8e-6")
             self.assertEqual(assignments["STAGE2_DATASETS"], "sft,my_private_data")
             self.assertEqual(assignments["MODEL_NAME"], "yaml-name")
+            self.assertEqual(assignments["BENCHMARKS"], "tsrbench,timeseriesexam")
+            self.assertEqual(assignments["RUN_ID"], "yaml-run")
+            self.assertEqual(assignments["EVAL_PROTOCOL_HASH"], "a" * 64)
+            self.assertEqual(assignments["HAYSTACK_SPLIT"], "validation")
+            self.assertEqual(assignments["TINY_DATA_PARTITION"], "search-dev")
+            self.assertEqual(assignments["TINY_PARTITION_SEED"], "42")
+
+    def test_host_one_click_pipeline_runs_training_then_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared = root / "shared"
+            shared.mkdir()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                """#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+if arguments[:1] == ["inspect"]:
+    print("true")
+    raise SystemExit(0)
+if arguments[:1] != ["exec"]:
+    raise SystemExit("unsupported fake docker invocation: " + repr(arguments))
+cursor = 1
+environment = os.environ.copy()
+while cursor < len(arguments) and arguments[cursor] == "-e":
+    key, value = arguments[cursor + 1].split("=", 1)
+    environment[key] = value
+    cursor += 2
+if cursor >= len(arguments):
+    raise SystemExit("fake docker exec has no container")
+cursor += 1  # The mock shares the host filesystem, so the container name is metadata.
+command = arguments[cursor:]
+if command[:2] == ["python", "-c"] and "torch.cuda.device_count" in command[2]:
+    print("8")
+    raise SystemExit(0)
+raise SystemExit(subprocess.run(command, env=environment, check=False).returncode)
+""",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+
+            train_project = root / "training-project"
+            eval_project = root / "evaluation-project"
+            train_script = train_project / "scripts" / "train.sh"
+            eval_script = eval_project / "scripts" / "eval.sh"
+            train_script.parent.mkdir(parents=True)
+            eval_script.parent.mkdir(parents=True)
+            dataset = root / "dataset-snapshot"
+            dataset.mkdir()
+            base_model = root / "base-model"
+            base_model.mkdir()
+            chronos = root / "chronos2"
+            chronos.mkdir()
+            final_model = shared / "models" / "one-click-model"
+            train_output = shared / "training"
+            eval_output = shared / "evaluation" / "one-click"
+            event_log = root / "events.log"
+
+            train_script.write_text(
+                """#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$PIPELINE_MODE" == "full" ]]
+[[ "$DATASET_DIR" == "$EXPECTED_DATASET_DIR" ]]
+[[ "$KEEP_STAGE1" == "1" ]]
+printf 'train|%s|%s|%s\n' "$PIPELINE_MODE" "$DATASET_DIR" "$KEEP_STAGE1" >> "$MOCK_EVENT_LOG"
+mkdir -p "$FINAL_MODEL_PATH"
+printf '%s\n' '{"architectures":["Qwen3TSForCausalLM"]}' > "$FINAL_MODEL_PATH/config.json"
+printf '%s\n' '{"status":"complete","pipeline_mode":"full"}' > "$FINAL_MODEL_PATH/TRAINING_COMPLETE.json"
+""",
+                encoding="utf-8",
+            )
+            train_script.chmod(0o755)
+            eval_script.write_text(
+                """#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ -f "$MODEL_PATH/config.json" ]]
+[[ -f "$MODEL_PATH/TRAINING_COMPLETE.json" ]]
+[[ "$REQUIRE_TRAINING_MARKER" == "1" ]]
+printf 'eval|%s|%s|%s|%s|%s|%s\n' "$BENCHMARKS" "$RUN_ID" "$EVAL_PROTOCOL_HASH" "$HAYSTACK_SPLIT" "$TINY_DATA_PARTITION" "$TINY_PARTITION_SEED" >> "$MOCK_EVENT_LOG"
+mkdir -p "$OUTPUT_ROOT"
+printf 'suite\tstatus\nall\tPASS\n' > "$OUTPUT_ROOT/benchmark_status.tsv"
+printf '# mock benchmark summary\n' > "$OUTPUT_ROOT/all_benchmarks_summary.md"
+printf '%s\n' '{"status":"complete","suites":{"tsrbench":{"status":"pass"},"timeseriesexam":{"status":"pass"}}}' > "$OUTPUT_ROOT/metrics.json"
+""",
+                encoding="utf-8",
+            )
+            eval_script.chmod(0o755)
+
+            for path in (
+                root / "tsrbench",
+                root / "tinybench",
+                root / "haystack",
+                root / "timeseriesexam",
+            ):
+                path.mkdir()
+            exam_data = root / "timeseriesexam" / "dataset.json"
+            write_json(exam_data, [])
+            protocol_hash = "b" * 64
+            config = root / "one-click.yaml"
+            config.write_text(
+                f"""
+pipeline:
+  seed: 42
+  force_train: false
+  force_eval: false
+  preflight_only: false
+  max_samples: 2
+  offline: true
+containers:
+  training: mock-training
+  evaluation: mock-evaluation
+training:
+  project_root: {train_project}
+  script: {train_script}
+  base_model_path: {base_model}
+  output_root: {train_output}
+  final_model_path: {final_model}
+  chronos2_model_path: {chronos}
+  dataset_dir: {dataset}
+  keep_stage1: true
+evaluation:
+  project_root: {eval_project}
+  script: {eval_script}
+  model_name: one-click-model
+  output_root: {eval_output}
+  chronos2_model_path: {chronos}
+  tsrbench_root: {root / 'tsrbench'}
+  tinybench_dataset_root: {root / 'tinybench'}
+  ts_haystack_root: {root / 'haystack'}
+  timeseriesexam_root: {root / 'timeseriesexam'}
+  timeseriesexam_data_file: {exam_data}
+  benchmarks: tsrbench,timeseriesexam
+  run_id: one-click-e2e
+  protocol_hash: {protocol_hash}
+  haystack_split: test
+  tiny_data_partition: all
+  tiny_partition_seed: 42
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            for name in (
+                "TRAIN_CONTAINER",
+                "EVAL_CONTAINER",
+                "TRAIN_PROJECT_ROOT",
+                "EVAL_PROJECT_ROOT",
+                "TRAIN_SCRIPT",
+                "EVAL_SCRIPT",
+                "BASE_MODEL_PATH",
+                "TRAIN_OUTPUT_ROOT",
+                "FINAL_MODEL_PATH",
+                "TRAIN_CHRONOS2_MODEL_PATH",
+                "EVAL_CHRONOS2_MODEL_PATH",
+                "DATASET_DIR",
+                "KEEP_STAGE1",
+                "PIPELINE_MODE",
+                "MODEL_NAME",
+                "EVAL_OUTPUT_ROOT",
+                "BENCHMARKS",
+                "RUN_ID",
+                "EVAL_PROTOCOL_HASH",
+                "HAYSTACK_SPLIT",
+                "TINY_DATA_PARTITION",
+                "TINY_PARTITION_SEED",
+            ):
+                env.pop(name, None)
+            env.update(
+                {
+                    "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+                    "HOST_PYTHON_BIN": sys.executable,
+                    "CONFIG_FILE": str(config),
+                    "SHARED_ROOT": str(shared),
+                    "EXPECTED_DATASET_DIR": str(dataset),
+                    "MOCK_EVENT_LOG": str(event_log),
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(HOST_PIPELINE)],
+                env=env,
+                check=True,
+                timeout=20,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("Pipeline completed successfully", result.stdout)
+            events = event_log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                events,
+                [
+                    f"train|full|{dataset}|1",
+                    (
+                        "eval|tsrbench,timeseriesexam|one-click-e2e|"
+                        f"{protocol_hash}|test|all|42"
+                    ),
+                ],
+            )
+            self.assertTrue((final_model / "TRAINING_COMPLETE.json").is_file())
+            self.assertTrue((eval_output / "benchmark_status.tsv").is_file())
+            self.assertTrue((eval_output / "all_benchmarks_summary.md").is_file())
+            self.assertTrue((eval_output / "metrics.json").is_file())
 
     def test_training_preflight_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

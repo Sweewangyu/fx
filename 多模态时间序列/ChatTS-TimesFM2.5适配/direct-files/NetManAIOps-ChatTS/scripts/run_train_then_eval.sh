@@ -40,12 +40,24 @@ EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-${SHARED_ROOT}/evaluation/all-benchmarks/$
 
 TRAIN_CHRONOS2_MODEL_PATH="${TRAIN_CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
 EVAL_CHRONOS2_MODEL_PATH="${EVAL_CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
+DATASET_DIR="${DATASET_DIR:-${TRAIN_PROJECT_ROOT}/data}"
+KEEP_STAGE1="${KEEP_STAGE1:-0}"
+# A train-then-evaluate entrypoint can only use the full two-stage recipe.
+# Reject an accidental stage1/stage2-only override instead of evaluating the
+# wrong checkpoint.
+PIPELINE_MODE="${PIPELINE_MODE:-full}"
 
 TSRBENCH_ROOT="${TSRBENCH_ROOT:-${SHARED_ROOT}/TSRBench-dataset}"
 TINYBENCH_DATASET_ROOT="${TINYBENCH_DATASET_ROOT:-${SHARED_ROOT}/tyb}"
 TS_HAYSTACK_ROOT="${TS_HAYSTACK_ROOT:-/workspace/TS-Haystack}"
 TIMESERIESEXAM_ROOT="${TIMESERIESEXAM_ROOT:-/workspace/TimeSeriesExam}"
 TIMESERIESEXAM_DATA_FILE="${TIMESERIESEXAM_DATA_FILE:-${TIMESERIESEXAM_ROOT}/output/round_3_folder/qa_dataset.json}"
+BENCHMARKS="${BENCHMARKS:-tsrbench,tinybenchmarks,ts_haystack,timeseriesexam}"
+RUN_ID="${RUN_ID:-train-eval-${MODEL_NAME}}"
+EVAL_PROTOCOL_HASH="${EVAL_PROTOCOL_HASH:-}"
+HAYSTACK_SPLIT="${HAYSTACK_SPLIT:-test}"
+TINY_DATA_PARTITION="${TINY_DATA_PARTITION:-all}"
+TINY_PARTITION_SEED="${TINY_PARTITION_SEED:-42}"
 
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
@@ -70,14 +82,16 @@ TRAIN_PARAMETER_NAMES=(
     STAGE2_PER_DEVICE_EVAL_BATCH_SIZE STAGE2_CUTOFF_LEN
     STAGE2_PREPROCESSING_NUM_WORKERS
 )
-TRAIN_PARAMETER_ENV=()
+# Keep this array non-empty for the Bash 3.2 shipped by macOS, where expanding
+# an empty array under `set -u` can raise an unbound-variable error.
+TRAIN_PARAMETER_ENV=(-e "PIPELINE_MODE=$PIPELINE_MODE")
 for parameter_name in "${TRAIN_PARAMETER_NAMES[@]}"; do
     if [[ -n "${!parameter_name+x}" ]]; then
         TRAIN_PARAMETER_ENV+=(-e "$parameter_name=${!parameter_name}")
     fi
 done
 
-for flag_name in FORCE_TRAIN FORCE_EVAL PREFLIGHT_ONLY OFFLINE; do
+for flag_name in FORCE_TRAIN FORCE_EVAL PREFLIGHT_ONLY OFFLINE KEEP_STAGE1; do
     flag_value="${!flag_name}"
     [[ "$flag_value" == "0" || "$flag_value" == "1" ]] || {
         echo "$flag_name must be 0 or 1, got: $flag_value" >&2
@@ -86,6 +100,32 @@ for flag_name in FORCE_TRAIN FORCE_EVAL PREFLIGHT_ONLY OFFLINE; do
 done
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer." >&2; exit 2; }
 [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || { echo "MAX_SAMPLES must be non-negative." >&2; exit 2; }
+[[ "$TINY_PARTITION_SEED" =~ ^[0-9]+$ ]] || {
+    echo "TINY_PARTITION_SEED must be a non-negative integer." >&2
+    exit 2
+}
+[[ "$PIPELINE_MODE" == "full" ]] || {
+    echo "run_train_then_eval.sh requires PIPELINE_MODE=full, got: $PIPELINE_MODE" >&2
+    exit 2
+}
+[[ -n "$DATASET_DIR" ]] || { echo "DATASET_DIR must not be empty." >&2; exit 2; }
+[[ -n "$BENCHMARKS" ]] || { echo "BENCHMARKS must not be empty." >&2; exit 2; }
+[[ "$RUN_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "RUN_ID may contain only letters, digits, dot, underscore, and dash." >&2
+    exit 2
+}
+if [[ -n "$EVAL_PROTOCOL_HASH" && ! "$EVAL_PROTOCOL_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "EVAL_PROTOCOL_HASH must be empty or a 64-character hexadecimal SHA256." >&2
+    exit 2
+fi
+case "$HAYSTACK_SPLIT" in
+    train|validation|test) ;;
+    *) echo "HAYSTACK_SPLIT must be train, validation, or test." >&2; exit 2 ;;
+esac
+case "$TINY_DATA_PARTITION" in
+    all|search-dev|final-test) ;;
+    *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
+esac
 
 command -v docker >/dev/null 2>&1 || { echo "docker command not found on the host." >&2; exit 1; }
 
@@ -141,8 +181,11 @@ echo " Configuration:       $CONFIG_FILE"
 echo " Training container:  $TRAIN_CONTAINER"
 echo " Evaluation container:$EVAL_CONTAINER"
 echo " Seed:                $SEED"
+echo " Dataset directory:   $DATASET_DIR"
 echo " Final model:         $FINAL_MODEL_PATH"
 echo " Evaluation output:   $EVAL_OUTPUT_ROOT"
+echo " Benchmarks:          $BENCHMARKS"
+echo " Run ID:              $RUN_ID"
 echo " Smoke sample limit:  $MAX_SAMPLES (0 means full evaluation)"
 echo "============================================================"
 
@@ -154,6 +197,8 @@ run_training() {
         -e OUTPUT_ROOT="$TRAIN_OUTPUT_ROOT" \
         -e FINAL_MODEL_PATH="$FINAL_MODEL_PATH" \
         -e CHRONOS2_MODEL_PATH="$TRAIN_CHRONOS2_MODEL_PATH" \
+        -e DATASET_DIR="$DATASET_DIR" \
+        -e KEEP_STAGE1="$KEEP_STAGE1" \
         -e SEED="$SEED" \
         -e S1_LR="$S1_LR" \
         -e S2_LR="$S2_LR" \
@@ -176,6 +221,12 @@ run_evaluation() {
         -e TS_HAYSTACK_ROOT="$TS_HAYSTACK_ROOT" \
         -e TIMESERIESEXAM_ROOT="$TIMESERIESEXAM_ROOT" \
         -e TIMESERIESEXAM_DATA_FILE="$TIMESERIESEXAM_DATA_FILE" \
+        -e BENCHMARKS="$BENCHMARKS" \
+        -e RUN_ID="$RUN_ID" \
+        -e EVAL_PROTOCOL_HASH="$EVAL_PROTOCOL_HASH" \
+        -e HAYSTACK_SPLIT="$HAYSTACK_SPLIT" \
+        -e TINY_DATA_PARTITION="$TINY_DATA_PARTITION" \
+        -e TINY_PARTITION_SEED="$TINY_PARTITION_SEED" \
         -e SEED="$SEED" \
         -e FORCE_EVAL="$FORCE_EVAL" \
         -e PREFLIGHT_ONLY="$PREFLIGHT_ONLY" \
@@ -210,10 +261,17 @@ require_container_path "$EVAL_CONTAINER" file "$FINAL_MODEL_PATH/config.json"
 echo "$(date '+%Y-%m-%d %H:%M:%S') | Training gate passed; starting sequential eight-GPU evaluation"
 run_evaluation
 
+# A zero exit from the evaluator is necessary but not sufficient for a durable
+# pipeline result. Require all aggregate artifacts before declaring success.
+require_container_path "$EVAL_CONTAINER" file "$EVAL_OUTPUT_ROOT/benchmark_status.tsv"
+require_container_path "$EVAL_CONTAINER" file "$EVAL_OUTPUT_ROOT/all_benchmarks_summary.md"
+require_container_path "$EVAL_CONTAINER" file "$EVAL_OUTPUT_ROOT/metrics.json"
+
 echo "============================================================"
 echo " Pipeline completed successfully"
 echo " Final model:       $FINAL_MODEL_PATH"
 echo " Evaluation output: $EVAL_OUTPUT_ROOT"
 echo " Status table:      $EVAL_OUTPUT_ROOT/benchmark_status.tsv"
 echo " Summary:           $EVAL_OUTPUT_ROOT/all_benchmarks_summary.md"
+echo " Metrics:           $EVAL_OUTPUT_ROOT/metrics.json"
 echo "============================================================"

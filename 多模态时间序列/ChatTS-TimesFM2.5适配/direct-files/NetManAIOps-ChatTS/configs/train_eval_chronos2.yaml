@@ -20,6 +20,10 @@ training:
   output_root: /share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1
   # Omit final_model_path to derive output_root/best_seed<seed> automatically.
   chronos2_model_path: /workspace/chronos2
+  dataset_dir: /workspace/ChatTS-Training/data
+  # false preserves the original one-click behavior; true is useful when the
+  # Stage1 checkpoint will be reused by later Stage2-only experiments.
+  keep_stage1: false
   deepspeed_include: "localhost:0,1,2,3,4,5,6,7"
   master_port: 19901
 
@@ -74,3 +78,9 @@ evaluation:
   ts_haystack_root: /workspace/TS-Haystack
   timeseriesexam_root: /workspace/TimeSeriesExam
   timeseriesexam_data_file: /workspace/TimeSeriesExam/output/round_3_folder/qa_dataset.json
+  benchmarks: "tsrbench,tinybenchmarks,ts_haystack,timeseriesexam"
+  # Omit protocol_hash to derive it from benchmark data, code, and arguments.
+  run_id: chronos2-seed42-full
+  haystack_split: test
+  tiny_data_partition: all
+  tiny_partition_seed: 42
