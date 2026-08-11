@@ -1,0 +1,137 @@
+schema_version: chatts-autoresearch-v1
+
+paths:
+  train_project: /workspace/ChatTS-Training
+  train_script: /workspace/ChatTS-Training/scripts/full/run_chronos2_best_two_stage.sh
+  eval_project: /workspace/ChatTS/ChatTS-main
+  eval_script: /workspace/ChatTS/ChatTS-main/scripts/run_all_chatts_benchmarks.sh
+  # All model, dataset, and project paths must already exist locally. Autoresearch
+  # never downloads checkpoints or benchmark data.
+  datav2_root: /workspace/datataste
+  datav2_registry: data/versions/datav2/sources.json
+  datav2_manifest: data/versions/datav2/manifest.json
+  chronos2_model: /workspace/chronos2
+  base_model: /share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B
+  tsrbench_root: /share/airesearch/data/finiverse/TSRBench-dataset
+  timeseriesexam_root: /workspace/TimeSeriesExam
+  timeseriesexam_data_file: /workspace/TimeSeriesExam/output/round_3_folder/qa_dataset.json
+  ts_haystack_root: /workspace/TS-Haystack
+  tinybench_root: /share/airesearch/data/finiverse/tyb
+
+runtime:
+  output_root: ./artifacts/chronos2
+  python_bin: python3
+  seed: 42
+  gpu_ids: "0,1,2,3,4,5,6,7"
+  master_port: 19901
+  dry_run: false
+
+deepseek:
+  enabled: true
+  base_url: http://localhost:30000/v1
+  # Use the exact model identifier exposed by the internal OpenAI-compatible API.
+  model: deepseek-flash-v4
+  api_key_env: DEEPSEEK_API_KEY
+  concurrency: 8
+  timeout_seconds: 120
+  max_retries: 2
+  temperature: 0.0
+  # Prefer server-side strict structured output. Use json_object only if the
+  # internal OpenAI-compatible service lacks json_schema support; local strict
+  # validation remains mandatory in either mode.
+  response_format: json_schema
+  prompt_version: chatts-label-v2
+
+labeling:
+  max_samples: 0
+  sources: []
+  input_char_limit: 6000
+  output_char_limit: 6000
+
+data:
+  snapshot_name: filtered-v1
+  # raw, prepared, or the exact snapshot_name. Baseline and every non-data trial
+  # use this same snapshot; only a data-family patch creates a derived snapshot.
+  baseline_snapshot: raw
+  minimum_quality: 0.55
+  missing_label_policy: keep       # keep | drop | error
+  drop_exact_duplicates: true
+  drop_cross_source_duplicates: true
+  drop_near_duplicates: false
+  near_duplicate_hamming: 3
+  source_weights: {}
+  difficulty_weights:
+    easy: 0.8
+    medium: 1.0
+    hard: 1.25
+  aliases:
+    chatts_align_256: align_256
+    chatts_ift: ift
+    chatts_sft: sft
+    chatts_align_random: align_random
+    time_mqa: finiverse_time_mqa
+    tsaqa: finiverse_tsaqa
+
+training:
+  stage1_learning_rate: 1.0e-5
+  stage2_learning_rate: 1.0e-5
+  stage1_timeseries_learning_rate: 1.0e-5
+  stage2_timeseries_learning_rate: 1.0e-5
+  stage1_datasets: align_256,ift
+  stage2_datasets: sft,align_random,finiverse_time_mqa,finiverse_tsaqa
+  stage1_mix_strategy: interleave_over
+  stage2_mix_strategy: concat
+  stage1_interleave_probs: "0.9,0.1"
+  stage2_interleave_probs: ""
+  stage1_epochs: 3
+  stage2_epochs: 1
+  stage2_warmup_ratio: 0.02
+  stage2_scheduler: cosine
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 32
+  cutoff_len: 2048
+  val_size: 0.05
+
+search:
+  proxy_trials: 6
+  proxy_max_steps: 300
+  full_finalists: 2
+  proposal_mode: deepseek          # deepseek | deterministic
+  learning_rates: [5.0e-6, 1.0e-5, 2.0e-5]
+  projector_lr_ratios: [0.5, 1.0, 2.0]
+  warmup_ratios: [0.01, 0.02, 0.05]
+  schedulers: [cosine, linear]
+  epochs: [1, 2]
+  minimum_qualities: [0.0, 0.5, 0.7]
+  source_weight_range: [0.5, 2.0]
+
+evaluation:
+  search_benchmarks: tsrbench,timeseriesexam
+  guard_benchmarks: ts_haystack,tinybenchmarks
+  final_benchmarks: tsrbench,timeseriesexam,ts_haystack,tinybenchmarks
+  # V1 locks these names and materializes immutable views. Complete official
+  # dev/test labels are retained; otherwise seed-42 exact hash-stratified 20/80.
+  search_split: search-dev
+  final_split: final-test
+  haystack_search_split: validation
+  haystack_final_split: test
+  tiny_partition_seed: 42
+  search_max_samples: 0
+  # V1 requires 0: baseline and champion run every example in the locked
+  # final-test partition for all four final_benchmarks.
+  final_max_samples: 0
+  # Optional generic JSON/JSONL sources used to create an immutable 20/80 ID split.
+  # Leave empty when official dev/test splits are supplied by the benchmark.
+  split_sources: []
+
+gates:
+  tiny_average_max_drop: 0.01
+  tiny_task_max_drop: 0.02
+  haystack_iou_max_drop: 0.02
+  coverage_max_drop: 0.01
+  tiny_expected_tasks:
+    - tinyArc
+    - tinyHellaswag
+    - tinyMMLU
+    - tinyTruthfulQA
+    - tinyWinogrande
