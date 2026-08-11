@@ -5,14 +5,14 @@ paths:
   output_root: ../exports
 
 selection:
-  run_name: demo-six-source-split
+  run_name: demo-all-source-split
   stage1:
-    sources: [chatts_align_256, chatts_align_random, chatts_ift, chatts_sft, time_mqa, tsaqa]
+    sources: ["*"]
     qualities: [weak, acceptable, good, excellent]
     difficulties: [very_easy, easy, moderate]
     abilities: []
   stage2:
-    sources: [chatts_align_256, chatts_align_random, chatts_ift, chatts_sft, time_mqa, tsaqa]
+    sources: ["*"]
     qualities: [weak, acceptable, good, excellent]
     difficulties: [moderate, hard, very_hard]
     abilities: []

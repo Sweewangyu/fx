@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import uuid
@@ -117,12 +118,32 @@ def _iter_joined(source: Source) -> tuple[Iterator[tuple[int, dict[str, Any], di
 
 
 def parse_rules(
-    payload: dict[str, Any], sources: list[Source]
+    payload: dict[str, Any],
+    sources: list[Source],
+    catalog: dict[str, Any] | None = None,
 ) -> tuple[StageRule, StageRule]:
     available = {source.name for source in sources if source.annotation_mode != "missing"}
+    wildcard_sources = available
+    if catalog is not None:
+        wildcard_sources = {
+            item["name"]
+            for item in catalog.get("sources", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and item.get("available") is True
+            and item["name"] in available
+        }
+
+    def expand_all(value: Any) -> Any:
+        if not isinstance(value, dict) or "*" not in value.get("sources", []):
+            return value
+        if value.get("sources") != ["*"]:
+            raise StudioError("The '*' source selector must be used alone")
+        return {**value, "sources": sorted(wildcard_sources)}
+
     return (
-        StageRule.from_mapping(payload.get("stage1"), available),
-        StageRule.from_mapping(payload.get("stage2"), available),
+        StageRule.from_mapping(expand_all(payload.get("stage1")), available),
+        StageRule.from_mapping(expand_all(payload.get("stage2")), available),
     )
 
 
@@ -189,7 +210,13 @@ def preview_selection(
     }
 
 
-def _dataset_key(stage: str, source_name: str) -> str:
+def _dataset_key(stage: str, source_name: str, data_version: str | None = None) -> str:
+    if data_version is not None:
+        # Versioned snapshots use the complete source name.  The original six
+        # aliases are intentionally not used here: an all-source registry can
+        # contain both e.g. `chatts_sft` and `sft`, which would otherwise map to
+        # the same LLaMAFactory dataset key.
+        return f"{data_version}__{stage}__{source_name}"
     return f"{stage}_{DEFAULT_ALIASES.get(source_name, source_name)}"
 
 
@@ -208,15 +235,70 @@ def _dataset_info_entry(stage: str, source_name: str) -> dict[str, Any]:
     }
 
 
+def _actual_preview(
+    selected_names: list[str],
+    source_counts: dict[str, dict[str, int]],
+    stage_stats: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    counts = {
+        key: sum(source_counts[name][key] for name in selected_names)
+        for key in ("stage1", "stage2", "overlap")
+    }
+    distributions: dict[str, dict[str, dict[str, int]]] = {}
+    for stage in ("stage1", "stage2"):
+        quality: Counter[str] = Counter()
+        difficulty: Counter[str] = Counter()
+        ability: Counter[str] = Counter()
+        for details in stage_stats[stage].values():
+            for packed, row_count in details["cube"].items():
+                quality_name, difficulty_name, ability_name = packed.split("\u001f", 2)
+                quality[quality_name] += row_count
+                difficulty[difficulty_name] += row_count
+                ability[ability_name] += row_count
+        distributions[stage] = {
+            "quality": dict(quality),
+            "difficulty": dict(difficulty),
+            "ability": dict(ability),
+        }
+    return {
+        "counts": counts,
+        "by_source": [
+            {
+                "source": name,
+                "source_rows": source_counts[name]["source_rows"],
+                "stage1": source_counts[name]["stage1"],
+                "stage2": source_counts[name]["stage2"],
+                "overlap": source_counts[name]["overlap"],
+            }
+            for name in selected_names
+        ],
+        "distributions": distributions,
+    }
+
+
+def _preview_signature(preview: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "counts": preview.get("counts"),
+        "by_source": sorted(preview.get("by_source", []), key=lambda row: row["source"]),
+        "distributions": preview.get("distributions"),
+    }
+
+
 def export_selection(
     payload: dict[str, Any],
     sources: list[Source],
     catalog: dict[str, Any],
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    stage1, stage2 = parse_rules(payload, sources)
+    stage1, stage2 = parse_rules(payload, sources, catalog)
     preview = preview_selection(catalog, stage1, stage2)
     run_name = safe_name(payload.get("run_name"), "run_name")
+    data_version_value = payload.get("data_version")
+    data_version = None
+    if data_version_value is not None:
+        data_version = safe_name(data_version_value, "data_version")
+        if data_version != run_name or not re.fullmatch(r"datav[1-9][0-9]*", data_version):
+            raise StudioError("A versioned export must use the same canonical datavN run_name")
     output_root_value = payload.get("output_root")
     if not isinstance(output_root_value, str) or not output_root_value.strip():
         raise StudioError("output_root must be a non-empty path")
@@ -235,6 +317,7 @@ def export_selection(
     dataset_info: dict[str, Any] = {}
     dataset_names = {"stage1": [], "stage2": []}
     stage_stats: dict[str, dict[str, Any]] = {"stage1": {}, "stage2": {}}
+    actual_source_counts: dict[str, dict[str, int]] = {}
     input_identities: dict[str, Any] = {}
     file_hashes: dict[str, str] = {}
 
@@ -256,6 +339,7 @@ def export_selection(
             digests: dict[str, Any] = {}
             annotation_digests: dict[str, Any] = {}
             counts = {"stage1": 0, "stage2": 0, "overlap": 0}
+            source_rows = 0
             cubes = {"stage1": Counter(), "stage2": Counter()}
             for stage, rule in (("stage1", stage1), ("stage2", stage2)):
                 if name not in rule.sources:
@@ -268,6 +352,7 @@ def export_selection(
                 annotation_digests[stage] = hashlib.sha256()
             try:
                 for line_number, raw_record, annotation in joined:
+                    source_rows += 1
                     qa = _validate_qa(raw_record, source, line_number)
                     matches = {
                         "stage1": stage1.matches(name, annotation),
@@ -306,6 +391,7 @@ def export_selection(
                     stream.close()
 
             input_identities[name] = identities
+            actual_source_counts[name] = {"source_rows": source_rows, **counts}
             for stage in ("stage1", "stage2"):
                 if stage not in outputs:
                     continue
@@ -321,9 +407,22 @@ def export_selection(
                     "annotation_sha256": annotation_digests[stage].hexdigest(),
                 }
                 if counts[stage] > 0:
-                    key = _dataset_key(stage, name)
+                    key = _dataset_key(stage, name, data_version)
+                    if key in dataset_info:
+                        raise StudioError(
+                            f"Dataset key collision for {name}: {key}; source names must be unique"
+                        )
                     dataset_info[key] = _dataset_info_entry(stage, name)
                     dataset_names[stage].append(key)
+
+        actual_preview = _actual_preview(selected_names, actual_source_counts, stage_stats)
+        if _preview_signature(actual_preview) != _preview_signature(preview):
+            raise StudioError(
+                "Source data changed after the catalog preview; rescan the catalog and retry"
+            )
+        # Manifest counts and distributions are always produced from the rows
+        # actually read during export, even after the equality check above.
+        preview = actual_preview
 
         selection = {
             "stage1": {
@@ -340,10 +439,21 @@ def export_selection(
             },
         }
         selection_hash = _hash_object(selection)
+        content_identities = {
+            name: {
+                "annotation_mode": identity["annotation_mode"],
+                "raw_sha256": identity["raw_sha256"],
+                "annotation_sha256": identity["annotation_sha256"],
+            }
+            for name, identity in input_identities.items()
+        }
         snapshot_payload = {
-            "schema_version": "chatts-dataset-snapshot-v1",
+            "schema_version": "chatts-dataset-snapshot-v2",
             "selection": selection,
-            "inputs": input_identities,
+            # Absolute source paths are audit metadata, not content identity.
+            # This keeps a snapshot hash stable after copying the same inputs
+            # between local and HPC workspaces.
+            "inputs": content_identities,
             "selected_outputs": {
                 path: digest
                 for path, digest in file_hashes.items()
@@ -381,15 +491,19 @@ def export_selection(
             "STAGE2_INTERLEAVE_PROBS=''",
             f"DATASET_SNAPSHOT_HASH={dataset_snapshot_hash}",
         ]
+        if data_version is not None:
+            env_lines.append(f"DATA_VERSION={data_version}")
         env_encoded = "\n".join(env_lines) + "\n"
         (temporary / "training.env").write_text(env_encoded, encoding="utf-8")
         file_hashes["training.env"] = hashlib.sha256(env_encoded.encode()).hexdigest()
         manifest = {
             "schema_version": "chatts-dataset-studio-export-v1",
             "run_name": run_name,
+            "data_version": data_version,
             "created_at": _utc_now(),
             "selection_hash": selection_hash,
             "dataset_snapshot_hash": dataset_snapshot_hash,
+            "snapshot_hash_schema": "chatts-dataset-snapshot-v2",
             "selection": selection,
             "preview": preview,
             "dataset_names": dataset_names,

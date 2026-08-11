@@ -1,40 +1,64 @@
 paths:
-  # datataste 的 datav2 数据源注册表。
-  registry_path: /workspace/datataste/data/versions/datav2/sources.json
-  # SFT_CURATOR merge_tsqa_annotations.py 的输出根目录；目录下应有
-  # annotations/*.jsonl（优先）或 annotated/*.jsonl。
-  annotations_root: /workspace/SFT_CURATOR/merged_labels
-  # 用于解析 sources.json 中的相对路径。
-  data_root: /workspace/datataste
-  # 每次导出会在这里新建 <run_name>/，不会覆盖已有目录。
-  output_root: /workspace/chatts-dataset-exports
+  # 先用 build-registry 扫描 merged_labels/annotated 下的全部 JSONL。
+  registry_path: /share/airesearch/data/finiverse/traindata/sources.json
+  annotations_root: /share/airesearch/data/finiverse/traindata/merged_labels
+  data_root: /share/airesearch/data/finiverse/traindata
+  # datav3、datav4... 均作为不可变快照保存在此目录。
+  output_root: /share/airesearch/data/finiverse/traindata/chatts-data-versions
+  state_root: /share/airesearch/data/finiverse/traindata/chatts-studio-state
 
+versions:
+  start: 3
+
+registry:
+  # 每次启动及点击“刷新 source”时，扫描 annotated/*.jsonl 全量重建。
+  auto_build: true
+  # 可选：旧 sources.json，只用于复用 family/split/training_role 元数据。
+  # metadata_registry: /workspace/datataste/data/versions/datav2/sources.json
+
+# CLI preview/export 的默认配方；"*" 会动态展开为注册表中的所有可用 source。
 selection:
-  run_name: six-source-medium-split-v1
+  run_name: all-source-preview
   stage1:
-    sources:
-      - chatts_align_256
-      - chatts_align_random
-      - chatts_ift
-      - chatts_sft
-      - time_mqa
-      - tsaqa
+    sources: ["*"]
     qualities: [weak, acceptable, good, excellent]
     difficulties: [very_easy, easy, moderate]
     abilities: []
   stage2:
-    sources:
-      - chatts_align_256
-      - chatts_align_random
-      - chatts_ift
-      - chatts_sft
-      - time_mqa
-      - tsaqa
+    sources: ["*"]
     qualities: [weak, acceptable, good, excellent]
     difficulties: [moderate, hard, very_hard]
     abilities: []
 
+# 浏览器不能覆盖以下脚本和运行路径。相对 host 路径以本 YAML 所在目录为基准。
+integration:
+  training_root: ../../ChatTS-Training
+  evaluation_root: ../../ChatTS
+  pipeline_script: ../../ChatTS/scripts/run_train_then_eval.sh
+
+  training_container: chatts
+  evaluation_container: ragas
+  train_project_root: /workspace/ChatTS-Training
+  eval_project_root: /workspace/ChatTS/ChatTS-main
+  training_script: /workspace/ChatTS-Training/scripts/full/run_chronos2_best_two_stage.sh
+  evaluation_script: /workspace/ChatTS/ChatTS-main/scripts/run_all_chatts_benchmarks.sh
+
+  base_model_path: /share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B
+  model_output_base: /share/airesearch/data/finiverse/output/ChatTS-msxf-8B
+  model_name_base: chatts-msxf-8B
+  evaluation_output_base: /share/airesearch/data/finiverse/evaluation/all-benchmarks
+  train_chronos2_model_path: /workspace/chronos2
+  eval_chronos2_model_path: /workspace/chronos2
+  deepspeed_include: "localhost:0,1,2,3,4,5,6,7"
+  master_port: 19901
+
+  tsrbench_root: /share/airesearch/data/finiverse/TSRBench-dataset
+  tinybench_dataset_root: /share/airesearch/data/finiverse/tyb
+  ts_haystack_root: /workspace/TS-Haystack
+  timeseriesexam_root: /workspace/TimeSeriesExam
+  timeseriesexam_data_file: /workspace/TimeSeriesExam/output/round_3_folder/qa_dataset.json
+
 server:
-  # 推荐在服务器上保持 127.0.0.1，再用 SSH 端口转发访问。
+  # 建议仅监听 loopback，再通过 SSH -L 访问。
   host: 127.0.0.1
   port: 7865

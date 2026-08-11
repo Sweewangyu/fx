@@ -449,6 +449,8 @@ def build_request(
     protocol_files: Sequence[str],
     protocol_items: Sequence[str],
     eval_protocol_hash: str,
+    data_version: str = "",
+    dataset_snapshot_hash: str = "",
 ) -> dict[str, Any]:
     if suite not in SUPPORTED_SUITES:
         raise ValueError(f"Unsupported suite: {suite}")
@@ -461,7 +463,12 @@ def build_request(
     resolved_model_components = _resolved_paths(model_components)
     resolved_data = _resolved_paths(data_paths)
     resolved_protocol_files = _resolved_paths(protocol_files)
-    command_descriptor = sorted(protocol_items)
+    identity_items: list[str] = []
+    if data_version:
+        identity_items.append(f"data_version={data_version}")
+    if dataset_snapshot_hash:
+        identity_items.append(f"dataset_snapshot_hash={dataset_snapshot_hash}")
+    command_descriptor = sorted([*protocol_items, *identity_items])
     command_fingerprint = _sha256_json(
         {
             "suite": suite,
@@ -504,6 +511,8 @@ def build_request(
         "protocol_code_fingerprint": protocol_code_fingerprint,
         "command_fingerprint": command_fingerprint,
         "external_eval_protocol_hash": eval_protocol_hash or None,
+        "data_version": data_version,
+        "dataset_snapshot_hash": dataset_snapshot_hash,
         "protocol_fingerprint": protocol_fingerprint,
     }
 
@@ -707,6 +716,8 @@ def aggregate_run(
     force_eval: bool,
     output_root: str,
     eval_protocol_hash: str,
+    data_version: str = "",
+    dataset_snapshot_hash: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     with Path(status_file).open(encoding="utf-8", newline="") as stream:
         statuses = list(csv.DictReader(stream, delimiter="\t"))
@@ -786,6 +797,8 @@ def aggregate_run(
         "force_eval": force_eval,
         "eval_protocol_hash": effective_protocol_hash,
         "external_eval_protocol_hash": eval_protocol_hash or None,
+        "data_version": data_version,
+        "dataset_snapshot_hash": dataset_snapshot_hash,
         "protocol_fingerprints": protocol_fingerprints,
         "data_fingerprints": data_fingerprints,
         "selected_suites": [status["suite"] for status in statuses],
@@ -820,6 +833,8 @@ def _request_from_args(args: argparse.Namespace) -> dict[str, Any]:
         protocol_files=args.protocol_file,
         protocol_items=args.protocol,
         eval_protocol_hash=args.eval_protocol_hash,
+        data_version=args.data_version,
+        dataset_snapshot_hash=args.dataset_snapshot_hash,
     )
 
 
@@ -832,6 +847,8 @@ def _add_request_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--protocol-file", action="append", required=True)
     parser.add_argument("--protocol", action="append", default=[])
     parser.add_argument("--eval-protocol-hash", default="")
+    parser.add_argument("--data-version", default="")
+    parser.add_argument("--dataset-snapshot-hash", default="")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -861,6 +878,8 @@ def _build_parser() -> argparse.ArgumentParser:
     aggregate_parser.add_argument("--force-eval", required=True, choices=("0", "1"))
     aggregate_parser.add_argument("--output-root", required=True)
     aggregate_parser.add_argument("--eval-protocol-hash", default="")
+    aggregate_parser.add_argument("--data-version", default="")
+    aggregate_parser.add_argument("--dataset-snapshot-hash", default="")
     return parser
 
 
@@ -907,6 +926,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             force_eval=args.force_eval == "1",
             output_root=args.output_root,
             eval_protocol_hash=args.eval_protocol_hash,
+            data_version=args.data_version,
+            dataset_snapshot_hash=args.dataset_snapshot_hash,
         )
         print(f"metrics={args.metrics_file} status={metrics['status']}")
         return 0 if metrics["status"] == "pass" else 1

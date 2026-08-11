@@ -1,3 +1,4 @@
+# ruff: noqa: PLW1510 -- this module intentionally uses unittest.TestCase.
 from __future__ import annotations
 
 import hashlib
@@ -9,12 +10,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "full" / "run_chronos2_best_two_stage.sh"
 STAGE1_RUNNER = REPO_ROOT / "scripts" / "full" / "train_chronos2_best_stage1.sh"
 STAGE2_RUNNER = REPO_ROOT / "scripts" / "full" / "train_chronos2_best_stage2.sh"
 FINALIZER = REPO_ROOT / "scripts" / "finalize_chatts_best_checkpoint.py"
+DATASET_VERIFIER = REPO_ROOT / "scripts" / "verify_dataset_snapshot.py"
 
 
 def write_json(path: Path, payload: object) -> None:
@@ -25,6 +26,119 @@ def write_json(path: Path, payload: object) -> None:
 def make_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def canonical_hash(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def write_studio_snapshot(
+    root: Path,
+    *,
+    data_version: str | None = None,
+    snapshot_schema: str = "chatts-dataset-snapshot-v2",
+) -> str:
+    stage_names = {
+        "stage1": ["align_256", "ift"],
+        "stage2": ["sft", "align_random", "finiverse_time_mqa", "finiverse_tsaqa"],
+    }
+    selection = {
+        stage: {
+            "sources": list(names),
+            "qualities": [],
+            "difficulties": [],
+            "abilities": [],
+        }
+        for stage, names in stage_names.items()
+    }
+    input_identities = {
+        name: {
+            "raw_path": f"/source/{name}.jsonl",
+            "annotation_path": f"/annotations/{name}.jsonl",
+            "annotation_mode": "native",
+            "raw_sha256": hashlib.sha256(f"raw:{name}".encode()).hexdigest(),
+            "annotation_sha256": hashlib.sha256(f"annotation:{name}".encode()).hexdigest(),
+        }
+        for names in stage_names.values()
+        for name in names
+    }
+    file_hashes: dict[str, str] = {}
+    dataset_info: dict[str, object] = {}
+    for stage, names in stage_names.items():
+        for name in names:
+            relative = f"{stage}/{name}.jsonl"
+            content = json.dumps({"source": name}, separators=(",", ":")) + "\n"
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            file_hashes[relative] = hashlib.sha256(content.encode()).hexdigest()
+            dataset_info[name] = {"file_name": relative}
+
+    counts = {"stage1": 2, "stage2": 4, "overlap": 0}
+    if snapshot_schema == "chatts-dataset-snapshot-v2":
+        snapshot_inputs = {
+            name: {
+                key: identity[key]
+                for key in ("annotation_mode", "raw_sha256", "annotation_sha256")
+            }
+            for name, identity in input_identities.items()
+        }
+    else:
+        snapshot_inputs = input_identities
+    snapshot_hash = canonical_hash(
+        {
+            "schema_version": snapshot_schema,
+            "selection": selection,
+            "inputs": snapshot_inputs,
+            "selected_outputs": dict(file_hashes),
+            "counts": counts,
+        }
+    )
+    selection_hash = canonical_hash(selection)
+    for stage, names in stage_names.items():
+        stage_manifest = {
+            "schema_version": "chatts-dataset-stage-v1",
+            "stage": stage,
+            "selection_hash": selection_hash,
+            "dataset_snapshot_hash": snapshot_hash,
+            "rule": selection[stage],
+            "dataset_names": names,
+            "total_rows": len(names),
+            "sources": {name: {"rows": 1} for name in names},
+        }
+        path = root / stage / "manifest.json"
+        write_json(path, stage_manifest)
+        file_hashes[f"{stage}/manifest.json"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    dataset_info_path = root / "dataset_info.json"
+    write_json(dataset_info_path, dataset_info)
+    file_hashes["dataset_info.json"] = hashlib.sha256(dataset_info_path.read_bytes()).hexdigest()
+    training_env = root / "training.env"
+    training_env.write_text("# fixture\n", encoding="utf-8")
+    file_hashes["training.env"] = hashlib.sha256(training_env.read_bytes()).hexdigest()
+    manifest = {
+        "schema_version": "chatts-dataset-studio-export-v1",
+        "run_name": "test-fixture",
+        "data_version": data_version,
+        "created_at": "2026-08-11T00:00:00+00:00",
+        "selection_hash": selection_hash,
+        "dataset_snapshot_hash": snapshot_hash,
+        "snapshot_hash_schema": snapshot_schema,
+        "selection": selection,
+        "preview": {"counts": counts},
+        "dataset_names": stage_names,
+        "input_identities": input_identities,
+        "files": file_hashes,
+    }
+    manifest["manifest_hash"] = canonical_hash(manifest)
+    write_json(root / "manifest.json", manifest)
+    return snapshot_hash
 
 
 class StageRunnerInterfaceTest(unittest.TestCase):
@@ -123,6 +237,7 @@ class PipelineModeTest(unittest.TestCase):
         project.mkdir()
         chronos.mkdir()
         dataset.mkdir()
+        write_studio_snapshot(dataset)
         write_json(model / "config.json", {})
 
         stage1_runner = root / "fake_stage1.sh"
@@ -204,6 +319,7 @@ PY
                 "STAGE1_SCRIPT": str(stage1_runner),
                 "STAGE2_SCRIPT": str(stage2_runner),
                 "FINALIZER": str(FINALIZER),
+                "DATASET_VERIFIER": str(DATASET_VERIFIER),
                 "AVAILABLE_GPUS_OVERRIDE": "8",
                 "PYTHON_BIN": sys.executable,
             }
@@ -231,6 +347,8 @@ PY
                 (final / "TRAINING_COMPLETE.json").read_text(encoding="utf-8")
             )
             self.assertEqual(marker["pipeline_mode"], "full")
+            self.assertEqual(marker["data_version"], "")
+            self.assertEqual(marker["resolved_configuration"]["DATA_VERSION"], "")
             self.assertFalse(marker["stage1_model_retained"])
             self.assertEqual(
                 Path(marker["resolved_configuration"]["DATASET_DIR"]),
@@ -249,6 +367,9 @@ PY
                 "RUN_NAME", "chronos2_seed42_s1lr_1e-5_s2lr_1e-5"
             ) / "training_run_manifest.json"
             self.assertTrue(run_manifest.is_file())
+            logged = json.loads(run_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(logged["data_version"], "")
+            self.assertEqual(logged["resolved_configuration"]["DATA_VERSION"], "")
 
     def test_stage1_then_stage2_reuses_and_never_deletes_shared_stage1(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -257,7 +378,9 @@ PY
             stage1 = root / "output" / "shared-stage1"
             final = root / "output" / "trial-final"
             stage1_hash = "a" * 64
-            data_hash = "d" * 64
+            data_hash = write_studio_snapshot(
+                Path(env["DATASET_DIR"]), data_version="datav3"
+            )
             env.update(
                 {
                     "PIPELINE_MODE": "stage1",
@@ -265,6 +388,7 @@ PY
                     "TRIAL_ID": "shared-stage1",
                     "TRIAL_CONFIG_HASH": stage1_hash,
                     "DATASET_SNAPSHOT_HASH": data_hash,
+                    "DATA_VERSION": "datav3",
                 }
             )
             subprocess.run(
@@ -275,6 +399,13 @@ PY
                 text=True,
             )
             self.assertTrue((stage1 / "STAGE1_COMPLETE.json").is_file())
+            stage1_marker = json.loads(
+                (stage1 / "STAGE1_COMPLETE.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(stage1_marker["data_version"], "datav3")
+            self.assertEqual(
+                stage1_marker["resolved_configuration"]["DATA_VERSION"], "datav3"
+            )
             resumed = subprocess.run(
                 ["bash", str(RUNNER)],
                 env=env,
@@ -311,6 +442,10 @@ PY
             self.assertEqual(marker["trial_id"], "proxy-001")
             self.assertEqual(marker["trial_config_hash"], "b" * 64)
             self.assertEqual(marker["dataset_snapshot_hash"], data_hash)
+            self.assertEqual(marker["data_version"], "datav3")
+            self.assertEqual(
+                marker["resolved_configuration"]["DATA_VERSION"], "datav3"
+            )
             self.assertTrue(marker["stage1_model_retained"])
             self.assertIsNone(marker["commands"]["stage1"])
             self.assertEqual(
@@ -318,6 +453,18 @@ PY
                 stage1.resolve(),
             )
             self.assertEqual(len(marker["stage1_input_provenance"]["sha256"]), 64)
+            run_manifest = (
+                root
+                / "output"
+                / "logs"
+                / "chronos2_seed42_s1lr_1e-5_s2lr_1e-5_proxy-001"
+                / "training_run_manifest.json"
+            )
+            logged = json.loads(run_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(logged["data_version"], "datav3")
+            self.assertEqual(
+                logged["resolved_configuration"]["DATA_VERSION"], "datav3"
+            )
 
     def test_stage2_rejects_ancestor_output_without_deleting_shared_stage1(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -568,7 +715,11 @@ PY
                     "STAGE1_OUT": str(stage1),
                     "FINAL_MODEL_PATH": str(final),
                     "TRIAL_CONFIG_HASH": "a" * 64,
-                    "DATASET_SNAPSHOT_HASH": "d" * 64,
+                    "DATASET_SNAPSHOT_HASH": json.loads(
+                        (Path(env["DATASET_DIR"]) / "manifest.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )["dataset_snapshot_hash"],
                 }
             )
             subprocess.run(
@@ -589,7 +740,7 @@ PY
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(
-                "completion marker mismatch for dataset_snapshot_hash",
+                "dataset_snapshot_hash does not match",
                 (result.stderr + result.stdout).lower(),
             )
             self.assertTrue(final.is_dir())
@@ -626,6 +777,145 @@ PY
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("not a Stage1 manifest", result.stderr + result.stdout)
+            self.assertFalse(output.exists())
+
+    def test_preflight_rejects_noncanonical_data_version_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = self.make_fixture(root)
+            output = root / "output" / "must-not-exist"
+            env.update(
+                {
+                    "DATA_VERSION": "data-v3",
+                    "FINAL_MODEL_PATH": str(output),
+                    "PREFLIGHT_ONLY": "1",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(RUNNER)], env=env, capture_output=True, text=True
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("canonical datavN", result.stderr + result.stdout)
+            self.assertFalse(output.exists())
+
+    def test_preflight_verifies_v1_snapshot_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = self.make_fixture(root)
+            snapshot_hash = write_studio_snapshot(
+                Path(env["DATASET_DIR"]),
+                data_version="datav3",
+                snapshot_schema="chatts-dataset-snapshot-v1",
+            )
+            output = root / "output" / "must-not-exist"
+            env.update(
+                {
+                    "DATASET_SNAPSHOT_HASH": snapshot_hash,
+                    "DATA_VERSION": "datav3",
+                    "FINAL_MODEL_PATH": str(output),
+                    "PREFLIGHT_ONLY": "1",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(RUNNER)], env=env, capture_output=True, text=True
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Dataset Studio snapshot verified", result.stdout)
+            self.assertFalse(output.exists())
+
+    def test_preflight_rejects_tampered_snapshot_file_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = self.make_fixture(root)
+            output = root / "output" / "must-not-exist"
+            (Path(env["DATASET_DIR"]) / "stage1" / "ift.jsonl").write_text(
+                "tampered\n", encoding="utf-8"
+            )
+            env.update(
+                {
+                    "FINAL_MODEL_PATH": str(output),
+                    "PREFLIGHT_ONLY": "1",
+                }
+            )
+
+            result = subprocess.run(
+                ["bash", str(RUNNER)], env=env, capture_output=True, text=True
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("snapshot file SHA256 mismatch", result.stderr + result.stdout)
+            self.assertFalse(output.exists())
+
+    def test_legacy_dataset_without_manifest_requires_no_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = self.make_fixture(root)
+            legacy = root / "legacy-dataset"
+            legacy.mkdir()
+            output = root / "output" / "must-not-exist"
+            env.update(
+                {
+                    "DATASET_DIR": str(legacy),
+                    "FINAL_MODEL_PATH": str(output),
+                    "PREFLIGHT_ONLY": "1",
+                }
+            )
+
+            accepted = subprocess.run(
+                ["bash", str(RUNNER)], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("Legacy dataset directory", accepted.stdout)
+            self.assertFalse(output.exists())
+
+            identified = env.copy()
+            identified["DATASET_SNAPSHOT_HASH"] = "d" * 64
+            rejected = subprocess.run(
+                ["bash", str(RUNNER)], env=identified, capture_output=True, text=True
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("manifest.json is missing", rejected.stderr + rejected.stdout)
+            self.assertFalse(output.exists())
+
+    def test_preflight_rejects_data_version_and_stage_key_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = self.make_fixture(root)
+            snapshot_hash = write_studio_snapshot(
+                Path(env["DATASET_DIR"]), data_version="datav3"
+            )
+            output = root / "output" / "must-not-exist"
+            env.update(
+                {
+                    "DATASET_SNAPSHOT_HASH": snapshot_hash,
+                    "DATA_VERSION": "datav4",
+                    "FINAL_MODEL_PATH": str(output),
+                    "PREFLIGHT_ONLY": "1",
+                }
+            )
+
+            bad_version = subprocess.run(
+                ["bash", str(RUNNER)], env=env, capture_output=True, text=True
+            )
+            self.assertNotEqual(bad_version.returncode, 0)
+            self.assertIn("DATA_VERSION does not match", bad_version.stderr + bad_version.stdout)
+            self.assertFalse(output.exists())
+
+            bad_keys_env = env.copy()
+            bad_keys_env["DATA_VERSION"] = "datav3"
+            bad_keys_env["STAGE2_DATASETS"] = "sft"
+            bad_keys = subprocess.run(
+                ["bash", str(RUNNER)], env=bad_keys_env, capture_output=True, text=True
+            )
+            self.assertNotEqual(bad_keys.returncode, 0)
+            self.assertIn(
+                "configured stage2 dataset keys do not match",
+                bad_keys.stderr + bad_keys.stdout,
+            )
             self.assertFalse(output.exists())
 
 

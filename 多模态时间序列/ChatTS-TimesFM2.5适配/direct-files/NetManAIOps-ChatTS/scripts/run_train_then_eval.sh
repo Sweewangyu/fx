@@ -64,6 +64,30 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 OFFLINE="${OFFLINE:-1}"
+DATA_VERSION="${DATA_VERSION:-}"
+DATASET_SNAPSHOT_HASH="${DATASET_SNAPSHOT_HASH:-}"
+TRIAL_ID="${TRIAL_ID:-}"
+TRIAL_CONFIG_HASH="${TRIAL_CONFIG_HASH:-}"
+
+# Safe benchmark tuning controls supported by run_all_chatts_benchmarks.sh.
+# Keep these defaults synchronized with that runner so older YAML files retain
+# exactly the same evaluation protocol.
+TSR_PROMPT_MODE="${TSR_PROMPT_MODE:-answer_only}"
+TSR_MAX_MODEL_LEN="${TSR_MAX_MODEL_LEN:-12288}"
+TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-8}"
+TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-16}"
+TSR_REQUEST_CHUNK_SIZE="${TSR_REQUEST_CHUNK_SIZE:-128}"
+TINY_MAX_MODEL_LEN="${TINY_MAX_MODEL_LEN:-6000}"
+TINY_REQUEST_CHUNK_SIZE="${TINY_REQUEST_CHUNK_SIZE:-16}"
+TINY_GPU_MEMORY_UTILIZATION="${TINY_GPU_MEMORY_UTILIZATION:-0.70}"
+HAYSTACK_MAX_MODEL_LEN="${HAYSTACK_MAX_MODEL_LEN:-40960}"
+HAYSTACK_MAX_NEW_TOKENS="${HAYSTACK_MAX_NEW_TOKENS:-500}"
+HAYSTACK_BATCH_SIZE="${HAYSTACK_BATCH_SIZE:-1}"
+HAYSTACK_REQUEST_CHUNK_SIZE="${HAYSTACK_REQUEST_CHUNK_SIZE:-8}"
+EXAM_MAX_MODEL_LEN="${EXAM_MAX_MODEL_LEN:-8192}"
+EXAM_MAX_NEW_TOKENS="${EXAM_MAX_NEW_TOKENS:-1024}"
+EXAM_BATCH_SIZE="${EXAM_BATCH_SIZE:-8}"
+EXAM_REQUEST_CHUNK_SIZE="${EXAM_REQUEST_CHUNK_SIZE:-64}"
 
 TRAIN_PARAMETER_NAMES=(
     DEEPSPEED_INCLUDE MASTER_PORT
@@ -118,6 +142,22 @@ if [[ -n "$EVAL_PROTOCOL_HASH" && ! "$EVAL_PROTOCOL_HASH" =~ ^[0-9a-fA-F]{64}$ ]
     echo "EVAL_PROTOCOL_HASH must be empty or a 64-character hexadecimal SHA256." >&2
     exit 2
 fi
+if [[ -n "$DATASET_SNAPSHOT_HASH" && ! "$DATASET_SNAPSHOT_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "DATASET_SNAPSHOT_HASH must be empty or a 64-character hexadecimal SHA256." >&2
+    exit 2
+fi
+if [[ -n "$DATA_VERSION" && ! "$DATA_VERSION" =~ ^datav[0-9]+$ ]]; then
+    echo "DATA_VERSION must be empty or use the canonical datavN form." >&2
+    exit 2
+fi
+if [[ -n "$TRIAL_ID" && ! "$TRIAL_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "TRIAL_ID may contain only letters, numbers, dot, underscore, and dash." >&2
+    exit 2
+fi
+if [[ -n "$TRIAL_CONFIG_HASH" && ! "$TRIAL_CONFIG_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "TRIAL_CONFIG_HASH must be empty or a 64-character hexadecimal SHA256." >&2
+    exit 2
+fi
 case "$HAYSTACK_SPLIT" in
     train|validation|test) ;;
     *) echo "HAYSTACK_SPLIT must be train, validation, or test." >&2; exit 2 ;;
@@ -126,6 +166,46 @@ case "$TINY_DATA_PARTITION" in
     all|search-dev|final-test) ;;
     *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
 esac
+case "$TSR_PROMPT_MODE" in
+    answer_only|official) ;;
+    *) echo "TSR_PROMPT_MODE must be answer_only or official." >&2; exit 2 ;;
+esac
+
+for parameter_name in \
+    TSR_MAX_MODEL_LEN TSR_MAX_NEW_TOKENS TSR_BATCH_SIZE TSR_REQUEST_CHUNK_SIZE \
+    TINY_MAX_MODEL_LEN TINY_REQUEST_CHUNK_SIZE \
+    HAYSTACK_MAX_MODEL_LEN HAYSTACK_MAX_NEW_TOKENS HAYSTACK_BATCH_SIZE \
+    HAYSTACK_REQUEST_CHUNK_SIZE EXAM_MAX_MODEL_LEN EXAM_MAX_NEW_TOKENS \
+    EXAM_BATCH_SIZE EXAM_REQUEST_CHUNK_SIZE; do
+    parameter_value="${!parameter_name}"
+    [[ "$parameter_value" =~ ^[1-9][0-9]*$ ]] || {
+        echo "$parameter_name must be a positive integer, got: $parameter_value" >&2
+        exit 2
+    }
+done
+(( TSR_MAX_MODEL_LEN > TSR_MAX_NEW_TOKENS )) || {
+    echo "TSR_MAX_MODEL_LEN must be larger than TSR_MAX_NEW_TOKENS." >&2
+    exit 2
+}
+(( HAYSTACK_MAX_MODEL_LEN > HAYSTACK_MAX_NEW_TOKENS )) || {
+    echo "HAYSTACK_MAX_MODEL_LEN must be larger than HAYSTACK_MAX_NEW_TOKENS." >&2
+    exit 2
+}
+(( EXAM_MAX_MODEL_LEN > EXAM_MAX_NEW_TOKENS )) || {
+    echo "EXAM_MAX_MODEL_LEN must be larger than EXAM_MAX_NEW_TOKENS." >&2
+    exit 2
+}
+"$HOST_PYTHON_BIN" - "$TINY_GPU_MEMORY_UTILIZATION" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("TINY_GPU_MEMORY_UTILIZATION must be numeric.") from exc
+if not math.isfinite(value) or not 0.0 < value <= 1.0:
+    raise SystemExit("TINY_GPU_MEMORY_UTILIZATION must be in (0, 1].")
+PY
 
 command -v docker >/dev/null 2>&1 || { echo "docker command not found on the host." >&2; exit 1; }
 
@@ -186,6 +266,7 @@ echo " Final model:         $FINAL_MODEL_PATH"
 echo " Evaluation output:   $EVAL_OUTPUT_ROOT"
 echo " Benchmarks:          $BENCHMARKS"
 echo " Run ID:              $RUN_ID"
+echo " Trial ID:            ${TRIAL_ID:-<none>}"
 echo " Smoke sample limit:  $MAX_SAMPLES (0 means full evaluation)"
 echo "============================================================"
 
@@ -198,6 +279,10 @@ run_training() {
         -e FINAL_MODEL_PATH="$FINAL_MODEL_PATH" \
         -e CHRONOS2_MODEL_PATH="$TRAIN_CHRONOS2_MODEL_PATH" \
         -e DATASET_DIR="$DATASET_DIR" \
+        -e DATA_VERSION="$DATA_VERSION" \
+        -e DATASET_SNAPSHOT_HASH="$DATASET_SNAPSHOT_HASH" \
+        -e TRIAL_ID="$TRIAL_ID" \
+        -e TRIAL_CONFIG_HASH="$TRIAL_CONFIG_HASH" \
         -e KEEP_STAGE1="$KEEP_STAGE1" \
         -e SEED="$SEED" \
         -e S1_LR="$S1_LR" \
@@ -227,6 +312,24 @@ run_evaluation() {
         -e HAYSTACK_SPLIT="$HAYSTACK_SPLIT" \
         -e TINY_DATA_PARTITION="$TINY_DATA_PARTITION" \
         -e TINY_PARTITION_SEED="$TINY_PARTITION_SEED" \
+        -e DATA_VERSION="$DATA_VERSION" \
+        -e DATASET_SNAPSHOT_HASH="$DATASET_SNAPSHOT_HASH" \
+        -e TSR_PROMPT_MODE="$TSR_PROMPT_MODE" \
+        -e TSR_MAX_MODEL_LEN="$TSR_MAX_MODEL_LEN" \
+        -e TSR_MAX_NEW_TOKENS="$TSR_MAX_NEW_TOKENS" \
+        -e TSR_BATCH_SIZE="$TSR_BATCH_SIZE" \
+        -e TSR_REQUEST_CHUNK_SIZE="$TSR_REQUEST_CHUNK_SIZE" \
+        -e TINY_MAX_MODEL_LEN="$TINY_MAX_MODEL_LEN" \
+        -e TINY_REQUEST_CHUNK_SIZE="$TINY_REQUEST_CHUNK_SIZE" \
+        -e TINY_GPU_MEMORY_UTILIZATION="$TINY_GPU_MEMORY_UTILIZATION" \
+        -e HAYSTACK_MAX_MODEL_LEN="$HAYSTACK_MAX_MODEL_LEN" \
+        -e HAYSTACK_MAX_NEW_TOKENS="$HAYSTACK_MAX_NEW_TOKENS" \
+        -e HAYSTACK_BATCH_SIZE="$HAYSTACK_BATCH_SIZE" \
+        -e HAYSTACK_REQUEST_CHUNK_SIZE="$HAYSTACK_REQUEST_CHUNK_SIZE" \
+        -e EXAM_MAX_MODEL_LEN="$EXAM_MAX_MODEL_LEN" \
+        -e EXAM_MAX_NEW_TOKENS="$EXAM_MAX_NEW_TOKENS" \
+        -e EXAM_BATCH_SIZE="$EXAM_BATCH_SIZE" \
+        -e EXAM_REQUEST_CHUNK_SIZE="$EXAM_REQUEST_CHUNK_SIZE" \
         -e SEED="$SEED" \
         -e FORCE_EVAL="$FORCE_EVAL" \
         -e PREFLIGHT_ONLY="$PREFLIGHT_ONLY" \

@@ -4,258 +4,296 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
-    <meta name="theme-color" content="#f3f0e8">
-    <title>ChatTS Dataset Studio</title>
+    <meta name="theme-color" content="#f4f6f5">
+    <title>ChatTS 控制台</title>
     <link rel="stylesheet" href="/styles.css">
     <script src="/app.js" defer></script>
   </head>
   <body>
-    <a class="skip-link" href="#workspace">跳到工作区</a>
+    <a class="skip-link" href="#main-content">跳到主内容</a>
 
     <header class="topbar">
-      <a class="brand" href="#top" aria-label="ChatTS Dataset Studio 首页">
+      <a class="brand" href="#overview" data-tab-link="overview" aria-label="ChatTS 控制台概览">
         <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
-        <span>
-          <strong>ChatTS</strong>
-          <small>Dataset Studio</small>
-        </span>
+        <span><strong>ChatTS</strong><small>训练控制台</small></span>
       </a>
-      <div class="connection-pill" id="health-pill" role="status">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="health-text">正在连接本地服务</span>
+      <div class="topbar-status">
+        <span class="status-chip" id="current-version-chip">未发布</span>
+        <span class="connection-pill" id="health-pill" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="health-text">连接中</span>
+        </span>
+        <button class="icon-button" id="open-settings" type="button" aria-controls="settings-panel" aria-expanded="false">设置</button>
       </div>
     </header>
 
-    <main id="workspace">
-      <section class="hero" id="top" aria-labelledby="hero-title">
-        <div class="hero-copy">
-          <p class="eyebrow">LOCAL · OFFLINE · REPRODUCIBLE</p>
-          <h1 id="hero-title">把标注数据变成<br><em>可训练的两阶段配方</em></h1>
-          <p class="hero-description">
-            按数据集、质量、难度和能力维度精确筛选，预览真实样本量，再分别导出 Stage 1 与 Stage 2 数据。
-          </p>
-          <div class="recipe-summary" aria-label="默认配方">
-            <div>
-              <span class="recipe-number">01</span>
-              <p><strong>Stage 1</strong><br>中等及以下 · weak 以上</p>
+    <nav class="tabbar" aria-label="工作区">
+      <div class="tablist" role="tablist" aria-orientation="horizontal">
+        <button id="tab-overview" role="tab" aria-selected="true" aria-controls="panel-overview" tabindex="0" data-tab="overview" type="button">概览</button>
+        <button id="tab-recipe" role="tab" aria-selected="false" aria-controls="panel-recipe" tabindex="-1" data-tab="recipe" type="button">数据配方</button>
+        <button id="tab-versions" role="tab" aria-selected="false" aria-controls="panel-versions" tabindex="-1" data-tab="versions" type="button">版本</button>
+        <button id="tab-training" role="tab" aria-selected="false" aria-controls="panel-training" tabindex="-1" data-tab="training" type="button">训练</button>
+        <button id="tab-evaluation" role="tab" aria-selected="false" aria-controls="panel-evaluation" tabindex="-1" data-tab="evaluation" type="button">评测</button>
+        <button id="tab-jobs" role="tab" aria-selected="false" aria-controls="panel-jobs" tabindex="-1" data-tab="jobs" type="button">任务 <span class="tab-count" id="running-job-count" hidden>0</span></button>
+      </div>
+    </nav>
+
+    <aside class="settings-panel" id="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" hidden>
+      <div class="settings-heading">
+        <div><h2 id="settings-title">工作区路径</h2><p>服务器绝对路径</p></div>
+        <button class="icon-button" id="close-settings" type="button" aria-label="关闭设置">关闭</button>
+      </div>
+      <div class="form-grid settings-grid">
+        <label class="field field-span-2"><span>数据源注册表</span><input id="registry-path" type="text" spellcheck="false" autocomplete="off"></label>
+        <label class="field field-span-2"><span>合并标注目录</span><input id="annotations-root" type="text" spellcheck="false" autocomplete="off"></label>
+        <label class="field"><span>数据根目录</span><input id="data-root" type="text" spellcheck="false" autocomplete="off"></label>
+        <label class="field"><span>数据版本目录</span><input id="output-root" type="text" spellcheck="false" autocomplete="off"></label>
+        <label class="field field-span-2 readonly-field"><span>ChatTS-Training（服务端配置）</span><input id="training-root" type="text" readonly aria-readonly="true" spellcheck="false" placeholder="由服务端配置"></label>
+      </div>
+      <div class="button-row">
+        <button class="button secondary" id="rebuild-sources" type="button" disabled>刷新全部 source</button>
+        <button class="button primary" id="scan-button" type="button" disabled>扫描</button>
+        <span class="inline-status" id="scan-status" aria-live="polite">等待连接</span>
+      </div>
+    </aside>
+    <button class="settings-backdrop" id="settings-backdrop" type="button" aria-label="关闭设置" hidden></button>
+
+    <main id="main-content" class="workspace">
+      <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" data-panel="overview">
+        <div class="page-heading">
+          <div><p class="eyebrow">工作区</p><h1>概览</h1></div>
+          <button class="button secondary" type="button" data-tab-link="recipe">编辑配方</button>
+        </div>
+
+        <div class="summary-grid">
+          <article class="summary-card accent">
+            <span>当前版本</span><strong id="overview-version">未发布</strong><small id="overview-version-meta">先扫描并创建数据配方</small>
+          </article>
+          <article class="summary-card"><span>可用数据源</span><strong id="overview-sources">—</strong><small id="overview-source-meta">等待扫描</small></article>
+          <article class="summary-card"><span>Stage 1 / 2</span><strong id="overview-stage-counts">— / —</strong><small id="overview-overlap">等待预览</small></article>
+          <article class="summary-card"><span>流水线</span><strong id="overview-pipeline">待配置</strong><small id="overview-job-meta">没有运行中的任务</small></article>
+        </div>
+
+        <section class="card compact-card" aria-labelledby="quick-actions-title">
+          <div class="card-heading"><div><h2 id="quick-actions-title">快捷操作</h2><p id="overview-status" aria-live="polite">打开设置并扫描数据。</p></div></div>
+          <div class="quick-actions">
+            <button class="quick-action" type="button" data-tab-link="recipe"><span>1</span><strong>选择数据</strong><small>数据源与筛选规则</small></button>
+            <button class="quick-action" type="button" data-tab-link="versions"><span>2</span><strong>发布版本</strong><small>记录组成并注册</small></button>
+            <button class="quick-action" id="overview-preflight" type="button"><span>3</span><strong>环境预检</strong><small>检查路径、容器和 GPU</small></button>
+            <button class="quick-action featured" id="overview-run" type="button"><span>4</span><strong>训练 + 评测</strong><small>启动完整流水线</small></button>
+          </div>
+        </section>
+
+        <section class="card compact-card" aria-labelledby="recent-jobs-title">
+          <div class="card-heading"><h2 id="recent-jobs-title">最近任务</h2><button class="text-button" type="button" data-tab-link="jobs">查看全部</button></div>
+          <div id="recent-jobs" class="list-empty">暂无任务</div>
+        </section>
+      </section>
+
+      <section id="panel-recipe" role="tabpanel" aria-labelledby="tab-recipe" data-panel="recipe" hidden>
+        <div class="page-heading sticky-heading">
+          <div><p class="eyebrow">数据</p><h1>数据配方</h1></div>
+          <div class="heading-actions"><span class="dirty-chip" id="recipe-state">未扫描</span><button class="button primary" id="preview-button" type="button" disabled>预览</button></div>
+        </div>
+
+        <section class="card" id="catalog-section" aria-labelledby="catalog-title">
+          <div class="card-heading">
+            <div><h2 id="catalog-title">数据源</h2><p id="catalog-stats" aria-live="polite">等待扫描</p></div>
+            <div class="compact-actions"><button type="button" id="select-all">选择全部可用源</button><button type="button" id="clear-sources">清空</button></div>
+          </div>
+          <label class="search-field"><span class="sr-only">搜索数据集</span><span aria-hidden="true">⌕</span><input id="dataset-search" type="search" placeholder="搜索名称、family、role"></label>
+          <div class="source-table" role="table" aria-label="数据源阶段选择">
+            <div class="source-head" role="row"><span role="columnheader">数据集</span><span role="columnheader">样本</span><span role="columnheader">S1</span><span role="columnheader">S2</span></div>
+            <div class="source-list" id="source-list" role="rowgroup"><div class="list-empty">在设置中扫描数据</div></div>
+          </div>
+        </section>
+
+        <div class="stage-grid" id="rules-section" aria-label="两阶段筛选规则">
+          <article class="card stage-card stage-one"><div class="card-heading"><h2>Stage 1</h2><span id="stage1-source-count">0 源</span></div><div class="rule-groups" id="stage1-rules"></div></article>
+          <article class="card stage-card stage-two"><div class="card-heading"><h2>Stage 2</h2><span id="stage2-source-count">0 源</span></div><div class="rule-groups" id="stage2-rules"></div></article>
+        </div>
+
+        <section class="card" id="preview-section" aria-labelledby="preview-title">
+          <div class="card-heading"><div><h2 id="preview-title">预览</h2><p id="preview-message" aria-live="polite">选择数据源后计算。</p></div></div>
+          <div class="metric-grid" aria-live="polite">
+            <div class="metric"><span>Stage 1</span><strong id="metric-stage1">—</strong><small id="metric-stage1-detail">0 源</small></div>
+            <div class="metric stage-two"><span>Stage 2</span><strong id="metric-stage2">—</strong><small id="metric-stage2-detail">0 源</small></div>
+            <div class="metric overlap"><span>重叠</span><strong id="metric-overlap">—</strong><small id="metric-overlap-detail">—</small></div>
+          </div>
+          <details id="preview-detail" hidden>
+            <summary>查看构成与按源明细</summary>
+            <div class="distribution-grid">
+              <div><div class="subheading"><h3>Stage 1</h3><span id="stage1-dist-total"></span></div><div class="bar-list" id="stage1-distribution"></div></div>
+              <div><div class="subheading"><h3>Stage 2</h3><span id="stage2-dist-total"></span></div><div class="bar-list" id="stage2-distribution"></div></div>
             </div>
-            <span class="recipe-arrow" aria-hidden="true">→</span>
-            <div>
-              <span class="recipe-number">02</span>
-              <p><strong>Stage 2</strong><br>中等及以上 · weak 以上</p>
+            <div class="table-wrap"><table><thead><tr><th>数据源</th><th>源数据</th><th>S1</th><th>S2</th><th>重叠</th></tr></thead><tbody id="source-results"></tbody></table></div>
+          </details>
+        </section>
+      </section>
+
+      <section id="panel-versions" role="tabpanel" aria-labelledby="tab-versions" data-panel="versions" hidden>
+        <div class="page-heading"><div><p class="eyebrow">可复现数据</p><h1>版本</h1></div><button class="button primary" id="publish-button" type="button" disabled>发布版本</button></div>
+        <div class="two-column">
+          <section class="card" aria-labelledby="publish-title">
+            <div class="card-heading"><h2 id="publish-title">新版本</h2><span class="status-chip" id="publish-state">草稿</span></div>
+            <div class="form-grid">
+              <label class="field"><span>版本号</span><input id="version-name" type="text" value="datav3" pattern="datav[1-9][0-9]*" spellcheck="false"></label>
+              <label class="field"><span>基于版本</span><select id="version-parent"><option value="">无</option></select></label>
+              <label class="field field-span-2"><span>变更说明</span><textarea id="version-notes" rows="3" placeholder="本版本的数据组成或筛选变化"></textarea></label>
             </div>
-          </div>
-        </div>
-        <aside class="hero-note" aria-label="数据处理原则">
-          <span class="note-index">A / B</span>
-          <p>训练 JSONL 只保留 <code>input</code>、<code>timeseries</code>、<code>output</code>。</p>
-          <p>完整标注会写入独立 sidecar，便于复查与复现。</p>
-          <div class="local-seal"><span>只读源数据</span><span>流式导出</span></div>
-        </aside>
-      </section>
-
-      <section class="panel path-panel" aria-labelledby="paths-title">
-        <div class="section-heading">
-          <div>
-            <span class="step-label">STEP 01</span>
-            <h2 id="paths-title">连接数据目录</h2>
-          </div>
-          <p>填写服务器上的绝对路径。扫描只读取 registry 与标注，不修改源文件。</p>
-        </div>
-
-        <div class="path-grid">
-          <label class="field field-wide">
-            <span>数据源注册表 <b>必填</b></span>
-            <input id="registry-path" type="text" spellcheck="false" autocomplete="off"
-              placeholder="/workspace/datataste/data/versions/datav2/sources.json">
-          </label>
-          <label class="field field-wide">
-            <span>合并标注目录 <b>必填</b></span>
-            <input id="annotations-root" type="text" spellcheck="false" autocomplete="off"
-              placeholder="/workspace/SFT_CURATOR/merged_labels">
-          </label>
-          <label class="field">
-            <span>datataste 根目录 <i>可选</i></span>
-            <input id="data-root" type="text" spellcheck="false" autocomplete="off"
-              placeholder="/workspace/datataste">
-          </label>
-          <label class="field">
-            <span>导出根目录 <b>必填</b></span>
-            <input id="output-root" type="text" spellcheck="false" autocomplete="off"
-              placeholder="/workspace/dataset-exports">
-          </label>
-        </div>
-
-        <div class="action-row">
-          <button class="button button-primary" id="scan-button" type="button" disabled>
-            <span>扫描数据与标注</span><span aria-hidden="true">↗</span>
-          </button>
-          <p class="inline-status" id="scan-status" aria-live="polite">等待扫描</p>
-        </div>
-      </section>
-
-      <section class="panel datasets-panel is-locked" id="datasets-section" aria-labelledby="datasets-title">
-        <div class="section-heading">
-          <div>
-            <span class="step-label">STEP 02</span>
-            <h2 id="datasets-title">选择训练数据源</h2>
-          </div>
-          <div class="catalog-stats" id="catalog-stats" aria-live="polite">
-            <span>尚未扫描</span>
-          </div>
-        </div>
-
-        <div class="dataset-toolbar">
-          <label class="search-field">
-            <span class="sr-only">搜索数据集</span>
-            <span aria-hidden="true">⌕</span>
-            <input id="dataset-search" type="search" placeholder="按名称、family 或 training role 搜索">
-          </label>
-          <div class="segmented-actions" aria-label="批量选择数据集">
-            <button type="button" id="select-defaults">选择示例六源</button>
-            <button type="button" id="select-all">全选可用源</button>
-            <button type="button" id="clear-sources">清空</button>
-          </div>
-        </div>
-
-        <div class="source-legend" aria-hidden="true">
-          <span>数据集</span><span>样本数 / 标注状态</span><span>Stage 1</span><span>Stage 2</span>
-        </div>
-        <div class="source-list" id="source-list">
-          <div class="empty-state">
-            <span aria-hidden="true">⌁</span>
-            <p>连接目录后，数据集会出现在这里</p>
-          </div>
-        </div>
-      </section>
-
-      <section class="rules-section is-locked" id="rules-section" aria-labelledby="rules-title">
-        <div class="section-heading section-heading-outside">
-          <div>
-            <span class="step-label">STEP 03</span>
-            <h2 id="rules-title">定义两阶段筛选规则</h2>
-          </div>
-          <p>每个阶段独立选择；“中等”默认同时进入两个阶段，因此会产生有意的重叠。</p>
-        </div>
-
-        <div class="stage-grid">
-          <article class="stage-card stage-one" data-stage="stage1">
-            <header>
-              <div>
-                <span class="stage-kicker">ALIGNMENT</span>
-                <h3>Stage 1</h3>
-              </div>
-              <span class="stage-source-count" id="stage1-source-count">0 个数据源</span>
-            </header>
-            <p class="stage-intro">优先使用更稳定、难度适中的样本完成特征对齐。</p>
-            <div class="rule-groups" id="stage1-rules"></div>
-          </article>
-
-          <article class="stage-card stage-two" data-stage="stage2">
-            <header>
-              <div>
-                <span class="stage-kicker">REASONING</span>
-                <h3>Stage 2</h3>
-              </div>
-              <span class="stage-source-count" id="stage2-source-count">0 个数据源</span>
-            </header>
-            <p class="stage-intro">保留中高难度样本，让语言模型学习时序推理与回答。</p>
-            <div class="rule-groups" id="stage2-rules"></div>
-          </article>
-        </div>
-      </section>
-
-      <section class="panel preview-panel is-locked" id="preview-section" aria-labelledby="preview-title">
-        <div class="section-heading">
-          <div>
-            <span class="step-label">STEP 04</span>
-            <h2 id="preview-title">预览筛选结果</h2>
-          </div>
-          <button class="button button-dark" id="preview-button" type="button">
-            计算样本量 <span aria-hidden="true">→</span>
-          </button>
-        </div>
-
-        <div class="metric-grid" aria-live="polite">
-          <article class="metric-card metric-stage1">
-            <span>Stage 1 样本</span><strong id="metric-stage1">—</strong><small id="metric-stage1-detail">等待预览</small>
-          </article>
-          <article class="metric-card metric-stage2">
-            <span>Stage 2 样本</span><strong id="metric-stage2">—</strong><small id="metric-stage2-detail">等待预览</small>
-          </article>
-          <article class="metric-card metric-overlap">
-            <span>阶段重叠</span><strong id="metric-overlap">—</strong><small id="metric-overlap-detail">中等难度可同时出现</small>
-          </article>
-        </div>
-
-        <div class="preview-detail" id="preview-detail" hidden>
-          <div class="distribution-grid">
-            <article>
-              <div class="subheading"><h3>Stage 1 构成</h3><span id="stage1-dist-total"></span></div>
-              <div class="bar-list" id="stage1-distribution"></div>
-            </article>
-            <article>
-              <div class="subheading"><h3>Stage 2 构成</h3><span id="stage2-dist-total"></span></div>
-              <div class="bar-list" id="stage2-distribution"></div>
-            </article>
-          </div>
-
-          <div class="table-wrap">
-            <div class="subheading"><h3>按数据源拆分</h3><span>精确行数</span></div>
-            <table>
-              <thead><tr><th scope="col">数据源</th><th scope="col">源数据</th><th scope="col">Stage 1</th><th scope="col">Stage 2</th><th scope="col">重叠</th></tr></thead>
-              <tbody id="source-results"></tbody>
-            </table>
-          </div>
-        </div>
-        <p class="preview-message" id="preview-message" aria-live="polite">完成规则选择后，点击“计算样本量”。</p>
-      </section>
-
-      <section class="panel export-panel is-locked" id="export-section" aria-labelledby="export-title">
-        <div class="section-heading">
-          <div>
-            <span class="step-label">STEP 05</span>
-            <h2 id="export-title">保存训练数据</h2>
-          </div>
-          <p>导出在后台流式执行。页面和本地服务需要保持开启，源数据不会被改写。</p>
-        </div>
-
-        <div class="export-layout">
-          <div>
-            <label class="field run-name-field">
-              <span>运行名称 <b>必填</b></span>
-              <input id="run-name" type="text" spellcheck="false" autocomplete="off" placeholder="six-source-split-v1">
-              <small>只允许字母、数字、点、下划线和短横线；已存在的目录不会被覆盖。</small>
-            </label>
-            <button class="button button-export" id="export-button" type="button">
-              <span>开始导出</span><span aria-hidden="true">↗</span>
-            </button>
-          </div>
-
-          <div class="export-progress" id="export-progress">
-            <div class="progress-heading">
-              <span id="progress-phase">尚未开始</span><strong id="progress-percent">0%</strong>
+            <div class="check-row">
+              <label><input id="publish-register" type="checkbox" checked> 注册到 ChatTS-Training</label>
+              <label><input id="publish-activate" type="checkbox" checked> 设为当前版本</label>
             </div>
-            <progress class="progress-track" aria-label="导出进度" max="100" value="0" id="progress-bar">0%</progress>
-            <p id="progress-detail" aria-live="polite">预览确认后即可导出。</p>
-          </div>
+            <div class="version-summary" id="version-summary">先在“数据配方”中完成预览。</div>
+            <div id="publish-result" class="result-box" role="status" hidden></div>
+          </section>
+          <section class="card" aria-labelledby="history-title">
+            <div class="card-heading"><h2 id="history-title">版本记录</h2><button class="text-button" id="refresh-versions" type="button">刷新</button></div>
+            <div id="version-list" class="version-list"><div class="list-empty">暂无版本</div></div>
+          </section>
         </div>
+      </section>
 
-        <div class="export-result" id="export-result" hidden>
-          <span class="result-check" aria-hidden="true">✓</span>
-          <div>
-            <strong>导出完成</strong>
-            <p id="result-summary"></p>
-            <dl id="result-paths"></dl>
+      <section id="panel-training" role="tabpanel" aria-labelledby="tab-training" data-panel="training" hidden>
+        <div class="page-heading"><div><p class="eyebrow">ChatTS-Training</p><h1>训练参数</h1></div><span class="status-chip" id="training-version">未选择版本</span></div>
+        <section class="card">
+          <div class="form-grid form-grid-3">
+            <label class="field readonly-field"><span>训练方案</span><select id="train-profile" disabled aria-disabled="true"><option value="chronos2-full">Chronos-2 两阶段</option></select></label>
+            <label class="field"><span>随机种子</span><input id="train-seed" type="number" min="0" step="1" value="42"></label>
+            <label class="field"><span>GPU</span><input id="deepspeed-include" type="text" value="localhost:0,1,2,3,4,5,6,7" spellcheck="false"></label>
+            <label class="field field-span-3 readonly-field"><span>基础模型（服务端配置）</span><input id="base-model-path" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-3 readonly-field"><span>模型输出根目录（自动追加版本）</span><input id="train-output-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
           </div>
+          <div class="path-preview"><span>最终输出</span><code id="final-model-preview">—</code></div>
+        </section>
+        <div class="stage-grid train-stage-grid">
+          <article class="card stage-card stage-one" data-train-stage="stage1">
+            <div class="card-heading"><div><h2>Stage 1</h2><p id="stage1-datasets">由数据版本生成</p></div></div>
+            <div class="form-grid form-grid-2">
+              <label class="field"><span>学习率</span><input data-train-param="learning_rate" type="text" value="1e-5" inputmode="decimal"></label>
+              <label class="field"><span>Epoch</span><input data-train-param="num_train_epochs" type="number" value="3" min="0" step="0.1"></label>
+              <label class="field"><span>单卡 Batch</span><input data-train-param="per_device_train_batch_size" type="number" value="2" min="1"></label>
+              <label class="field"><span>梯度累积</span><input data-train-param="gradient_accumulation_steps" type="number" value="32" min="1"></label>
+            </div>
+            <details><summary>高级参数</summary><div class="form-grid form-grid-2 advanced-fields">
+              <label class="field"><span>时序学习率</span><input data-train-param="timeseries_learning_rate" type="text" value="1e-5"></label>
+              <label class="field"><span>混合策略</span><select data-train-param="mix_strategy"><option value="concat">concat</option><option value="interleave_over">interleave_over</option><option value="interleave_under">interleave_under</option></select></label>
+              <label class="field"><span>混合概率</span><input data-train-param="interleave_probs" type="text" placeholder="留空"></label>
+              <label class="field"><span>最大步数</span><input data-train-param="max_steps" type="number" value="0" min="0"></label>
+              <label class="field"><span>调度器</span><select data-train-param="lr_scheduler_type"><option value="cosine">cosine</option><option value="linear">linear</option><option value="constant">constant</option><option value="constant_with_warmup">constant_with_warmup</option></select></label>
+              <label class="field"><span>Warmup</span><input data-train-param="warmup_ratio" type="number" value="0.02" min="0" max="1" step="0.001"></label>
+              <label class="field"><span>日志步数</span><input data-train-param="logging_steps" type="number" value="1" min="1"></label>
+              <label class="field"><span>保存步数</span><input data-train-param="save_steps" type="number" value="200" min="1"></label>
+              <label class="field"><span>评测步数</span><input data-train-param="eval_steps" type="number" value="200" min="1"></label>
+              <label class="field"><span>验证比例</span><input data-train-param="val_size" type="number" value="0.05" min="0" max="1" step="0.01"></label>
+              <label class="field"><span>评测 Batch</span><input data-train-param="per_device_eval_batch_size" type="number" value="2" min="1"></label>
+              <label class="field"><span>截断长度</span><input data-train-param="cutoff_len" type="number" value="2048" min="1"></label>
+              <label class="field"><span>预处理进程</span><input data-train-param="preprocessing_num_workers" type="number" value="96" min="1"></label>
+            </div></details>
+          </article>
+          <article class="card stage-card stage-two" data-train-stage="stage2">
+            <div class="card-heading"><div><h2>Stage 2</h2><p id="stage2-datasets">由数据版本生成</p></div></div>
+            <div class="form-grid form-grid-2">
+              <label class="field"><span>学习率</span><input data-train-param="learning_rate" type="text" value="1e-5" inputmode="decimal"></label>
+              <label class="field"><span>Epoch</span><input data-train-param="num_train_epochs" type="number" value="1" min="0" step="0.1"></label>
+              <label class="field"><span>单卡 Batch</span><input data-train-param="per_device_train_batch_size" type="number" value="2" min="1"></label>
+              <label class="field"><span>梯度累积</span><input data-train-param="gradient_accumulation_steps" type="number" value="32" min="1"></label>
+            </div>
+            <details><summary>高级参数</summary><div class="form-grid form-grid-2 advanced-fields">
+              <label class="field"><span>时序学习率</span><input data-train-param="timeseries_learning_rate" type="text" value="1e-5"></label>
+              <label class="field"><span>混合策略</span><select data-train-param="mix_strategy"><option value="concat">concat</option><option value="interleave_over">interleave_over</option><option value="interleave_under">interleave_under</option></select></label>
+              <label class="field"><span>混合概率</span><input data-train-param="interleave_probs" type="text" placeholder="留空"></label>
+              <label class="field"><span>最大步数</span><input data-train-param="max_steps" type="number" value="0" min="0"></label>
+              <label class="field"><span>调度器</span><select data-train-param="lr_scheduler_type"><option value="cosine">cosine</option><option value="linear">linear</option><option value="constant">constant</option><option value="constant_with_warmup">constant_with_warmup</option></select></label>
+              <label class="field"><span>Warmup</span><input data-train-param="warmup_ratio" type="number" value="0.02" min="0" max="1" step="0.001"></label>
+              <label class="field"><span>日志步数</span><input data-train-param="logging_steps" type="number" value="1" min="1"></label>
+              <label class="field"><span>保存步数</span><input data-train-param="save_steps" type="number" value="100" min="1"></label>
+              <label class="field"><span>评测步数</span><input data-train-param="eval_steps" type="number" value="100" min="1"></label>
+              <label class="field"><span>验证比例</span><input data-train-param="val_size" type="number" value="0.05" min="0" max="1" step="0.01"></label>
+              <label class="field"><span>评测 Batch</span><input data-train-param="per_device_eval_batch_size" type="number" value="4" min="1"></label>
+              <label class="field"><span>截断长度</span><input data-train-param="cutoff_len" type="number" value="2048" min="1"></label>
+              <label class="field"><span>预处理进程</span><input data-train-param="preprocessing_num_workers" type="number" value="96" min="1"></label>
+            </div></details>
+          </article>
         </div>
+        <section class="card compact-card"><div class="form-grid form-grid-3">
+          <label class="field"><span>Master port</span><input id="master-port" type="number" value="19901" min="1024" max="65535"></label>
+          <label class="field check-field"><input id="keep-stage1" type="checkbox"><span>保留 Stage 1 模型</span></label>
+          <label class="field check-field"><input id="force-train" type="checkbox"><span>强制重新训练</span></label>
+        </div></section>
+      </section>
+
+      <section id="panel-evaluation" role="tabpanel" aria-labelledby="tab-evaluation" data-panel="evaluation" hidden>
+        <div class="page-heading"><div><p class="eyebrow">Benchmark</p><h1>评测参数</h1></div><span class="status-chip" id="evaluation-version">未选择版本</span></div>
+        <section class="card">
+          <div class="card-heading"><h2>评测套件</h2><span id="suite-count">4 项</span></div>
+          <fieldset class="suite-grid" id="benchmark-suites"><legend class="sr-only">选择评测套件</legend>
+            <label><input type="checkbox" value="tsrbench" checked><span><strong>TSRBench</strong><small>时序推理</small></span></label>
+            <label><input type="checkbox" value="tinybenchmarks" checked><span><strong>TinyBenchmarks</strong><small>轻量基准</small></span></label>
+            <label><input type="checkbox" value="ts_haystack" checked><span><strong>TS-Haystack</strong><small>长上下文</small></span></label>
+            <label><input type="checkbox" value="timeseriesexam" checked><span><strong>TimeSeriesExam</strong><small>综合能力</small></span></label>
+          </fieldset>
+          <div class="form-grid form-grid-2">
+            <label class="field"><span>最大样本数（0 为全部）</span><input id="eval-max-samples" type="number" min="0" value="0"></label>
+            <label class="field check-field"><input id="eval-offline" type="checkbox" checked><span>离线模式</span></label>
+            <label class="field field-span-2 readonly-field"><span>模型路径（由版本派生）</span><input id="eval-model-path" type="text" readonly aria-readonly="true" spellcheck="false" placeholder="由当前版本训练结果派生"></label>
+            <label class="field field-span-2 readonly-field"><span>评测输出目录（由版本派生）</span><input id="eval-output-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+          </div>
+          <details><summary>高级参数</summary><div class="form-grid form-grid-2 advanced-fields">
+            <label class="field"><span>Haystack split</span><select id="haystack-split"><option value="test">test</option><option value="validation">validation</option><option value="train">train</option></select></label>
+            <label class="field"><span>Tiny partition</span><select id="tiny-partition"><option value="all">all</option><option value="search-dev">search-dev</option><option value="final-test">final-test</option></select></label>
+            <label class="field"><span>Tiny seed</span><input id="tiny-seed" type="number" min="0" value="42"></label>
+            <label class="field check-field"><input id="force-eval" type="checkbox"><span>强制重新评测</span></label>
+            <label class="field"><span>TSR prompt</span><select id="tsr-prompt-mode"><option value="answer_only">answer_only</option><option value="official">official</option></select></label>
+            <label class="field"><span>协议 Hash</span><input id="eval-protocol-hash" type="text" maxlength="64" placeholder="自动生成" spellcheck="false"></label>
+            <label class="field"><span>TSR 最大长度</span><input id="tsr-max-model-len" type="number" min="1" value="12288"></label>
+            <label class="field"><span>TSR 新 token</span><input id="tsr-max-new-tokens" type="number" min="1" value="8"></label>
+            <label class="field"><span>TSR Batch</span><input id="tsr-batch-size" type="number" min="1" value="16"></label>
+            <label class="field"><span>TSR 请求块</span><input id="tsr-request-chunk-size" type="number" min="1" value="128"></label>
+            <label class="field"><span>Tiny 最大长度</span><input id="tiny-max-model-len" type="number" min="1" value="6000"></label>
+            <label class="field"><span>Tiny 请求块</span><input id="tiny-request-chunk-size" type="number" min="1" value="16"></label>
+            <label class="field"><span>Tiny GPU 利用率</span><input id="tiny-gpu-memory-utilization" type="number" min="0.01" max="0.99" step="0.01" value="0.7"></label>
+            <label class="field"><span>Haystack 最大长度</span><input id="haystack-max-model-len" type="number" min="1" value="40960"></label>
+            <label class="field"><span>Haystack 新 token</span><input id="haystack-max-new-tokens" type="number" min="1" value="500"></label>
+            <label class="field"><span>Haystack Batch</span><input id="haystack-batch-size" type="number" min="1" value="1"></label>
+            <label class="field"><span>Haystack 请求块</span><input id="haystack-request-chunk-size" type="number" min="1" value="8"></label>
+            <label class="field"><span>Exam 最大长度</span><input id="exam-max-model-len" type="number" min="1" value="8192"></label>
+            <label class="field"><span>Exam 新 token</span><input id="exam-max-new-tokens" type="number" min="1" value="1024"></label>
+            <label class="field"><span>Exam Batch</span><input id="exam-batch-size" type="number" min="1" value="8"></label>
+            <label class="field"><span>Exam 请求块</span><input id="exam-request-chunk-size" type="number" min="1" value="64"></label>
+            <label class="field field-span-2 readonly-field"><span>评测项目目录（服务端配置）</span><input id="eval-project-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-2 readonly-field"><span>TSRBench（服务端配置）</span><input id="tsrbench-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-2 readonly-field"><span>TinyBenchmarks（服务端配置）</span><input id="tinybench-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-2 readonly-field"><span>TS-Haystack（服务端配置）</span><input id="haystack-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-2 readonly-field"><span>TimeSeriesExam（服务端配置）</span><input id="timeseriesexam-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-2 readonly-field"><span>TimeSeriesExam 文件（服务端配置）</span><input id="timeseriesexam-file" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+          </div></details>
+        </section>
+        <section class="card run-bar" aria-labelledby="run-title">
+          <div><h2 id="run-title">启动</h2><p id="run-status" aria-live="polite">先发布并注册数据版本。</p></div>
+          <div class="button-row"><button class="button secondary run-button" data-run-mode="preflight" type="button">预检</button><button class="button primary run-button" data-run-mode="train_eval" type="button">训练 + 评测</button></div>
+        </section>
+      </section>
+
+      <section id="panel-jobs" role="tabpanel" aria-labelledby="tab-jobs" data-panel="jobs" hidden>
+        <div class="page-heading"><div><p class="eyebrow">后台运行</p><h1>任务</h1></div><button class="button secondary" id="refresh-jobs" type="button">刷新</button></div>
+        <section class="card jobs-card">
+          <div class="job-table" role="table" aria-label="任务列表">
+            <div class="job-head" role="row"><span>任务</span><span>版本</span><span>状态</span><span>开始时间</span><span>耗时</span></div>
+            <div id="job-list" role="rowgroup"><div class="list-empty">暂无任务</div></div>
+          </div>
+        </section>
       </section>
     </main>
 
-    <footer>
-      <p>ChatTS Dataset Studio <span>·</span> 本地数据配方工具</p>
-      <p>源文件只读，导出结果包含 SHA256 与可复现 manifest。</p>
-    </footer>
+    <dialog id="job-dialog" class="job-dialog" aria-labelledby="job-dialog-title">
+      <div class="dialog-heading"><div><h2 id="job-dialog-title">任务日志</h2><p id="job-dialog-meta"></p></div><button class="icon-button" id="close-job-dialog" type="button">关闭</button></div>
+      <div class="job-progress"><span id="job-phase">—</span><strong id="job-percent">—</strong></div>
+      <progress id="job-progress" max="100" value="0">0%</progress>
+      <pre id="job-log" tabindex="0">等待日志</pre>
+      <div class="artifact-list" id="job-artifacts"></div>
+    </dialog>
 
     <div class="toast-region" id="toast-region" aria-live="assertive" aria-atomic="true"></div>
   </body>

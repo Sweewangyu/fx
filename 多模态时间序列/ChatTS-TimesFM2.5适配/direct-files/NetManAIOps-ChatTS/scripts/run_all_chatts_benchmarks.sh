@@ -32,6 +32,8 @@ METRICS_FILE="${METRICS_FILE:-${OUTPUT_ROOT}/metrics.json}"
 BENCHMARKS="${BENCHMARKS:-tsrbench,tinybenchmarks,ts_haystack,timeseriesexam}"
 RUN_ID="${RUN_ID:-manual}"
 EVAL_PROTOCOL_HASH="${EVAL_PROTOCOL_HASH:-}"
+DATA_VERSION="${DATA_VERSION:-}"
+DATASET_SNAPSHOT_HASH="${DATASET_SNAPSHOT_HASH:-}"
 
 FORCE_EVAL="${FORCE_EVAL:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
@@ -78,6 +80,14 @@ for flag_name in FORCE_EVAL PREFLIGHT_ONLY OFFLINE REQUIRE_TRAINING_MARKER; do
 done
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer." >&2; exit 2; }
 [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || { echo "MAX_SAMPLES must be non-negative." >&2; exit 2; }
+[[ -z "$DATA_VERSION" || "$DATA_VERSION" =~ ^datav[0-9]+$ ]] || {
+    echo "DATA_VERSION must be empty or use the canonical datavN form." >&2
+    exit 2
+}
+[[ -z "$DATASET_SNAPSHOT_HASH" || "$DATASET_SNAPSHOT_HASH" =~ ^[0-9a-fA-F]{64}$ ]] || {
+    echo "DATASET_SNAPSHOT_HASH must be empty or a 64-character SHA256 hex digest." >&2
+    exit 2
+}
 [[ "$EVAL_NUM_GPUS" =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_NUM_GPUS must be positive." >&2; exit 2; }
 [[ "$TS_GPUS_PER_PROCESS" =~ ^[1-9][0-9]*$ ]] || { echo "TS_GPUS_PER_PROCESS must be positive." >&2; exit 2; }
 [[ "$TINY_PARTITION_SEED" =~ ^[0-9]+$ ]] || { echo "TINY_PARTITION_SEED must be non-negative." >&2; exit 2; }
@@ -215,6 +225,7 @@ echo " ChatTS four-suite sequential eight-GPU evaluation"
 echo " Model:          $MODEL_PATH"
 echo " Model name:     $MODEL_NAME"
 echo " Run ID:         $RUN_ID"
+echo " Data version:   ${DATA_VERSION:-<none>}"
 echo " Encoder:        chronos2 ($CHRONOS2_MODEL_PATH)"
 echo " Seed:           $SEED"
 echo " GPU allocation: $EVAL_GPUS (exclusive for each suite)"
@@ -378,6 +389,8 @@ suite_artifact() {
         --model-name "$MODEL_NAME"
         --model-component "$CHRONOS2_MODEL_PATH"
         --eval-protocol-hash "$EVAL_PROTOCOL_HASH"
+        --data-version "$DATA_VERSION"
+        --dataset-snapshot-hash "$DATASET_SNAPSHOT_HASH"
         --protocol-file "$PROJECT_ROOT/scripts/run_all_chatts_benchmarks.sh"
         --protocol-file "$PROJECT_ROOT/chatts/vllm/chatts_vllm.py"
         --protocol-file "$PROJECT_ROOT/chatts/utils/llm_utils.py"
@@ -606,7 +619,9 @@ aggregate_code=0
     --max-samples "$MAX_SAMPLES" \
     --force-eval "$FORCE_EVAL" \
     --output-root "$OUTPUT_ROOT" \
-    --eval-protocol-hash "$EVAL_PROTOCOL_HASH" || aggregate_code=$?
+    --eval-protocol-hash "$EVAL_PROTOCOL_HASH" \
+    --data-version "$DATA_VERSION" \
+    --dataset-snapshot-hash "$DATASET_SNAPSHOT_HASH" || aggregate_code=$?
 if (( aggregate_code != 0 && FAILED_SUITES == 0 )); then
     echo "Metric aggregation failed with exit code $aggregate_code." >&2
     FAILED_SUITES=$((FAILED_SUITES + 1))

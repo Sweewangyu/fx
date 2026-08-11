@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from conftest import read_jsonl, write_jsonl
+
 from chatts_dataset_studio.catalog import CatalogCache
 from chatts_dataset_studio.exporter import parse_rules, preview_selection
 
 
-def test_catalog_scans_all_six_sources_and_label_dimensions(
+def test_catalog_scans_every_registered_source_and_label_dimension(
     labeled_corpus: dict[str, Any],
 ) -> None:
     sources, catalog = CatalogCache().get(
@@ -47,7 +49,7 @@ def test_default_preview_matches_requested_stage_boundaries(
         labeled_corpus["annotations_root"],
         labeled_corpus["data_root"],
     )
-    stage1, stage2 = parse_rules(default_selection, sources)
+    stage1, stage2 = parse_rules(default_selection, sources, catalog)
 
     preview = preview_selection(catalog, stage1, stage2)
 
@@ -68,6 +70,59 @@ def test_default_preview_matches_requested_stage_boundaries(
     }
 
 
+def test_star_selector_expands_to_every_available_source(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    sources, catalog = CatalogCache().get(
+        labeled_corpus["registry_path"],
+        labeled_corpus["annotations_root"],
+        labeled_corpus["data_root"],
+    )
+    all_selection = {
+        stage: {**default_selection[stage], "sources": ["*"]}
+        for stage in ("stage1", "stage2")
+    }
+    stage1, stage2 = parse_rules(all_selection, sources, catalog)
+
+    assert stage1.sources == stage2.sources == frozenset(labeled_corpus["sources"])
+    assert preview_selection(catalog, stage1, stage2)["counts"] == {
+        "stage1": 12,
+        "stage2": 18,
+        "overlap": 6,
+    }
+
+
+def test_star_selector_excludes_sources_that_failed_catalog_validation(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    unavailable_name = "time_mqa"
+    annotation_path = (
+        labeled_corpus["annotations_root"] / "annotations" / f"{unavailable_name}.jsonl"
+    )
+    rows = read_jsonl(annotation_path)
+    rows[0]["annotation_id"] = "wrong:id"
+    write_jsonl(annotation_path, rows)
+    sources, catalog = CatalogCache().get(
+        labeled_corpus["registry_path"],
+        labeled_corpus["annotations_root"],
+        labeled_corpus["data_root"],
+    )
+    all_selection = {
+        stage: {**default_selection[stage], "sources": ["*"]}
+        for stage in ("stage1", "stage2")
+    }
+
+    stage1, stage2 = parse_rules(all_selection, sources, catalog)
+
+    expected = frozenset(set(labeled_corpus["sources"]) - {unavailable_name})
+    assert stage1.sources == stage2.sources == expected
+    assert preview_selection(catalog, stage1, stage2)["counts"] == {
+        "stage1": 10,
+        "stage2": 15,
+        "overlap": 5,
+    }
+
+
 def test_ability_filter_is_optional_and_exact(
     labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
 ) -> None:
@@ -78,7 +133,7 @@ def test_ability_filter_is_optional_and_exact(
     )
     default_selection["stage1"]["abilities"] = ["trend_analysis"]
     default_selection["stage2"]["abilities"] = ["anomaly_detection"]
-    stage1, stage2 = parse_rules(default_selection, sources)
+    stage1, stage2 = parse_rules(default_selection, sources, catalog)
 
     preview = preview_selection(catalog, stage1, stage2)
 

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "chatts-dataset-studio"
-version = "0.1.0"
-description = "Local visual dataset selector and Stage1/Stage2 exporter for annotated ChatTS QA data"
+version = "0.2.0"
+description = "Local ChatTS dataset version, training, and evaluation control plane"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

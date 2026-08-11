@@ -86,6 +86,8 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [`train_timesfm2_5_one_stage.sh`](./direct-files/scripts/full/train_timesfm2_5_one_stage.sh)
 - [`train_chronos2_stage1.sh`](./direct-files/scripts/full/train_chronos2_stage1.sh)
 - [`train_chronos2_stage2.sh`](./direct-files/scripts/full/train_chronos2_stage2.sh)
+- [Chronos-2 两阶段统一入口](./direct-files/scripts/full/run_chronos2_best_two_stage.sh)
+- [Dataset Studio 快照完整性校验器](./direct-files/scripts/verify_dataset_snapshot.py)
 - [`train_zeus_stage1.sh`](./direct-files/scripts/full/train_zeus_stage1.sh)
 - [`train_zeus_stage2.sh`](./direct-files/scripts/full/train_zeus_stage2.sh)
 - [vLLM 四后端版 `chatts_vllm.py`](./direct-files/NetManAIOps-ChatTS/chatts/vllm/chatts_vllm.py)
@@ -93,6 +95,7 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [Dataset A/B 批处理评测脚本](./direct-files/NetManAIOps-ChatTS/scripts/run_chatts_no_ragas_batch.sh)
 - [TS encoder checkpoint 权重盘点脚本](./direct-files/NetManAIOps-ChatTS/scripts/inspect_chatts_ts_encoder_checkpoints.py)
 - [NetManAIOps/ChatTS 覆盖与评测说明](./direct-files/NetManAIOps-ChatTS/README.md)
+- [宿主机一键训练 + 四套评测入口](./direct-files/NetManAIOps-ChatTS/scripts/run_train_then_eval.sh)
 
 其中 `timesfm2_5.py`、`chronos2.py`、`zeus.py`、`zeus_modeling.py` 和
 `timeseries_backbones.py` 是新增文件，其余 Python 文件包含基于 `bf30699` 的完整修改后内容。

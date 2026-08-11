@@ -8,6 +8,10 @@ pipeline:
   preflight_only: false
   max_samples: 0             # 0 = full evaluation
   offline: true
+  # Dataset Studio writes both values into the immutable version manifest.
+  # For a legacy data directory with no manifest, leave both values empty.
+  data_version: null
+  dataset_snapshot_hash: null
 
 containers:
   training: chatts
@@ -84,3 +88,21 @@ evaluation:
   haystack_split: test
   tiny_data_partition: all
   tiny_partition_seed: 42
+  # Safe advanced controls. These are the historical runner defaults; omitting
+  # them keeps old configuration files fully backward compatible.
+  tsr_prompt_mode: answer_only
+  tsr_max_model_len: 12288
+  tsr_max_new_tokens: 8
+  tsr_batch_size: 16
+  tsr_request_chunk_size: 128
+  tiny_max_model_len: 6000
+  tiny_request_chunk_size: 16
+  tiny_gpu_memory_utilization: "0.70"
+  haystack_max_model_len: 40960
+  haystack_max_new_tokens: 500
+  haystack_batch_size: 1
+  haystack_request_chunk_size: 8
+  exam_max_model_len: 8192
+  exam_max_new_tokens: 1024
+  exam_batch_size: 8
+  exam_request_chunk_size: 64

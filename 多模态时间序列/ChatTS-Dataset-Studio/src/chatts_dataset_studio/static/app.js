@@ -5,35 +5,49 @@ const state = {
   catalog: null,
   preview: null,
   previewFingerprint: null,
-  exporting: false,
+  versions: [],
+  nextVersion: null,
+  activeVersion: null,
+  pipelineEnabled: false,
+  jobs: [],
+  activeJobId: null,
+  busy: new Set(),
   stages: {
     stage1: { sources: new Set(), qualities: new Set(), difficulties: new Set(), abilities: new Set() },
     stage2: { sources: new Set(), qualities: new Set(), difficulties: new Set(), abilities: new Set() },
   },
 };
 
-const $ = (selector) => document.querySelector(selector);
-const number = new Intl.NumberFormat("zh-CN");
-const paths = {
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+const countFormatter = new Intl.NumberFormat("zh-CN");
+const pathFields = {
   registry_path: $("#registry-path"),
   annotations_root: $("#annotations-root"),
   data_root: $("#data-root"),
   output_root: $("#output-root"),
 };
 
-function node(tag, className, text) {
-  const element = document.createElement(tag);
-  if (className) element.className = className;
-  if (text !== undefined) element.textContent = text;
-  return element;
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function element(tag, className, text) {
+  const item = document.createElement(tag);
+  if (className) item.className = className;
+  if (text !== undefined) item.textContent = text;
+  return item;
 }
 
 function formatCount(value) {
-  return number.format(Number(value || 0));
+  return countFormatter.format(Number(value || 0));
 }
 
-function showToast(message, isError = false) {
-  const toast = node("div", `toast${isError ? " is-error" : ""}`, message);
+function showToast(message, kind = "info") {
+  const toast = element("div", `toast ${kind}`, message);
   $("#toast-region").append(toast);
   window.setTimeout(() => toast.remove(), 4200);
 }
@@ -41,343 +55,393 @@ function showToast(message, isError = false) {
 async function api(url, options = {}) {
   const response = await fetch(url, {
     ...options,
-    headers: options.body ? { "Content-Type": "application/json" } : undefined,
+    headers: options.body ? { "Content-Type": "application/json", ...(options.headers || {}) } : options.headers,
   });
-  let payload;
-  try {
-    payload = await response.json();
-  } catch {
-    throw new Error(`服务返回了无法解析的响应（HTTP ${response.status}）`);
+  const contentType = response.headers.get("content-type") || "";
+  let payload = null;
+  if (contentType.includes("application/json")) {
+    try { payload = await response.json(); } catch { payload = null; }
   }
-  if (!response.ok || payload.error) {
-    throw new Error(payload.error || `请求失败（HTTP ${response.status}）`);
+  if (!response.ok || (payload && payload.error)) {
+    const fallback = response.status === 404 ? "当前服务未启用此功能" : `请求失败（HTTP ${response.status}）`;
+    throw new ApiError(payload?.error || fallback, response.status);
   }
-  return payload;
+  return payload ?? {};
+}
+
+async function optionalGet(url, fallback) {
+  try { return await api(url); } catch (error) {
+    if (error.status === 404) return fallback;
+    throw error;
+  }
 }
 
 function pathPayload() {
-  return {
-    registry_path: paths.registry_path.value.trim(),
-    annotations_root: paths.annotations_root.value.trim(),
-    data_root: paths.data_root.value.trim() || null,
-    output_root: paths.output_root.value.trim(),
-  };
+  return Object.fromEntries(Object.entries(pathFields).map(([key, input]) => [key, input.value.trim() || null]));
 }
 
 function stagePayload(stageName) {
   const stage = state.stages[stageName];
+  const available = (state.catalog?.sources || [])
+    .filter((source) => source.available)
+    .map((source) => source.name);
+  const selectedAll = available.length > 0
+    && available.every((name) => stage.sources.has(name))
+    && stage.sources.size === available.length;
   return {
-    sources: [...stage.sources].sort(),
-    qualities: [...stage.qualities],
-    difficulties: [...stage.difficulties],
+    sources: selectedAll ? ["*"] : [...stage.sources].sort(),
+    qualities: [...stage.qualities].sort(),
+    difficulties: [...stage.difficulties].sort(),
     abilities: [...stage.abilities].sort(),
   };
 }
 
+function recipePayload() {
+  return { stage1: stagePayload("stage1"), stage2: stagePayload("stage2") };
+}
+
 function selectionPayload() {
-  return {
-    ...pathPayload(),
-    stage1: stagePayload("stage1"),
-    stage2: stagePayload("stage2"),
-  };
+  return { ...pathPayload(), ...recipePayload() };
 }
 
 function selectionFingerprint() {
   return JSON.stringify(selectionPayload());
 }
 
-function markSelectionDirty() {
-  if (state.previewFingerprint) {
-    const dirty = state.previewFingerprint !== selectionFingerprint();
-    if (dirty) {
-      $("#preview-message").hidden = false;
-      $("#preview-message").textContent = "筛选条件已变化，请重新计算样本量。";
-      $("#preview-message").classList.remove("is-error");
-      $("#preview-detail").hidden = true;
-      $("#export-section").classList.add("is-locked");
-    } else if (state.preview) {
-      renderPreview(state.preview);
-    }
+function normalizeCollection(payload, key) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.[key])) return payload[key];
+  if (payload?.[key] && typeof payload[key] === "object") {
+    const idKey = key === "versions" ? "version" : "job_id";
+    return Object.entries(payload[key]).filter(([, value]) => value && typeof value === "object").map(([id, value]) => ({ [idKey]: id, ...value }));
   }
-  updateStageCounts();
+  if (payload && typeof payload === "object" && key === "versions") {
+    return Object.entries(payload).filter(([, value]) => value && typeof value === "object").map(([version, value]) => ({ version, ...value }));
+  }
+  return [];
 }
 
-function setBusy(button, busy, label) {
-  button.disabled = busy;
-  button.classList.toggle("loading", busy);
-  if (label) button.querySelector("span") ? button.querySelector("span").replaceChildren(label) : button.replaceChildren(label);
+function versionName(version) {
+  const value = version?.version || version?.name || version?.data_version || "";
+  return value && typeof value === "object" ? versionName(value) : String(value);
+}
+
+function jobId(job) {
+  return String(job?.job_id || job?.id || "");
+}
+
+function currentVersionName() {
+  return versionName(state.activeVersion) || $("#version-name").value.trim();
 }
 
 function setHealth(kind, text) {
-  const pill = $("#health-pill");
-  pill.classList.toggle("is-online", kind === "online");
-  pill.classList.toggle("is-error", kind === "error");
+  $("#health-pill").className = `connection-pill ${kind}`;
   $("#health-text").textContent = text;
 }
 
-function setUnlocked(unlocked) {
-  for (const selector of ["#datasets-section", "#rules-section", "#preview-section"]) {
-    $(selector).classList.toggle("is-locked", !unlocked);
-  }
-  if (!unlocked) $("#export-section").classList.add("is-locked");
+function setBusy(button, busy, label) {
+  if (!button) return;
+  const key = button.id || button.dataset.runMode || button.textContent.trim();
+  if (!button.dataset.defaultLabel) button.dataset.defaultLabel = button.textContent.trim();
+  if (busy) state.busy.add(key); else state.busy.delete(key);
+  button.classList.toggle("is-busy", busy);
+  button.setAttribute("aria-busy", String(busy));
+  button.textContent = busy ? label : button.dataset.defaultLabel;
+  renderActionState();
+}
+
+async function withBusy(button, label, task) {
+  setBusy(button, true, label);
+  try { return await task(); } finally { setBusy(button, false, label); }
+}
+
+function renderActionState() {
+  const scanned = Boolean(state.catalog);
+  const previewReady = Boolean(state.preview && state.previewFingerprint === selectionFingerprint());
+  const hasVersion = Boolean(versionName(state.activeVersion));
+  const canRun = hasVersion && state.pipelineEnabled;
+  $("#scan-button").disabled = !state.defaults || state.busy.has("scan-button");
+  $("#rebuild-sources").disabled = !state.defaults || state.busy.has("rebuild-sources");
+  $("#preview-button").disabled = !scanned || state.busy.has("preview-button");
+  $("#publish-button").disabled = !previewReady || state.busy.has("publish-button");
+  $$(".run-button").forEach((button) => { button.disabled = !canRun || state.busy.has(button.dataset.runMode); });
+  $("#overview-preflight").disabled = !canRun || state.busy.has("overview-preflight");
+  $("#overview-run").disabled = !canRun || state.busy.has("overview-run");
+}
+
+function activateTab(name, { focus = false, updateHash = true } = {}) {
+  const tab = $(`[data-tab="${name}"]`);
+  const panel = $(`[data-panel="${name}"]`);
+  if (!tab || !panel) return;
+  $$("[role=tab]").forEach((item) => {
+    const selected = item === tab;
+    item.setAttribute("aria-selected", String(selected));
+    item.tabIndex = selected ? 0 : -1;
+  });
+  $$("[role=tabpanel]").forEach((item) => { item.hidden = item !== panel; });
+  if (focus) tab.focus();
+  if (updateHash) history.replaceState(null, "", `#${name}`);
+  if (name === "jobs") refreshJobs({ quiet: true });
+}
+
+function handleTabKeys(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const tabs = $$("[role=tab]");
+  const index = tabs.indexOf(event.currentTarget);
+  let next = index;
+  if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+  if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+  if (event.key === "Home") next = 0;
+  if (event.key === "End") next = tabs.length - 1;
+  event.preventDefault();
+  activateTab(tabs[next].dataset.tab, { focus: true });
+}
+
+function openSettings(open) {
+  const panel = $("#settings-panel");
+  const backdrop = $("#settings-backdrop");
+  panel.hidden = !open;
+  backdrop.hidden = !open;
+  $("#open-settings").setAttribute("aria-expanded", String(open));
+  document.body.classList.toggle("settings-open", open);
+  if (open) $("#registry-path").focus(); else $("#open-settings").focus();
 }
 
 function initializeRules() {
+  const fallback = {
+    stage1: { qualities: ["weak", "acceptable", "good", "excellent"], difficulties: ["very_easy", "easy", "moderate"] },
+    stage2: { qualities: ["weak", "acceptable", "good", "excellent"], difficulties: ["moderate", "hard", "very_hard"] },
+  };
   for (const stageName of ["stage1", "stage2"]) {
-    const preset = state.defaults.presets[stageName];
-    state.stages[stageName].qualities = new Set(preset.qualities);
-    state.stages[stageName].difficulties = new Set(preset.difficulties);
+    const preset = state.defaults.presets?.[stageName] || fallback[stageName];
+    state.stages[stageName].qualities = new Set(preset.qualities || []);
+    state.stages[stageName].difficulties = new Set(preset.difficulties || []);
     state.stages[stageName].abilities = new Set();
   }
 }
 
-function renderRuleGroup(stageName, type, title, description, values, labels, selected) {
-  const group = node("fieldset", "rule-group");
-  const legend = node("legend", "sr-only", title);
-  group.append(legend);
-  const heading = node("div", "rule-heading");
-  heading.append(node("strong", "", title), node("small", "", description));
-  group.append(heading);
-  const chips = node("div", "chips");
-  values.forEach((value) => {
-    const label = node("label", "chip");
-    const input = node("input");
+function markRecipeDirty() {
+  updateStageCounts();
+  if (state.previewFingerprint !== selectionFingerprint()) {
+    $("#recipe-state").textContent = state.preview ? "已修改" : "未预览";
+    $("#recipe-state").className = "dirty-chip dirty";
+    $("#preview-message").textContent = state.preview ? "配方已变化，请重新预览。" : "选择数据源后计算。";
+    $("#preview-detail").hidden = true;
+  }
+  renderActionState();
+}
+
+function ruleGroup(stageName, type, title, values, labels, selected) {
+  const fieldset = element("fieldset", "rule-group");
+  fieldset.append(element("legend", "", title));
+  const chips = element("div", "chips");
+  for (const value of values || []) {
+    const label = element("label", "chip");
+    const input = element("input");
     input.type = "checkbox";
     input.checked = selected.has(value);
     input.dataset.stage = stageName;
     input.dataset.type = type;
     input.value = value;
-    const translated = labels && labels[value] ? labels[value] : value;
-    label.append(input, node("span", "", translated));
+    label.append(input, element("span", "", labels?.[value] || value));
     chips.append(label);
-  });
-  group.append(chips);
-  return group;
+  }
+  fieldset.append(chips);
+  return fieldset;
 }
 
-function renderAbilityGroup(stageName) {
+function abilityGroup(stageName) {
   const selected = state.stages[stageName].abilities;
-  const group = node("fieldset", "rule-group");
-  group.append(node("legend", "sr-only", "能力维度"));
-  const heading = node("div", "rule-heading");
-  heading.append(node("strong", "", "能力维度"), node("small", "", "不限定时包含全部能力"));
-  group.append(heading);
-  const chips = node("div", "chips");
-  const allLabel = node("label", "chip chip-all");
-  const allInput = node("input");
+  const fieldset = element("fieldset", "rule-group");
+  fieldset.append(element("legend", "", "能力"));
+  const chips = element("div", "chips");
+  const all = element("label", "chip all-chip");
+  const allInput = element("input");
   allInput.type = "checkbox";
   allInput.checked = selected.size === 0;
   allInput.dataset.stage = stageName;
   allInput.dataset.type = "abilities-all";
-  allInput.value = "__all__";
-  allLabel.append(allInput, node("span", "", "全部能力"));
-  chips.append(allLabel);
-  for (const ability of state.catalog.abilities) {
-    const label = node("label", "chip");
-    const input = node("input");
+  all.append(allInput, element("span", "", "全部"));
+  chips.append(all);
+  for (const ability of state.catalog?.abilities || []) {
+    const label = element("label", "chip");
+    const input = element("input");
     input.type = "checkbox";
     input.checked = selected.has(ability);
     input.dataset.stage = stageName;
     input.dataset.type = "abilities";
     input.value = ability;
-    label.append(input, node("span", "", ability));
+    label.append(input, element("span", "", ability));
     chips.append(label);
   }
-  group.append(chips);
-  return group;
+  fieldset.append(chips);
+  return fieldset;
 }
 
 function renderRules() {
   if (!state.catalog) return;
   for (const stageName of ["stage1", "stage2"]) {
     const stage = state.stages[stageName];
-    const root = $(`#${stageName}-rules`);
-    root.replaceChildren(
-      renderRuleGroup(
-        stageName, "qualities", "质量等级", "可多选，weak 以上为默认",
-        state.defaults.quality_levels, state.defaults.quality_labels_zh, stage.qualities,
-      ),
-      renderRuleGroup(
-        stageName, "difficulties", "难度等级", stageName === "stage1" ? "默认中等及以下" : "默认中等及以上",
-        state.defaults.difficulty_levels, state.defaults.difficulty_labels_zh, stage.difficulties,
-      ),
-      renderAbilityGroup(stageName),
+    $(`#${stageName}-rules`).replaceChildren(
+      ruleGroup(stageName, "qualities", "质量", state.defaults.quality_levels, state.defaults.quality_labels_zh, stage.qualities),
+      ruleGroup(stageName, "difficulties", "难度", state.defaults.difficulty_levels, state.defaults.difficulty_labels_zh, stage.difficulties),
+      abilityGroup(stageName),
     );
   }
 }
 
 function sourceSearchText(source) {
-  return `${source.name} ${source.family} ${source.training_role} ${source.split}`.toLocaleLowerCase();
+  return `${source.name || ""} ${source.family || ""} ${source.training_role || ""} ${source.split || ""}`.toLocaleLowerCase();
 }
 
-function createSourceToggle(source, stageName) {
-  const label = node("label", "source-toggle");
-  label.title = source.available ? `${stageName === "stage1" ? "Stage 1" : "Stage 2"} 使用 ${source.name}` : "标注不可用";
-  const input = node("input");
+function sourceToggle(source, stageName) {
+  const label = element("label", "source-toggle");
+  const input = element("input");
   input.type = "checkbox";
   input.checked = state.stages[stageName].sources.has(source.name);
   input.disabled = !source.available;
   input.dataset.source = source.name;
   input.dataset.stage = stageName;
-  input.setAttribute("aria-label", label.title);
-  label.append(input, node("span"));
+  input.setAttribute("aria-label", `${stageName === "stage1" ? "Stage 1" : "Stage 2"} ${input.checked ? "移除" : "使用"} ${source.name}`);
+  label.append(input, element("span"));
   return label;
 }
 
 function renderSources() {
   const root = $("#source-list");
   root.replaceChildren();
-  for (const source of state.catalog.sources) {
-    const row = node("article", `source-row${source.available ? "" : " is-unavailable"}`);
+  for (const source of state.catalog?.sources || []) {
+    const row = element("div", `source-row${source.available ? "" : " unavailable"}`);
+    row.setAttribute("role", "row");
     row.dataset.search = sourceSearchText(source);
-    const identity = node("div", "source-name");
-    identity.append(node("strong", "", source.name));
-    const tags = node("div", "source-tags");
-    tags.append(node("span", "", source.family), node("span", "", source.training_role), node("span", "", source.split));
-    identity.append(tags);
-    const meta = node("div", "source-meta");
-    meta.append(node("strong", "", formatCount(source.rows)));
-    const availability = node(
-      "span",
-      source.available ? "available" : "missing",
-      source.available ? `${source.annotation_mode} 标注可用` : "标注不可用",
-    );
-    if (!source.available && source.errors && source.errors.length) availability.title = source.errors.join("\n");
-    meta.append(availability);
-    row.append(identity, meta, createSourceToggle(source, "stage1"), createSourceToggle(source, "stage2"));
+    const identity = element("div", "source-identity");
+    identity.setAttribute("role", "cell");
+    identity.append(element("strong", "", source.name));
+    identity.append(element("small", "", [source.family, source.training_role, source.split].filter(Boolean).join(" · ")));
+    const meta = element("div", "source-meta");
+    meta.setAttribute("role", "cell");
+    meta.append(element("strong", "", formatCount(source.rows)), element("small", source.available ? "ok" : "error", source.available ? "可用" : "不可用"));
+    if (!source.available && source.errors?.length) meta.title = source.errors.join("\n");
+    row.append(identity, meta, sourceToggle(source, "stage1"), sourceToggle(source, "stage2"));
     root.append(row);
   }
+  if (!root.childElementCount) root.append(element("div", "list-empty", "没有数据源"));
   applySourceSearch();
 }
 
 function applySourceSearch() {
   const query = $("#dataset-search").value.trim().toLocaleLowerCase();
   let visible = 0;
-  document.querySelectorAll(".source-row").forEach((row) => {
-    row.hidden = query && !row.dataset.search.includes(query);
+  $$(".source-row", $("#source-list")).forEach((row) => {
+    row.hidden = Boolean(query && !row.dataset.search.includes(query));
     if (!row.hidden) visible += 1;
   });
-  $("#source-list").classList.toggle("has-no-match", Boolean(state.catalog && visible === 0));
+  $("#source-list").classList.toggle("no-match", Boolean(state.catalog && visible === 0));
 }
 
 function updateStageCounts() {
   for (const stageName of ["stage1", "stage2"]) {
     const size = state.stages[stageName].sources.size;
-    $(`#${stageName}-source-count`).textContent = `${size} 个数据源`;
+    $(`#${stageName}-source-count`).textContent = `${size} 源`;
+    $(`#metric-${stageName}-detail`).textContent = `${size} 源`;
   }
 }
 
 function chooseSources(mode) {
   if (!state.catalog) return;
-  const available = state.catalog.sources.filter((item) => item.available).map((item) => item.name);
-  let names = [];
-  if (mode === "all") names = available;
-  if (mode === "defaults") names = state.defaults.target_sources.filter((name) => available.includes(name));
+  const available = state.catalog.sources.filter((source) => source.available).map((source) => source.name);
+  const names = mode === "all" ? available : [];
   for (const stageName of ["stage1", "stage2"]) state.stages[stageName].sources = new Set(names);
   renderSources();
-  markSelectionDirty();
-  showToast(mode === "clear" ? "已清空两个阶段的数据源" : `两个阶段已选择 ${names.length} 个数据源`);
+  markRecipeDirty();
+  showToast(mode === "clear" ? "已清空" : `已选择 ${names.length} 个数据源`, "success");
 }
 
-function catalogStats() {
-  const root = $("#catalog-stats");
-  root.replaceChildren();
-  root.append(
-    node("span", "", `${state.catalog.available_sources} / ${state.catalog.total_sources} 源可用`),
-    node("span", "", `${formatCount(state.catalog.total_rows)} 条已标注`),
-    node("span", "", `${state.catalog.abilities.length} 个能力维度`),
-  );
-  const missing = state.catalog.total_sources - state.catalog.available_sources;
-  if (missing) root.append(node("span", "is-warn", `${missing} 个源不可用`));
+function renderCatalogSummary() {
+  const catalog = state.catalog;
+  const missing = Number(catalog.total_sources || 0) - Number(catalog.available_sources || 0);
+  $("#catalog-stats").textContent = `${catalog.available_sources} / ${catalog.total_sources} 可用 · ${formatCount(catalog.total_rows)} 条${missing ? ` · ${missing} 不可用` : ""}`;
+  $("#overview-sources").textContent = String(catalog.available_sources || 0);
+  $("#overview-source-meta").textContent = `${formatCount(catalog.total_rows)} 条已标注`;
 }
 
 async function scanCatalog() {
   const button = $("#scan-button");
-  const status = $("#scan-status");
-  if (!paths.registry_path.value.trim() || !paths.annotations_root.value.trim()) {
-    showToast("请先填写数据源注册表和标注目录", true);
+  if (!pathFields.registry_path.value.trim() || !pathFields.annotations_root.value.trim()) {
+    showToast("请填写注册表和标注目录", "error");
     return;
   }
-  setBusy(button, true, "正在扫描");
-  status.textContent = "正在逐行读取标注，数据较大时可能需要几分钟…";
-  status.classList.remove("is-error");
-  try {
-    state.catalog = await api("/api/catalog", { method: "POST", body: JSON.stringify(pathPayload()) });
-    initializeRules();
-    const available = new Set(state.catalog.sources.filter((item) => item.available).map((item) => item.name));
-    const defaults = state.defaults.target_sources.filter((name) => available.has(name));
-    state.stages.stage1.sources = new Set(defaults);
-    state.stages.stage2.sources = new Set(defaults);
-    state.preview = null;
-    state.previewFingerprint = null;
-    renderSources();
-    renderRules();
-    catalogStats();
-    updateStageCounts();
-    setUnlocked(true);
-    resetPreview();
-    status.textContent = `扫描完成：${state.catalog.available_sources} 个可用数据源，默认选中 ${defaults.length} 个示例源。`;
-    showToast("数据目录扫描完成");
-    $("#datasets-section").scrollIntoView({ behavior: "smooth", block: "start" });
-  } catch (error) {
-    setUnlocked(false);
-    status.textContent = error.message;
-    status.classList.add("is-error");
-    showToast(error.message, true);
-  } finally {
-    setBusy(button, false, "扫描数据与标注");
-  }
+  await withBusy(button, "扫描中…", async () => {
+    $("#scan-status").textContent = "扫描中…";
+    try {
+      state.catalog = await api("/api/catalog", { method: "POST", body: JSON.stringify(pathPayload()) });
+      initializeRules();
+      const available = state.catalog.sources.filter((source) => source.available).map((source) => source.name);
+      for (const stageName of ["stage1", "stage2"]) state.stages[stageName].sources = new Set(available);
+      state.preview = null;
+      state.previewFingerprint = null;
+      renderSources();
+      renderRules();
+      updateStageCounts();
+      renderCatalogSummary();
+      markRecipeDirty();
+      $("#scan-status").textContent = `${state.catalog.available_sources} 个源可用`;
+      $("#overview-status").textContent = "数据已就绪，可编辑配方。";
+      openSettings(false);
+      activateTab("recipe");
+      showToast("扫描完成", "success");
+    } catch (error) {
+      $("#scan-status").textContent = error.message;
+      showToast(error.message, "error");
+    }
+  });
 }
 
-function validateSelection() {
+async function rebuildSources() {
+  const button = $("#rebuild-sources");
+  await withBusy(button, "刷新中…", async () => {
+    try {
+      const result = await api("/api/registry/rebuild", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      showToast(`已创建 ${formatCount(result.source_count)} 个 source`, "success");
+      await scanCatalog();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function validateRecipe() {
   for (const stageName of ["stage1", "stage2"]) {
     const label = stageName === "stage1" ? "Stage 1" : "Stage 2";
     const stage = state.stages[stageName];
-    if (!stage.sources.size) throw new Error(`${label} 至少需要选择一个数据源`);
-    if (!stage.qualities.size) throw new Error(`${label} 至少需要选择一个质量等级`);
-    if (!stage.difficulties.size) throw new Error(`${label} 至少需要选择一个难度等级`);
+    if (!stage.sources.size) throw new Error(`${label} 至少选择一个数据源`);
+    if (!stage.qualities.size) throw new Error(`${label} 至少选择一个质量等级`);
+    if (!stage.difficulties.size) throw new Error(`${label} 至少选择一个难度等级`);
   }
 }
 
-function resetPreview() {
-  state.preview = null;
-  state.previewFingerprint = null;
-  for (const id of ["#metric-stage1", "#metric-stage2", "#metric-overlap"]) $(id).textContent = "—";
-  $("#metric-stage1-detail").textContent = "等待预览";
-  $("#metric-stage2-detail").textContent = "等待预览";
-  $("#metric-overlap-detail").textContent = "中等难度可同时出现";
-  $("#preview-detail").hidden = true;
-  $("#preview-message").hidden = false;
-  $("#preview-message").textContent = "完成规则选择后，点击“计算样本量”。";
-  $("#preview-message").classList.remove("is-error");
-  $("#export-section").classList.add("is-locked");
-}
-
-function displayLabel(type, key) {
-  if (type === "quality") return state.defaults.quality_labels_zh[key] || key;
-  if (type === "difficulty") return state.defaults.difficulty_labels_zh[key] || key;
+function distributionLabel(type, key) {
+  if (type === "quality") return state.defaults.quality_labels_zh?.[key] || key;
+  if (type === "difficulty") return state.defaults.difficulty_labels_zh?.[key] || key;
   return key;
 }
 
 function renderDistribution(stageName, preview) {
   const root = $(`#${stageName}-distribution`);
-  root.classList.toggle("stage-two-bars", stageName === "stage2");
   root.replaceChildren();
-  const total = preview.counts[stageName];
-  const groups = [
-    ["quality", "质量"],
-    ["difficulty", "难度"],
-  ];
-  for (const [type, prefix] of groups) {
-    const distribution = preview.distributions[stageName][type];
-    for (const [key, value] of Object.entries(distribution).sort((a, b) => b[1] - a[1])) {
-      const item = node("div", "bar-item");
-      item.append(node("span", "", `${prefix} · ${displayLabel(type, key)}`));
-      const track = node("progress", "bar-track");
-      track.max = total || 1;
-      track.value = value;
-      track.textContent = total ? `${((value / total) * 100).toFixed(1)}%` : "0%";
-      item.append(track, node("span", "bar-value", formatCount(value)));
+  const total = Number(preview.counts[stageName] || 0);
+  for (const [type, prefix] of [["quality", "质量"], ["difficulty", "难度"]]) {
+    const entries = Object.entries(preview.distributions?.[stageName]?.[type] || {}).sort((left, right) => right[1] - left[1]);
+    for (const [key, value] of entries) {
+      const item = element("div", "bar-item");
+      const progress = element("progress");
+      progress.max = total || 1;
+      progress.value = value;
+      progress.setAttribute("aria-label", `${prefix}${distributionLabel(type, key)} ${formatCount(value)} 条`);
+      item.append(element("span", "", `${prefix} · ${distributionLabel(type, key)}`), progress, element("strong", "", formatCount(value)));
       root.append(item);
     }
   }
@@ -386,229 +450,579 @@ function renderDistribution(stageName, preview) {
 
 function renderPreview(preview) {
   state.preview = preview;
-  const { counts } = preview;
+  const counts = preview.counts || {};
   $("#metric-stage1").textContent = formatCount(counts.stage1);
   $("#metric-stage2").textContent = formatCount(counts.stage2);
   $("#metric-overlap").textContent = formatCount(counts.overlap);
-  $("#metric-stage1-detail").textContent = `${state.stages.stage1.sources.size} 个数据源`;
-  $("#metric-stage2-detail").textContent = `${state.stages.stage2.sources.size} 个数据源`;
-  const denominator = Math.min(counts.stage1, counts.stage2);
-  $("#metric-overlap-detail").textContent = denominator ? `占较小阶段 ${((counts.overlap / denominator) * 100).toFixed(1)}%` : "无重叠";
+  const denominator = Math.min(Number(counts.stage1 || 0), Number(counts.stage2 || 0));
+  $("#metric-overlap-detail").textContent = denominator ? `${((Number(counts.overlap || 0) / denominator) * 100).toFixed(1)}%` : "无重叠";
+  $("#overview-stage-counts").textContent = `${formatCount(counts.stage1)} / ${formatCount(counts.stage2)}`;
+  $("#overview-overlap").textContent = `重叠 ${formatCount(counts.overlap)} 条`;
   renderDistribution("stage1", preview);
   renderDistribution("stage2", preview);
-  const tbody = $("#source-results");
-  tbody.replaceChildren();
-  for (const row of preview.by_source) {
-    const tr = node("tr");
-    for (const value of [row.source, row.source_rows, row.stage1, row.stage2, row.overlap]) tr.append(node("td", "", typeof value === "number" ? formatCount(value) : value));
-    tbody.append(tr);
+  const body = $("#source-results");
+  body.replaceChildren();
+  for (const source of preview.by_source || []) {
+    const row = element("tr");
+    for (const value of [source.source, source.source_rows, source.stage1, source.stage2, source.overlap]) row.append(element("td", "", typeof value === "number" ? formatCount(value) : value));
+    body.append(row);
   }
   $("#preview-detail").hidden = false;
-  $("#preview-message").hidden = true;
-  $("#export-section").classList.remove("is-locked");
+  $("#preview-message").textContent = "配方已计算，可发布版本。";
+  $("#recipe-state").textContent = "已预览";
+  $("#recipe-state").className = "dirty-chip ready";
+  renderVersionSummary();
+  renderActionState();
 }
 
 async function calculatePreview({ quiet = false } = {}) {
   const button = $("#preview-button");
-  const message = $("#preview-message");
-  validateSelection();
-  setBusy(button, true);
-  message.hidden = false;
-  message.textContent = "正在计算精确筛选结果…";
-  message.classList.remove("is-error");
+  validateRecipe();
+  return withBusy(button, "计算中…", async () => {
+    try {
+      $("#preview-message").textContent = "正在计算…";
+      const payload = selectionPayload();
+      const fingerprint = JSON.stringify(payload);
+      const preview = await api("/api/preview", { method: "POST", body: JSON.stringify(payload) });
+      if (selectionFingerprint() !== fingerprint) {
+        $("#preview-message").textContent = "配方已在计算期间改变，请重新预览。";
+        markRecipeDirty();
+        return null;
+      }
+      state.previewFingerprint = fingerprint;
+      renderPreview(preview);
+      if (!quiet) showToast("预览已更新", "success");
+      return preview;
+    } catch (error) {
+      $("#preview-message").textContent = error.message;
+      if (!quiet) showToast(error.message, "error");
+      throw error;
+    }
+  });
+}
+
+function nextVersionName() {
+  if (/^datav[1-9]\d*$/.test(state.nextVersion || "")) return state.nextVersion;
+  const numbers = state.versions.map((version) => /^datav(\d+)$/.exec(versionName(version))?.[1]).filter(Boolean).map(Number);
+  return `datav${numbers.length ? Math.max(...numbers) + 1 : 3}`;
+}
+
+function renderVersionSummary() {
+  if (!state.preview) {
+    $("#version-summary").textContent = "先在“数据配方”中完成预览。";
+    return;
+  }
+  const counts = state.preview.counts;
+  $("#version-summary").textContent = `${state.stages.stage1.sources.size}/${state.stages.stage2.sources.size} 个源 · S1 ${formatCount(counts.stage1)} · S2 ${formatCount(counts.stage2)} · 重叠 ${formatCount(counts.overlap)}`;
+}
+
+function renderVersions() {
+  const root = $("#version-list");
+  root.replaceChildren();
+  const sorted = [...state.versions].sort((left, right) => versionName(right).localeCompare(versionName(left), undefined, { numeric: true }));
+  for (const version of sorted) {
+    const name = versionName(version);
+    if (!name) continue;
+    const item = element("article", "version-item");
+    const header = element("div", "version-item-heading");
+    const identity = element("div");
+    identity.append(element("strong", "", name));
+    identity.append(element("small", "", version.notes || version.description || version.created_at || "无说明"));
+    const isActive = name === versionName(state.activeVersion);
+    const status = element("span", `status-chip ${isActive ? "active" : ""}`, isActive ? "当前" : (version.registered ? "已注册" : version.status || "已发布"));
+    header.append(identity, status);
+    const meta = element("p", "", [version.parent ? `基于 ${version.parent}` : "", version.dataset_snapshot_hash ? `#${String(version.dataset_snapshot_hash).slice(0, 10)}` : ""].filter(Boolean).join(" · "));
+    const actions = element("div", "compact-actions");
+    const register = element("button", "", "注册");
+    register.type = "button";
+    register.dataset.versionAction = "register";
+    register.dataset.version = name;
+    register.disabled = Boolean(version.registered);
+    const activate = element("button", "", "设为当前");
+    activate.type = "button";
+    activate.dataset.versionAction = "activate";
+    activate.dataset.version = name;
+    activate.disabled = isActive;
+    actions.append(register, activate);
+    item.append(header, meta, actions);
+    root.append(item);
+  }
+  if (!root.childElementCount) root.append(element("div", "list-empty", "暂无版本"));
+
+  const parent = $("#version-parent");
+  const selected = parent.value;
+  parent.replaceChildren(new Option("无", ""));
+  for (const version of sorted) {
+    const name = versionName(version);
+    if (name) parent.append(new Option(name, name));
+  }
+  if ([...parent.options].some((option) => option.value === selected)) parent.value = selected;
+  $("#version-name").value = nextVersionName();
+  renderCurrentVersion();
+}
+
+function renderCurrentVersion() {
+  const name = versionName(state.activeVersion);
+  for (const id of ["#current-version-chip", "#overview-version", "#training-version", "#evaluation-version"]) $(id).textContent = name || "未发布";
+  $("#overview-version-meta").textContent = name ? (state.activeVersion.dataset_snapshot_hash ? `#${String(state.activeVersion.dataset_snapshot_hash).slice(0, 12)}` : "已设为当前版本") : "先发布数据版本";
+  const stage1 = state.activeVersion?.dataset_names?.stage1 || state.activeVersion?.composition?.stage1?.dataset_names || state.activeVersion?.datasets?.stage1 || [];
+  const stage2 = state.activeVersion?.dataset_names?.stage2 || state.activeVersion?.composition?.stage2?.dataset_names || state.activeVersion?.datasets?.stage2 || [];
+  $("#stage1-datasets").textContent = Array.isArray(stage1) && stage1.length ? stage1.join(", ") : "由数据版本生成";
+  $("#stage2-datasets").textContent = Array.isArray(stage2) && stage2.length ? stage2.join(", ") : "由数据版本生成";
+  updateDerivedPaths();
+  renderActionState();
+}
+
+async function refreshVersions({ quiet = false } = {}) {
   try {
-    const preview = await api("/api/preview", { method: "POST", body: JSON.stringify(selectionPayload()) });
-    state.previewFingerprint = selectionFingerprint();
-    renderPreview(preview);
-    if (!quiet) showToast("预览已更新");
-    return preview;
+    const payload = await optionalGet("/api/versions", { versions: [] });
+    state.versions = normalizeCollection(payload, "versions");
+    state.nextVersion = payload?.next_version || null;
+    const activeName = payload?.active_version || payload?.current_version;
+    state.activeVersion = state.versions.find((version) => version.active || versionName(version) === activeName) || (activeName ? { version: activeName } : null);
+    renderVersions();
   } catch (error) {
-    message.hidden = false;
-    message.textContent = error.message;
-    message.classList.add("is-error");
-    $("#export-section").classList.add("is-locked");
-    if (!quiet) showToast(error.message, true);
-    throw error;
-  } finally {
-    setBusy(button, false);
+    if (!quiet) showToast(error.message, "error");
   }
 }
 
-function updateProgress(job) {
-  const total = Number(job.total_rows || 0);
-  const processed = Number(job.processed_rows || 0);
-  const completed = job.status === "completed";
-  const failed = job.status === "failed";
-  const percent = completed ? 100 : total ? Math.min(99, Math.floor((processed / total) * 100)) : 0;
-  const phaseLabels = {
-    queued: "任务排队中",
-    preparing: "正在准备导出",
-    exporting: "正在流式导出",
-    completed: "导出完成",
-    failed: "导出失败",
-  };
-  $("#progress-phase").textContent = phaseLabels[job.phase] || phaseLabels[job.status] || "正在处理";
-  $("#progress-percent").textContent = `${percent}%`;
-  $("#progress-bar").value = percent;
-  $("#progress-bar").textContent = `${percent}%`;
-  $("#export-progress").classList.toggle("is-failed", failed);
-  if (failed) {
-    $("#progress-detail").textContent = job.error || "后台任务失败";
-  } else if (completed) {
-    $("#progress-detail").textContent = `${formatCount(job.result.counts.stage1)} 条 Stage 1 · ${formatCount(job.result.counts.stage2)} 条 Stage 2`;
-  } else if (job.phase === "exporting") {
-    $("#progress-detail").textContent = `${job.source || "数据源"} · ${formatCount(processed)} / ${formatCount(total)} 行`;
-  } else {
-    $("#progress-detail").textContent = "正在校验选择和创建输出目录…";
-  }
-}
-
-function addResultPath(root, label, value) {
-  const row = node("div", "result-path-row");
-  row.append(node("dt", "", label), node("dd", "", value));
-  const copy = node("button", "copy-button", "复制");
-  copy.type = "button";
-  copy.dataset.copy = value;
-  copy.setAttribute("aria-label", `复制${label}路径`);
-  row.append(copy);
-  root.append(row);
-}
-
-function renderExportResult(result) {
-  $("#result-summary").textContent = `Stage 1 ${formatCount(result.counts.stage1)} 条，Stage 2 ${formatCount(result.counts.stage2)} 条，重叠 ${formatCount(result.counts.overlap)} 条。`;
-  const pathsRoot = $("#result-paths");
-  pathsRoot.replaceChildren();
-  addResultPath(pathsRoot, "输出目录", result.output_dir);
-  addResultPath(pathsRoot, "训练环境", result.training_env);
-  addResultPath(pathsRoot, "数据注册表", result.dataset_info);
-  addResultPath(pathsRoot, "Manifest", result.manifest);
-  $("#export-result").hidden = false;
-}
-
-function wait(milliseconds) {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-}
-
-async function pollExport(jobId) {
+async function waitForJob(id, onUpdate) {
   while (true) {
-    const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
-    updateProgress(job);
-    if (job.status === "completed") return job.result;
-    if (job.status === "failed") throw new Error(job.error || "导出失败");
-    await wait(700);
+    const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+    if (onUpdate) onUpdate(job);
+    if (["completed", "failed", "canceled", "cancelled"].includes(job.status)) return job;
+    await new Promise((resolve) => window.setTimeout(resolve, 900));
   }
 }
 
-async function startExport() {
-  const button = $("#export-button");
-  const runName = $("#run-name").value.trim();
-  if (!/^[A-Za-z0-9_.-]+$/.test(runName)) {
-    showToast("运行名称只能包含字母、数字、点、下划线和短横线", true);
-    $("#run-name").focus();
-    return;
-  }
-  if (!paths.output_root.value.trim()) {
-    showToast("请填写导出根目录", true);
-    paths.output_root.focus();
-    return;
-  }
-  state.exporting = true;
-  setBusy(button, true, "正在导出");
-  $("#export-result").hidden = true;
+async function publishVersion() {
+  const button = $("#publish-button");
+  const version = $("#version-name").value.trim();
+  const notes = $("#version-notes").value.trim();
+  if (!/^datav[1-9]\d*$/.test(version)) { showToast("版本号格式应为 datavN", "error"); $("#version-name").focus(); return; }
+  if (!notes) { showToast("请填写变更说明", "error"); $("#version-notes").focus(); return; }
+  if (state.previewFingerprint !== selectionFingerprint()) { showToast("请先重新预览配方", "error"); activateTab("recipe"); return; }
+  await withBusy(button, "发布中…", async () => {
+    $("#publish-state").textContent = "发布中";
+    const body = {
+      version,
+      parent: $("#version-parent").value || null,
+      notes,
+      register: $("#publish-register").checked,
+      activate: $("#publish-activate").checked,
+      paths: pathPayload(),
+      recipe: recipePayload(),
+      preview_fingerprint: state.previewFingerprint,
+    };
+    try {
+      let result;
+      try {
+        const started = await api("/api/versions/publish", { method: "POST", body: JSON.stringify(body) });
+        if (started.job_id) {
+          state.jobs.unshift({ ...started, kind: "publish", version });
+          renderJobs();
+          const completed = await waitForJob(started.job_id, (job) => {
+            const index = state.jobs.findIndex((item) => jobId(item) === started.job_id);
+            if (index >= 0) state.jobs[index] = job; else state.jobs.unshift(job);
+            renderJobs();
+          });
+          if (completed.status === "failed") throw new Error(completed.error || "版本发布失败");
+          result = completed.result || completed;
+        } else {
+          result = started;
+        }
+      } catch (error) {
+        if (error.status !== 404) throw error;
+        const legacy = await api("/api/export", { method: "POST", body: JSON.stringify({ ...selectionPayload(), run_name: version }) });
+        const completed = legacy.job_id ? await waitForJob(legacy.job_id) : legacy;
+        result = { ...(completed.result || completed), version, registered: false, legacy_export: true };
+      }
+      const publishedVersion = versionName(result.version) || version;
+      $("#publish-result").hidden = false;
+      $("#publish-result").textContent = result.legacy_export ? `${publishedVersion} 已导出；当前服务未启用训练注册。` : `${publishedVersion} 已发布${body.register ? "并注册" : ""}${result.idempotent ? "（内容未变，复用原版本）" : ""}。`;
+      $("#publish-state").textContent = result.legacy_export ? "已导出" : "已发布";
+      $("#version-notes").value = "";
+      if (result.legacy_export) {
+        state.versions.push({ ...result, version, notes, active: false, registered: false });
+        renderVersions();
+      } else {
+        await refreshVersions({ quiet: true });
+        const published = state.versions.find((item) => versionName(item) === publishedVersion) || { ...result, version: publishedVersion, notes, active: body.activate, registered: body.register };
+        if (body.activate) state.activeVersion = published;
+        renderVersions();
+      }
+      showToast(result.legacy_export ? "版本已导出，注册功能不可用" : "版本发布完成", result.legacy_export ? "info" : "success");
+    } catch (error) {
+      $("#publish-state").textContent = "失败";
+      showToast(error.message, "error");
+    }
+  });
+}
+
+async function versionAction(button) {
+  const action = button.dataset.versionAction;
+  const version = button.dataset.version;
+  const endpoint = action === "register" ? "/api/versions/register" : "/api/versions/activate";
+  await withBusy(button, "处理中…", async () => {
+    try {
+      await api(endpoint, { method: "POST", body: JSON.stringify({ version }) });
+      await refreshVersions({ quiet: true });
+      showToast(action === "register" ? `${version} 已注册` : `${version} 已激活`, "success");
+    } catch (error) { showToast(error.message, "error"); }
+  });
+}
+
+function valueOf(input) {
+  if (input.type === "number") return Number(input.value);
+  const value = input.value.trim();
+  return value === "" ? null : value;
+}
+
+function trainingStagePayload(stageName) {
+  const root = $(`[data-train-stage="${stageName}"]`);
+  return Object.fromEntries($$("[data-train-param]", root).map((input) => [input.dataset.trainParam, valueOf(input)]));
+}
+
+function evaluationPayload() {
+  return {
+    benchmarks: $$("#benchmark-suites input:checked").map((input) => input.value),
+    max_samples: Number($("#eval-max-samples").value),
+    offline: $("#eval-offline").checked,
+    force_eval: $("#force-eval").checked,
+    haystack_split: $("#haystack-split").value,
+    tiny_data_partition: $("#tiny-partition").value,
+    tiny_partition_seed: Number($("#tiny-seed").value),
+    tsr_prompt_mode: $("#tsr-prompt-mode").value,
+    protocol_hash: $("#eval-protocol-hash").value.trim() || null,
+    tsr_max_model_len: Number($("#tsr-max-model-len").value),
+    tsr_max_new_tokens: Number($("#tsr-max-new-tokens").value),
+    tsr_batch_size: Number($("#tsr-batch-size").value),
+    tsr_request_chunk_size: Number($("#tsr-request-chunk-size").value),
+    tiny_max_model_len: Number($("#tiny-max-model-len").value),
+    tiny_request_chunk_size: Number($("#tiny-request-chunk-size").value),
+    tiny_gpu_memory_utilization: Number($("#tiny-gpu-memory-utilization").value),
+    haystack_max_model_len: Number($("#haystack-max-model-len").value),
+    haystack_max_new_tokens: Number($("#haystack-max-new-tokens").value),
+    haystack_batch_size: Number($("#haystack-batch-size").value),
+    haystack_request_chunk_size: Number($("#haystack-request-chunk-size").value),
+    exam_max_model_len: Number($("#exam-max-model-len").value),
+    exam_max_new_tokens: Number($("#exam-max-new-tokens").value),
+    exam_batch_size: Number($("#exam-batch-size").value),
+    exam_request_chunk_size: Number($("#exam-request-chunk-size").value),
+  };
+}
+
+function runPayload(mode) {
+  return {
+    mode,
+    version: versionName(state.activeVersion),
+    training: {
+      seed: Number($("#train-seed").value),
+      deepspeed_include: $("#deepspeed-include").value.trim(),
+      master_port: Number($("#master-port").value),
+      keep_stage1: $("#keep-stage1").checked,
+      force_train: $("#force-train").checked,
+      stage1: trainingStagePayload("stage1"),
+      stage2: trainingStagePayload("stage2"),
+    },
+    evaluation: evaluationPayload(),
+  };
+}
+
+function validateRun(mode) {
+  if (!versionName(state.activeVersion)) throw new Error("请先选择已注册的数据版本");
+  if (["eval", "train_eval"].includes(mode) && !evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
+}
+
+async function startRun(mode, button) {
+  const effectiveMode = mode === "preflight" ? "train_eval" : mode;
+  try { validateRun(effectiveMode); } catch (error) { showToast(error.message, "error"); return; }
+  const endpoint = mode === "preflight" ? "/api/runs/preflight" : "/api/runs";
+  await withBusy(button, mode === "preflight" ? "预检中…" : "启动中…", async () => {
+    try {
+      const result = await api(endpoint, { method: "POST", body: JSON.stringify(runPayload(effectiveMode)) });
+      const id = jobId(result);
+      $("#run-status").textContent = mode === "preflight" ? "预检任务已提交。" : "任务已提交。";
+      if (id) {
+        state.activeJobId = id;
+        state.jobs.unshift(result);
+        renderJobs();
+      }
+      showToast(mode === "preflight" ? "预检已提交" : "流水线已启动", "success");
+      activateTab("jobs");
+      refreshJobs({ quiet: true });
+    } catch (error) {
+      $("#run-status").textContent = error.message;
+      showToast(error.message, "error");
+    }
+  });
+}
+
+function jobStatusLabel(status) {
+  return ({ queued: "排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
+}
+
+function jobType(job) {
+  return job.type || job.kind || job.mode || job.phase || "任务";
+}
+
+function formatDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDuration(job) {
+  let seconds = Number(job.duration_seconds || 0);
+  if (!seconds && job.started_at && !["completed", "failed", "canceled", "cancelled"].includes(job.status)) seconds = Math.max(0, (Date.now() - new Date(job.started_at).getTime()) / 1000);
+  if (!seconds) return "—";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours ? `${hours}h ${minutes}m` : `${minutes}m ${Math.floor(seconds % 60)}s`;
+}
+
+function jobRow(job) {
+  const button = element("button", "job-row");
+  button.type = "button";
+  button.dataset.jobId = jobId(job);
+  button.setAttribute("role", "row");
+  button.setAttribute("aria-label", `查看${jobType(job)}任务日志`);
+  const status = element("span", `job-status ${job.status || "unknown"}`, jobStatusLabel(job.status));
+  for (const value of [jobType(job), job.version || job.data_version || "—"]) button.append(element("span", "", String(value)));
+  button.append(status, element("span", "", formatDate(job.started_at || job.created_at)), element("span", "", formatDuration(job)));
+  return button;
+}
+
+function renderJobs() {
+  const root = $("#job-list");
+  root.replaceChildren(...state.jobs.map(jobRow));
+  if (!state.jobs.length) root.append(element("div", "list-empty", "暂无任务"));
+  const recent = $("#recent-jobs");
+  recent.replaceChildren(...state.jobs.slice(0, 5).map(jobRow));
+  if (!state.jobs.length) recent.append(element("div", "list-empty", "暂无任务"));
+  const running = state.jobs.filter((job) => !["completed", "failed", "canceled", "cancelled"].includes(job.status)).length;
+  $("#running-job-count").hidden = running === 0;
+  $("#running-job-count").textContent = String(running);
+  $("#overview-pipeline").textContent = running ? `${running} 个运行中` : (state.jobs[0] ? jobStatusLabel(state.jobs[0].status) : "空闲");
+  $("#overview-job-meta").textContent = state.jobs[0] ? `${jobType(state.jobs[0])} · ${state.jobs[0].version || state.jobs[0].data_version || "—"}` : "没有运行中的任务";
+}
+
+async function refreshJobs({ quiet = false } = {}) {
   try {
-    if (state.previewFingerprint !== selectionFingerprint()) await calculatePreview({ quiet: true });
-    const request = { ...selectionPayload(), run_name: runName };
-    const started = await api("/api/export", { method: "POST", body: JSON.stringify(request) });
-    updateProgress({ status: "queued", phase: "queued" });
-    const result = await pollExport(started.job_id);
-    renderExportResult(result);
-    showToast("训练数据导出完成");
-  } catch (error) {
-    updateProgress({ status: "failed", phase: "failed", error: error.message });
-    showToast(error.message, true);
-  } finally {
-    state.exporting = false;
-    setBusy(button, false, "开始导出");
+    const payload = await optionalGet("/api/jobs", { jobs: [] });
+    state.jobs = normalizeCollection(payload, "jobs");
+    renderJobs();
+  } catch (error) { if (!quiet) showToast(error.message, "error"); }
+}
+
+function renderJobDialog(job) {
+  $("#job-dialog-title").textContent = `${jobType(job)} · ${jobStatusLabel(job.status)}`;
+  $("#job-dialog-meta").textContent = `${job.version || job.data_version || "—"} · ${jobId(job)}`;
+  $("#job-phase").textContent = job.phase || jobStatusLabel(job.status);
+  const total = Number(job.total_rows || job.total || 0);
+  const processed = Number(job.processed_rows || job.processed || 0);
+  const percent = Number(job.progress_percent ?? (total ? Math.floor((processed / total) * 100) : (job.status === "completed" ? 100 : 0)));
+  $("#job-percent").textContent = `${Math.max(0, Math.min(100, percent))}%`;
+  $("#job-progress").value = Math.max(0, Math.min(100, percent));
+  const log = Array.isArray(job.log_tail) ? job.log_tail.join("\n") : (job.log_tail || job.log || job.error || "等待日志");
+  $("#job-log").textContent = log;
+  const artifacts = $("#job-artifacts");
+  artifacts.replaceChildren();
+  const values = job.artifacts || job.result?.artifacts || job.result || {};
+  if (values && typeof values === "object") {
+    for (const [label, value] of Object.entries(values)) {
+      if (typeof value !== "string" || !value.startsWith("/")) continue;
+      const row = element("div", "artifact-row");
+      row.append(element("span", "", label), element("code", "", value));
+      const copy = element("button", "text-button", "复制");
+      copy.type = "button";
+      copy.dataset.copy = value;
+      row.append(copy);
+      artifacts.append(row);
+    }
   }
+}
+
+async function openJob(id) {
+  if (!id) return;
+  try {
+    const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+    state.activeJobId = id;
+    renderJobDialog(job);
+    const dialog = $("#job-dialog");
+    if (!dialog.open) dialog.showModal();
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function copyText(value, button) {
+  try {
+    await navigator.clipboard.writeText(value);
+    const original = button.textContent;
+    button.textContent = "已复制";
+    window.setTimeout(() => { button.textContent = original; }, 1200);
+  } catch { showToast("无法访问剪贴板", "error"); }
+}
+
+function updateDerivedPaths() {
+  const version = versionName(state.activeVersion) || $("#version-name").value.trim();
+  const root = $("#train-output-root").value.trim();
+  const seed = $("#train-seed").value;
+  const cleanRoot = root.replace(/\/$/, "").replace(/(?:[-_]?data-?v\d+)$/i, "");
+  $("#final-model-preview").textContent = cleanRoot && version ? `${cleanRoot}-${version}/best_seed${seed}` : "由服务端按版本生成";
+  $("#suite-count").textContent = `${$$("#benchmark-suites input:checked").length} 项`;
+}
+
+function applyDefaults(defaults) {
+  const paths = defaults.paths || defaults;
+  for (const [key, input] of Object.entries(pathFields)) if (typeof paths[key] === "string") input.value = paths[key];
+  const pipeline = defaults.pipeline || {};
+  const training = pipeline.training || defaults.training || {};
+  const integration = pipeline.integration || defaults.integration || {};
+  state.pipelineEnabled = Boolean(integration.enabled);
+  $("#training-root").value = integration.training_root || defaults.training_root || "由服务端配置";
+  $("#base-model-path").value = training.base_model_path || defaults.base_model_path || "由服务端配置";
+  $("#train-output-root").value = training.output_root || defaults.train_output_root || "";
+  $("#train-profile").value = training.profile || "chronos2-full";
+  $("#train-seed").value = training.seed ?? 42;
+  $("#deepspeed-include").value = training.deepspeed_include || "localhost:0,1,2,3,4,5,6,7";
+  $("#master-port").value = training.master_port ?? 19901;
+  $("#keep-stage1").checked = Boolean(training.keep_stage1);
+  $("#force-train").checked = Boolean(training.force_train);
+  for (const stageName of ["stage1", "stage2"]) {
+    const values = training[stageName] || {};
+    for (const input of $$("[data-train-param]", $(`[data-train-stage="${stageName}"]`))) {
+      if (values[input.dataset.trainParam] !== undefined) input.value = values[input.dataset.trainParam] ?? "";
+    }
+  }
+  const evaluation = pipeline.evaluation || defaults.evaluation || {};
+  $("#eval-project-root").value = integration.evaluation_root || evaluation.project_root || defaults.eval_project_root || "由服务端配置";
+  $("#eval-output-root").value = evaluation.output_root || defaults.eval_output_root || "";
+  const suites = new Set(evaluation.benchmarks || ["tsrbench", "tinybenchmarks", "ts_haystack", "timeseriesexam"]);
+  $$("#benchmark-suites input").forEach((input) => { input.checked = suites.has(input.value); });
+  const evaluationFields = {
+    "#eval-max-samples": "max_samples",
+    "#haystack-split": "haystack_split",
+    "#tiny-partition": "tiny_data_partition",
+    "#tiny-seed": "tiny_partition_seed",
+    "#tsr-prompt-mode": "tsr_prompt_mode",
+    "#tsr-max-model-len": "tsr_max_model_len",
+    "#tsr-max-new-tokens": "tsr_max_new_tokens",
+    "#tsr-batch-size": "tsr_batch_size",
+    "#tsr-request-chunk-size": "tsr_request_chunk_size",
+    "#tiny-max-model-len": "tiny_max_model_len",
+    "#tiny-request-chunk-size": "tiny_request_chunk_size",
+    "#tiny-gpu-memory-utilization": "tiny_gpu_memory_utilization",
+    "#haystack-max-model-len": "haystack_max_model_len",
+    "#haystack-max-new-tokens": "haystack_max_new_tokens",
+    "#haystack-batch-size": "haystack_batch_size",
+    "#haystack-request-chunk-size": "haystack_request_chunk_size",
+    "#exam-max-model-len": "exam_max_model_len",
+    "#exam-max-new-tokens": "exam_max_new_tokens",
+    "#exam-batch-size": "exam_batch_size",
+    "#exam-request-chunk-size": "exam_request_chunk_size",
+  };
+  for (const [selector, key] of Object.entries(evaluationFields)) if (evaluation[key] !== undefined) $(selector).value = evaluation[key];
+  $("#eval-offline").checked = evaluation.offline !== false;
+  $("#force-eval").checked = Boolean(evaluation.force_eval);
+  $("#tsrbench-root").value = evaluation.tsrbench_root || "由服务端配置";
+  $("#tinybench-root").value = evaluation.tinybench_dataset_root || "由服务端配置";
+  $("#haystack-root").value = evaluation.ts_haystack_root || "由服务端配置";
+  $("#timeseriesexam-root").value = evaluation.timeseriesexam_root || "由服务端配置";
+  $("#timeseriesexam-file").value = evaluation.timeseriesexam_data_file || "由服务端配置";
+  $("#run-status").textContent = state.pipelineEnabled ? "发布并激活版本后可启动。" : "服务端尚未配置训练流水线。";
+  updateDerivedPaths();
 }
 
 function handleRuleChange(event) {
   const input = event.target.closest("input[data-stage][data-type]");
   if (!input) return;
   const stage = state.stages[input.dataset.stage];
-  const type = input.dataset.type;
-  if (type === "abilities-all") {
+  if (input.dataset.type === "abilities-all") {
     stage.abilities.clear();
     renderRules();
-    markSelectionDirty();
-    return;
+  } else {
+    const values = stage[input.dataset.type];
+    if (input.checked) values.add(input.value); else values.delete(input.value);
+    if (input.dataset.type === "abilities") renderRules();
   }
-  const collection = stage[type];
-  if (input.checked) collection.add(input.value);
-  else collection.delete(input.value);
-  if (type === "abilities") renderRules();
-  markSelectionDirty();
+  markRecipeDirty();
 }
 
 function handleSourceChange(event) {
   const input = event.target.closest("input[data-source][data-stage]");
   if (!input) return;
-  const collection = state.stages[input.dataset.stage].sources;
-  if (input.checked) collection.add(input.dataset.source);
-  else collection.delete(input.dataset.source);
-  markSelectionDirty();
-}
-
-function defaultRunName() {
-  const now = new Date();
-  const pad = (value) => String(value).padStart(2, "0");
-  return `six-source-split-${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
-}
-
-async function copyPath(value, button) {
-  try {
-    await navigator.clipboard.writeText(value);
-    button.textContent = "已复制";
-    window.setTimeout(() => { button.textContent = "复制"; }, 1400);
-  } catch {
-    showToast("浏览器无法访问剪贴板，请手动选择路径", true);
-  }
+  const values = state.stages[input.dataset.stage].sources;
+  if (input.checked) values.add(input.dataset.source); else values.delete(input.dataset.source);
+  renderSources();
+  markRecipeDirty();
 }
 
 function bindEvents() {
+  $$("[role=tab]").forEach((tab) => {
+    tab.addEventListener("click", () => activateTab(tab.dataset.tab));
+    tab.addEventListener("keydown", handleTabKeys);
+  });
+  $$('[data-tab-link]').forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); activateTab(link.dataset.tabLink); }));
+  $("#open-settings").addEventListener("click", () => openSettings(true));
+  for (const selector of ["#close-settings", "#settings-backdrop"]) $(selector).addEventListener("click", () => openSettings(false));
   $("#scan-button").addEventListener("click", scanCatalog);
+  $("#rebuild-sources").addEventListener("click", rebuildSources);
   $("#preview-button").addEventListener("click", () => calculatePreview().catch(() => {}));
-  $("#export-button").addEventListener("click", startExport);
   $("#dataset-search").addEventListener("input", applySourceSearch);
-  $("#select-defaults").addEventListener("click", () => chooseSources("defaults"));
   $("#select-all").addEventListener("click", () => chooseSources("all"));
   $("#clear-sources").addEventListener("click", () => chooseSources("clear"));
   $("#source-list").addEventListener("change", handleSourceChange);
   $("#rules-section").addEventListener("change", handleRuleChange);
-  for (const input of Object.values(paths)) input.addEventListener("change", markSelectionDirty);
-  $("#result-paths").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-copy]");
-    if (button) copyPath(button.dataset.copy, button);
+  Object.values(pathFields).forEach((input) => input.addEventListener("change", markRecipeDirty));
+  $("#publish-button").addEventListener("click", publishVersion);
+  $("#refresh-versions").addEventListener("click", () => refreshVersions());
+  $("#version-list").addEventListener("click", (event) => { const button = event.target.closest("button[data-version-action]"); if (button) versionAction(button); });
+  $("#version-name").addEventListener("input", updateDerivedPaths);
+  $("#train-seed").addEventListener("input", updateDerivedPaths);
+  $("#benchmark-suites").addEventListener("change", updateDerivedPaths);
+  $$(".run-button").forEach((button) => button.addEventListener("click", () => startRun(button.dataset.runMode, button)));
+  $("#overview-preflight").addEventListener("click", () => startRun("preflight", $("#overview-preflight")));
+  $("#overview-run").addEventListener("click", () => startRun("train_eval", $("#overview-run")));
+  $("#refresh-jobs").addEventListener("click", () => refreshJobs());
+  for (const root of [$("#job-list"), $("#recent-jobs")]) root.addEventListener("click", (event) => { const row = event.target.closest("[data-job-id]"); if (row) openJob(row.dataset.jobId); });
+  $("#close-job-dialog").addEventListener("click", () => $("#job-dialog").close());
+  $("#job-dialog").addEventListener("click", (event) => { const button = event.target.closest("button[data-copy]"); if (button) copyText(button.dataset.copy, button); });
+  document.addEventListener("keydown", (event) => {
+    const settings = $("#settings-panel");
+    if (settings.hidden) return;
+    if (event.key === "Escape") { openSettings(false); return; }
+    if (event.key !== "Tab") return;
+    const focusable = $$('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)', settings);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
   });
 }
 
 async function boot() {
   bindEvents();
-  $("#run-name").value = defaultRunName();
+  const initial = location.hash.slice(1);
+  activateTab($( `[data-tab="${initial}"]`) ? initial : "overview", { updateHash: false });
   try {
-    await api("/api/health");
     state.defaults = await api("/api/defaults");
-    for (const [key, input] of Object.entries(paths)) {
-      const value = state.defaults[key];
-      if (typeof value === "string") input.value = value;
-    }
+    applyDefaults(state.defaults);
     initializeRules();
-    $("#scan-button").disabled = false;
-    setHealth("online", "本地服务已连接");
+    setHealth("online", "服务正常");
+    $("#scan-status").textContent = "可扫描";
+    await Promise.all([refreshVersions({ quiet: true }), refreshJobs({ quiet: true })]);
   } catch (error) {
-    setHealth("error", "本地服务不可用");
-    showToast(error.message, true);
+    setHealth("error", "服务不可用");
+    $("#overview-status").textContent = error.message;
+    showToast(error.message, "error");
   }
+  renderActionState();
+  window.setInterval(async () => {
+    if (document.hidden) return;
+    await refreshJobs({ quiet: true });
+    if (state.activeJobId && $("#job-dialog").open) openJob(state.activeJobId);
+  }, 5000);
 }
 
 boot();

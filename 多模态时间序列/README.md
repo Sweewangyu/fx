@@ -2,6 +2,14 @@
 
 本目录收录时间序列与大语言模型、多模态问答及跨模态编码相关的调研与设计材料。
 
+## ChatTS Dataset Studio
+
+独立的数据版本、两阶段训练和四套 benchmark 评测控制台。它会动态扫描
+`merged_labels/annotated/*.jsonl`，为所有校验通过的数据集创建 source，不再限定原始 6 个。
+可将配方发布为不可变 `datavN` 快照，并通过固定脚本串联 ChatTS-Training 与 ChatTS 评测。
+
+- [全量 source、数据版本及一键训练评测说明](./ChatTS-Dataset-Studio/README.md)
+
 ## ChatTS Chronos-2 自包含权重
 
 将已有的 `Qwen3 + 已训练两层 projector` 检查点与本地 Chronos-2 合并为一个标准

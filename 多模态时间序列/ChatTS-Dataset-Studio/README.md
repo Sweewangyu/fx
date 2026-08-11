@@ -1,115 +1,101 @@
 # ChatTS Dataset Studio
 
-一个与 `SFT_CURATOR`、`datataste` 和训练仓库解耦的本地可视化数据筛选器。它读取
-`datataste` 的数据注册表和 `SFT_CURATOR` 已合并的标签，按数据集、质量、难度、能力维度
-组合规则，分别导出可直接交给 ChatTS 两阶段训练的 Stage1 / Stage2 数据。
+ChatTS 的本地数据版本、两阶段训练和四套评测控制台。它不 import `ChatTS` 或
+`ChatTS-Training`：数据通过不可变快照交付，训练评测通过固定脚本和 YAML 交互。
 
-真实 QA 不会送到浏览器：浏览器只接收聚合计数，JSONL 的扫描、筛选和写盘都在服务器端
-流式完成。工具不调用模型、不联网，也不修改两个上游项目。
+## 能做什么
 
-## 默认配方
+- 扫描 `merged_labels/annotated/*.jsonl`，为**全部数据集**创建 source，不再写死 6 个。
+- 按 source、quality、difficulty、ability 组合 Stage1 / Stage2 配方并预览数量。
+- 发布 `datav3`、`datav4`……不可变数据版本，记录每版数据集组成、规则、行数和 SHA256。
+- 在同级 `ChatTS-Training/data/studio_versions/` 注册版本，但不改全局
+  `data/dataset_info.json`。
+- 配置两阶段 LR、time-series encoder LR、epoch、batch、梯度累积、warmup、scheduler、
+  max steps、保存/评测间隔等训练参数。
+- 配置四套 benchmark 及其安全推理参数，并执行 preflight 或一键训练后评测。
+- 模型、评测目录自动带 `-datavN`，任务配置和日志持久保存。
 
-页面首次扫描后会自动选中：
+## 服务器目录
+
+一键训练评测需要三个同级项目；评测入口实际位于 `ChatTS`：
 
 ```text
-chatts_align_256, chatts_align_random, chatts_ift,
-chatts_sft, time_mqa, tsaqa
+<workspace>/
+├── ChatTS-Dataset-Studio/
+├── ChatTS-Training/
+└── ChatTS/
 ```
 
-- Stage1：质量 `weak` 及以上，难度 `moderate` 及以下。
-- Stage2：质量 `weak` 及以上，难度 `moderate` 及以上。
-- `moderate` 会按需求同时进入两阶段；预览区会明确显示重叠数量。
-- 能力维度默认不限制，可在页面中继续多选 15 维标签或 `UNMAPPED`。
+如果只有前两个目录，可以完成 source 扫描、数据版本发布、训练注册和配置预览，但无法运行
+现有四套评测。`ChatTS/scripts/run_train_then_eval.sh` 还要求训练容器 `chatts`、评测容器
+`ragas` 正在运行，并能看到相同的 `/share/...` 数据、模型与输出目录。
 
-## 先在本地只看格式
+## 你的 traindata 路径
 
-本地没有真实标签时，用 30 条明确标记为 demo 的合成记录启动页面：
+按当前服务器目录，核心配置应为：
+
+```yaml
+paths:
+  registry_path: /share/airesearch/data/finiverse/traindata/sources.json
+  annotations_root: /share/airesearch/data/finiverse/traindata/merged_labels
+  data_root: /share/airesearch/data/finiverse/traindata
+  output_root: /share/airesearch/data/finiverse/traindata/chatts-data-versions
+  state_root: /share/airesearch/data/finiverse/traindata/chatts-studio-state
+```
+
+`tsr-taxonomy-datav2-v1/final_labels.jsonl` 是标签流程产物，不应被当成单个训练 source；实际
+训练 source 来自 `merged_labels/annotated/` 下每个带 `input/timeseries/output` 的 JSONL。
+
+## 安装与启动
 
 ```bash
 cd /path/to/ChatTS-Dataset-Studio
-PYTHON_BIN=/path/to/python3.10-or-newer bash scripts/run_demo.sh --open
-```
-
-演示数据只用于检查页面和导出格式，绝不能用于训练。默认预览结果应为：Stage1 12 条、
-Stage2 18 条、两阶段重叠 6 条。
-
-## 在内网服务器运行
-
-要求 Python 3.10+。训练环境通常已经包含 `PyYAML`；也可以离线安装本项目：
-
-```bash
-cd /workspace/ChatTS-Dataset-Studio
 python3 -m pip install -e .
 cp configs/server.example.yaml configs/server.yaml
-# 修改 server.yaml 中四个路径，然后启动：
+# 检查 server.yaml 中容器内路径、模型与 benchmark 路径后启动：
 chatts-dataset-studio serve -c configs/server.yaml
 ```
 
-不安装包也可直接运行：
+不安装包也可以：
 
 ```bash
-cd /workspace/ChatTS-Dataset-Studio
 PYTHONPATH=src python3 -m chatts_dataset_studio serve -c configs/server.yaml
 ```
 
-如果希望把 `merged_labels/annotated/` 下的全部数据集加入页面，不需要手写
-`sources.json`。下面的命令会扫描所有 `.jsonl`、校验首行 QA 格式，并生成完整注册表：
+服务建议只监听 `127.0.0.1`，从电脑建立 SSH 隧道：
 
 ```bash
-chatts-dataset-studio build-registry \
-  --merged-labels-root /share/airesearch/data/finiverse/traindata/merged_labels \
-  --data-root /share/airesearch/data/finiverse/traindata \
-  --output /share/airesearch/data/finiverse/traindata/sources.json
+ssh -L 7865:127.0.0.1:7865 yu.wang17@<server>
 ```
 
-若仍保留 datataste 原始 `sources.json`，可用它补回 family、split 和 training role：
+浏览器打开 `http://127.0.0.1:7865`。
+
+## 全量创建 source
+
+`registry.auto_build` 默认就是 `true`（示例配置也显式写出），因此每次启动会扫描全部
+`merged_labels/annotated/*.jsonl` 并原子刷新 `sources.json`。也可在启动前手动执行：
 
 ```bash
 chatts-dataset-studio build-registry \
   --merged-labels-root /share/airesearch/data/finiverse/traindata/merged_labels \
   --data-root /share/airesearch/data/finiverse/traindata \
-  --metadata-registry /workspace/datataste/data/versions/datav2/sources.json \
   --output /share/airesearch/data/finiverse/traindata/sources.json \
   --force
 ```
 
-`--force` 仅用于明确替换已有注册表；生成器不会修改任何 QA 或标注文件。
+如需复用旧 registry 的 `family/split/training_role` 元数据，再加
+`--metadata-registry /path/to/old/sources.json`。生成器只校验和登记文件，不改 QA 或标注。
 
-服务器建议只监听 `127.0.0.1`。从本机建立隧道后访问 `http://127.0.0.1:7865`：
+YAML 的 `sources: ["*"]` 和页面的“全选可用 source”都会动态使用完整 catalog。新文件出现后
+刷新 source 即可，不需要改 Python 名单。
 
-```bash
-ssh -L 7865:127.0.0.1:7865 user@server
-```
+## 数据版本与训练注册
 
-不要把页面直接暴露到公网；它具有向配置的输出目录写文件的能力。
-
-## 输入约定
-
-`registry_path` 指向 datav2 的 `sources.json`，其中每个源至少有 `name` 与 `path`。
-规范 QA JSONL 每行包含：
-
-```json
-{"input":"... <ts><ts/> ...","timeseries":[[0.1,0.2]],"output":"..."}
-```
-
-`annotations_root` 指向 `merge_tsqa_annotations.py` 的输出根目录。工具优先读取体积较小的
-`annotations/<source>.jsonl`；若不存在则读取 `annotated/<source>.jsonl`。sidecar 与 QA 必须
-严格一一同序，若 `annotation_source`、`source_index`、`line_number` 或 `annotation_id` 错位，
-导出会立即失败并清理临时目录。
-
-合法枚举：
+首次发布默认为 `datav3`，之后自动递增。也接受 `data-v4` 输入，但落盘统一为 `datav4`。
+同一内容重复发布会复用原版本；内容变化才会创建下一版。每版目录为：
 
 ```text
-quality:   unusable < weak < acceptable < good < excellent
-difficulty: very_easy < easy < moderate < hard < very_hard
-```
-
-## 导出产物
-
-每个运行名只允许创建一次，避免误覆盖：
-
-```text
-<output_root>/<run_name>/
+chatts-data-versions/datav3/
 ├── stage1/<source>.jsonl
 ├── stage2/<source>.jsonl
 ├── stage1_annotations/<source>.jsonl
@@ -121,34 +107,65 @@ difficulty: very_easy < easy < moderate < hard < very_hard
 └── stage2/manifest.json
 ```
 
-训练 JSONL 只保留 `input/timeseries/output` 三个字段。标签 sidecar、输入/输出 SHA256、筛选
-规则、计数和数据快照哈希单独保存，便于审计与复现。
+中央 `chatts-data-versions/ledger.json` 记录 parent、notes、规则、每阶段完整 source 组成、行数、
+快照和文件哈希。发布或启动训练前会再次校验所有文件，修改旧版本会被拒绝。
 
-## 接入现有两阶段训练
+“发布并注册”只在 Training 仓库新增：
 
-导出完成后：
-
-```bash
-set -a
-source /workspace/chatts-dataset-exports/<run_name>/training.env
-set +a
-
-cd /workspace/ChatTS-Training
-bash scripts/full/run_chronos2_best_two_stage.sh
+```text
+ChatTS-Training/data/studio_versions/
+├── datav3.json
+├── datav3.env
+└── active.json
 ```
 
-`training.env` 会设置 `DATASET_DIR`、两个阶段的数据集名、`concat` 混合策略以及
-`DATASET_SNAPSHOT_HASH`。它不会覆盖学习率、batch size、epoch 等训练超参数。
+训练仍由快照自己的 `dataset_info.json` 注册：控制台把 `DATASET_DIR` 指到该 `datavN` 目录，
+并从 manifest 注入 Stage1/Stage2 dataset keys。浏览器不能偷偷换训练脚本、项目根或任意输出
+路径。
 
-## 命令行与测试
+## 一键训练与评测
 
-同一份 YAML 也可以完全不经过页面：
+选择一个版本后：
+
+1. 在“训练”页调整两阶段参数；dataset 列表只读，始终来自所选版本。
+2. 在“评测”页选择 `tsrbench`、`tinybenchmarks`、`ts_haystack`、`timeseriesexam`。
+3. 先点 `Preflight`。它检查配置、两个容器、共享路径、脚本和 GPU，不启动训练。
+4. 通过后点“一键训练 + 评测”。任务页显示持久日志和派生路径。
+
+例如 `datav3`、seed 42 会派生：
+
+```text
+TRAIN_OUTPUT_ROOT = .../ChatTS-msxf-8B-datav3
+FINAL_MODEL_PATH  = .../ChatTS-msxf-8B-datav3/best_seed42
+MODEL_NAME        = chatts-msxf-8B-datav3-seed42
+RUN_ID            = chronos2-datav3-seed42-full
+```
+
+底层固定调用：
+
+```bash
+CONFIG_FILE=<studio-generated.yaml> bash ../ChatTS/scripts/run_train_then_eval.sh
+```
+
+数据版本和 `DATASET_SNAPSHOT_HASH` 会同时进入训练与评测容器。训练完成以
+`TRAINING_COMPLETE.json` 为准；评测完成以 `metrics.json.status == "pass"` 为准。
+
+## 兼容 CLI
 
 ```bash
 chatts-dataset-studio catalog -c configs/server.yaml
 chatts-dataset-studio preview -c configs/server.yaml
+# legacy export；推荐正式数据使用页面的 datavN 发布流程
 chatts-dataset-studio export -c configs/server.yaml
-pytest
 ```
 
-`catalog` 扫描并校验标签，`preview` 只计算选择结果，`export` 才写文件。
+## 测试
+
+```bash
+pytest
+ruff check src tests
+bash -n ../ChatTS/scripts/run_train_then_eval.sh
+```
+
+所有真实 QA 均在服务器端流式扫描、筛选和写盘；浏览器只接收聚合计数、版本组成、任务状态
+和日志。该服务具有写数据版本和启动训练的能力，不要直接暴露到公网。

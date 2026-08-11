@@ -1,3 +1,4 @@
+# ruff: noqa: PLW1510 -- this module intentionally uses unittest.TestCase.
 from __future__ import annotations
 
 import csv
@@ -10,12 +11,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 DIRECT_FILES = Path(__file__).resolve().parents[2]
 CHATTS_REPO = Path(
     os.environ.get("CHATTS_REPO_ROOT", DIRECT_FILES.parent / "ChatTS")
 ).resolve()
 FINALIZER = DIRECT_FILES / "scripts" / "finalize_chatts_best_checkpoint.py"
+DATASET_VERIFIER = DIRECT_FILES / "scripts" / "verify_dataset_snapshot.py"
 TRAIN_RUNNER = DIRECT_FILES / "scripts" / "full" / "run_chronos2_best_two_stage.sh"
 EVAL_RUNNER = (
     CHATTS_REPO
@@ -449,6 +450,7 @@ evaluation:
                         / "train_chronos2_best_stage2.sh"
                     ),
                     "FINALIZER": str(FINALIZER),
+                    "DATASET_VERIFIER": str(DATASET_VERIFIER),
                     "PREFLIGHT_ONLY": "1",
                     "AVAILABLE_GPUS_OVERRIDE": "8",
                     "PYTHON_BIN": sys.executable,

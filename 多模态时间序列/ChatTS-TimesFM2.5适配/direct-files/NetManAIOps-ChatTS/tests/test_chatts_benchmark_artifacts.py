@@ -298,6 +298,67 @@ def test_cache_requires_all_fingerprints_and_untouched_summary(tmp_path: Path) -
     assert artifacts.cache_matches(model_manifest, model_changed)[1] == "model_fingerprint changed"
 
 
+def test_cache_identity_binds_nonempty_dataset_version_and_snapshot_hash(tmp_path: Path) -> None:
+    legacy = _request(tmp_path)
+    explicit_empty = artifacts.build_request(
+        suite="tsrbench",
+        model_path=legacy["model_path"],
+        model_name="candidate",
+        model_components=legacy["model_components"],
+        data_paths=legacy["data_paths"],
+        protocol_files=legacy["protocol_files"],
+        protocol_items=["seed=42", "prompt=answer_only"],
+        eval_protocol_hash="external-protocol-v1",
+        data_version="",
+        dataset_snapshot_hash="",
+    )
+    assert explicit_empty["command_fingerprint"] == legacy["command_fingerprint"]
+    assert explicit_empty["protocol_fingerprint"] == legacy["protocol_fingerprint"]
+
+    snapshot_hash = "a" * 64
+    versioned = artifacts.build_request(
+        suite="tsrbench",
+        model_path=legacy["model_path"],
+        model_name="candidate",
+        model_components=legacy["model_components"],
+        data_paths=legacy["data_paths"],
+        protocol_files=legacy["protocol_files"],
+        protocol_items=["seed=42", "prompt=answer_only"],
+        eval_protocol_hash="external-protocol-v1",
+        data_version="datav3",
+        dataset_snapshot_hash=snapshot_hash,
+    )
+    output = tmp_path / "versioned-output"
+    summary = output / "tsrbench_summary_candidate.json"
+    _write_json(summary, {"overall": {"accuracy_strict": 0.5}})
+    manifest_path = artifacts.write_suite_manifest(
+        request=versioned,
+        output_dir=str(output),
+        summary_file=str(summary),
+        run_id="datav3",
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert artifacts.cache_matches(manifest, versioned)[0] is True
+
+    for changed_version, changed_hash in (("datav4", snapshot_hash), ("datav3", "b" * 64)):
+        changed = artifacts.build_request(
+            suite="tsrbench",
+            model_path=legacy["model_path"],
+            model_name="candidate",
+            model_components=legacy["model_components"],
+            data_paths=legacy["data_paths"],
+            protocol_files=legacy["protocol_files"],
+            protocol_items=["seed=42", "prompt=answer_only"],
+            eval_protocol_hash="external-protocol-v1",
+            data_version=changed_version,
+            dataset_snapshot_hash=changed_hash,
+        )
+        assert artifacts.cache_matches(manifest, changed) == (
+            False,
+            "protocol_fingerprint changed",
+        )
+
+
 def test_normalizes_existing_suite_summaries_without_rescoring() -> None:
     tsr = artifacts.normalized_suite_metrics(
         "tsrbench",
@@ -411,6 +472,8 @@ def test_aggregate_writes_metrics_and_run_manifest(tmp_path: Path) -> None:
         force_eval=False,
         output_root=str(tmp_path / "run"),
         eval_protocol_hash="external-protocol-v1",
+        data_version="datav3",
+        dataset_snapshot_hash="c" * 64,
     )
 
     assert metrics["status"] == "pass"
@@ -418,7 +481,13 @@ def test_aggregate_writes_metrics_and_run_manifest(tmp_path: Path) -> None:
     assert metrics["suites"]["tsrbench"]["summary"]["overall"]["correct"] == 3
     assert manifest["eval_protocol_hash"] == "external-protocol-v1"
     assert json.loads(metrics_file.read_text(encoding="utf-8"))["run_id"] == "trial-1"
-    assert json.loads(run_manifest_file.read_text(encoding="utf-8"))["status"] == "pass"
+    written_metrics = json.loads(metrics_file.read_text(encoding="utf-8"))
+    written_manifest = json.loads(run_manifest_file.read_text(encoding="utf-8"))
+    assert written_metrics["data_version"] == "datav3"
+    assert written_metrics["dataset_snapshot_hash"] == "c" * 64
+    assert written_manifest["status"] == "pass"
+    assert written_manifest["data_version"] == "datav3"
+    assert written_manifest["dataset_snapshot_hash"] == "c" * 64
 
 
 def test_preflight_accepts_one_selected_suite_without_other_dataset_roots(tmp_path: Path) -> None:

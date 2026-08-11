@@ -31,8 +31,16 @@ def _load_config(path: Path | None) -> dict[str, Any]:
     paths = value.get("paths", {})
     selection = value.get("selection", {})
     server = value.get("server", {})
-    if not all(isinstance(item, dict) for item in (paths, selection, server)):
-        raise StudioError("paths, selection, and server must be mappings")
+    versions = value.get("versions", {})
+    integration = value.get("integration", {})
+    registry = value.get("registry", {})
+    if not all(
+        isinstance(item, dict)
+        for item in (paths, selection, server, versions, integration, registry)
+    ):
+        raise StudioError(
+            "paths, selection, server, versions, integration, and registry must be mappings"
+        )
 
     def resolve(raw: Any) -> Any:
         if not isinstance(raw, str) or not raw:
@@ -40,11 +48,32 @@ def _load_config(path: Path | None) -> dict[str, Any]:
         candidate = Path(raw).expanduser()
         return str(candidate if candidate.is_absolute() else (resolved.parent / candidate).resolve())
 
+    integration_result = dict(integration)
+    for name in ("training_root", "evaluation_root", "pipeline_script"):
+        if name in integration_result:
+            integration_result[name] = resolve(integration_result[name])
+
+    output_root = resolve(paths.get("output_root"))
+    state_root = resolve(paths.get("state_root"))
+    if state_root is None and output_root:
+        state_root = str(Path(output_root) / ".studio-state")
+    version_start = versions.get("start", 3)
+    if isinstance(version_start, bool) or not isinstance(version_start, int):
+        raise StudioError("versions.start must be an integer")
+    registry_auto_build = registry.get("auto_build", True)
+    if not isinstance(registry_auto_build, bool):
+        raise StudioError("registry.auto_build must be true or false")
+
     result = {
         "registry_path": resolve(paths.get("registry_path")),
         "annotations_root": resolve(paths.get("annotations_root")),
         "data_root": resolve(paths.get("data_root")),
-        "output_root": resolve(paths.get("output_root")),
+        "output_root": output_root,
+        "state_root": state_root,
+        "version_start": version_start,
+        "registry_auto_build": registry_auto_build,
+        "metadata_registry": resolve(registry.get("metadata_registry")),
+        "integration": integration_result,
         "run_name": selection.get("run_name"),
         "stage1": selection.get("stage1"),
         "stage2": selection.get("stage2"),
@@ -137,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "catalog":
             result = catalog
         else:
-            stage1, stage2 = parse_rules(config, sources)
+            stage1, stage2 = parse_rules(config, sources, catalog)
             if args.command == "preview":
                 result = preview_selection(catalog, stage1, stage2)
             else:

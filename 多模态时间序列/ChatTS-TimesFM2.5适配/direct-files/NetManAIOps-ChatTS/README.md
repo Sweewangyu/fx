@@ -562,6 +562,8 @@ cp /path/to/direct-files/scripts/full/train_chronos2_best_stage2.sh \
   /workspace/ChatTS-Training/scripts/full/
 cp /path/to/direct-files/scripts/full/run_chronos2_best_two_stage.sh \
   /workspace/ChatTS-Training/scripts/full/
+cp /path/to/direct-files/scripts/verify_dataset_snapshot.py \
+  /workspace/ChatTS-Training/scripts/
 ```
 
 评测文件按原相对路径复制到 `ragas` 中的
@@ -582,6 +584,10 @@ save/eval steps 以及四套评测数据路径均可在该 YAML 中修改。使�
 ```bash
 CONFIG_FILE=/path/to/my_experiment.yaml bash scripts/run_train_then_eval.sh
 ```
+
+Dataset Studio 启动的任务会另外写入 `DATA_VERSION`、
+`DATASET_SNAPSHOT_HASH`、`TRIAL_ID` 和 `TRIAL_CONFIG_HASH`。训练容器会在写任何
+输出前独立校验快照 manifest 与全部文件 SHA256，避免读到被修改或版本不匹配的数据。
 
 命令行环境变量的优先级高于 YAML，例如临时做每套 2 条的冒烟评测：
 
