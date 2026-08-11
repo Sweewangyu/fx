@@ -109,3 +109,61 @@ DeepSeek 会看到该组第一条答案的脱敏模板作为格式代表；因�
 不再重复展开；失败模板会重试。缓存同时校验 `model + prompt_version`，更换模型或 prompt
 不会误用旧标签。`--dry-run` 不调用模型，只报告样本数、唯一模板数、预计 API 请求数和
 模板压缩比例。
+
+## 合并能力、质量和难度标签
+
+全部质量标注跑完后，使用 [`merge_tsqa_annotations.py`](merge_tsqa_annotations.py) 和
+[`merge_config.yaml`](merge_config.yaml) 将每条 QA 关联为：
+
+```json
+{
+  "annotation_id": "time_r1:1",
+  "ability_label": "TSF",
+  "ability_bucket": "TSF",
+  "ability_name": "time_series_forecasting",
+  "ability_major": "prediction",
+  "quality": "good",
+  "difficulty": "hard",
+  "quality_reason": "...",
+  "ability_label_source": "final",
+  "ability_join_method": "taxonomy_direct_hash"
+}
+```
+
+先只生成不含 `timeseries` 的轻量 sidecar 和联合分布（推荐先做这一步）：
+
+```bash
+python merge_tsqa_annotations.py --config merge_config.yaml --dry-run
+python merge_tsqa_annotations.py --config merge_config.yaml --labels-only
+```
+
+确认分布后，生成“原 QA + 标签”的逐来源完整 JSONL：
+
+```bash
+python merge_tsqa_annotations.py --config merge_config.yaml
+```
+
+完整 JSONL 会再占用约一份 datav2 的空间。任务按来源原子写入并支持 resume；中断后重复执行
+同一命令即可。`--dataset time_r1` 可只合并一个来源，`--force` 可强制重建逐来源结果。
+
+默认输出目录是 `merged_labels/`：
+
+- `annotations/*.jsonl`：逐 QA 轻量标签 sidecar，不复制原始序列；
+- `annotated/*.jsonl`：原始 `input/timeseries/output` 加顶层标签字段；
+- `reports/DISTRIBUTION.md`：可直接阅读的总体摘要；
+- `reports/ability_quality_difficulty.csv`：15 维能力 × 质量 × 难度完整立方体；
+- `reports/source_ability_quality_difficulty.csv`：再按数据来源展开；
+- `reports/coverage_by_source.csv`：逐来源覆盖率、标签来源和连接方式；
+- `reports/distribution.json`：机器可读汇总；
+- `taxonomy_labels.sqlite`：能力标注的可复用轻量索引。
+
+连接不是简单按行号硬拼：原始 ChatTS 清洗来源按有效行顺序并校验规范化内容；未清洗来源
+校验原始行 SHA-256；质量标签还会重新计算 `template_id/input_hash`。当前
+`opentslm_ecg_qa_cot` 数据有 21,817 条，而旧能力结果只对应 11,543 条旧内容，因此该来源
+会明确记录为 `audit_fallback`，使用当前逐行 audit 的 `primary_label`，不会误接旧标签。
+
+能力标签采用 `final.primary_label` → `final.proposed_primary_label` →
+`provisional.primary_label` 的优先级。明确 `out_of_scope` 的 QA 不会被强塞到某个能力维度，
+其 `ability_label` 为 `null`，报表中归到 `UNMAPPED`；因此报表同时给出总 QA 数与“15 维有效
+覆盖率”。为方便直接分组，每条记录还包含必有值的 `ability_bucket`：正常样本等于
+`ability_label`，超出范围的样本为 `UNMAPPED`。

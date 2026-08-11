@@ -1,0 +1,38 @@
+# 把 DeepSeek 质量/难度标注与 DataTaste 的 TSRBench 4×15 能力标注合并。
+# 所有相对路径均相对于本 YAML；服务器保持 SFT_CURATOR 与 datataste 同级即可。
+
+data_root: ../datataste
+data_registry: ../datataste/data/versions/datav2/sources.json
+quality_config: label_config.yaml
+
+taxonomy:
+  # 两个标注任务合起来覆盖 datav2 的全部 16 个来源。
+  manifests:
+    - ../datataste/artifacts/tsr-taxonomy/prepare_manifest.json
+    - ../datataste/artifacts/reasoning-taxonomy/prepare_manifest.json
+
+  # final 优先；人工未决时依次使用 final 中的 proposed label 和 provisional label。
+  # 明确 out_of_scope 的样本保留为 UNMAPPED，不强塞进 15 个能力维度。
+  labels:
+    - provisional: ../datataste/artifacts/tsr-taxonomy/provisional_labels.jsonl
+      final: ../datataste/artifacts/tsr-taxonomy/final_labels.jsonl
+    - provisional: ../datataste/artifacts/reasoning-taxonomy/provisional_labels.jsonl
+      final: ../datataste/artifacts/reasoning-taxonomy/final_labels.jsonl
+
+output:
+  root: merged_labels
+
+  # true 会按来源生成“原 QA + 全部标签”，约再占用一份 datav2 的磁盘空间。
+  # 若只想先看分布，可运行 `--labels-only` 临时覆盖为 false。
+  write_annotated_qa: true
+
+  # 轻量逐 QA sidecar，不复制 timeseries，建议始终保留。
+  write_annotation_sidecar: true
+
+  # 缺任何 quality/difficulty 或能力连接记录时立即失败，避免静默错位。
+  # 能力记录本身明确标记为 out_of_scope 不属于连接失败。
+  strict_quality: true
+  strict_ability_join: true
+
+  # 每个来源原子写入并保存签名；中断后重跑会跳过已完整完成的来源。
+  resume: true
