@@ -11,6 +11,7 @@ metadata needed by inference, and optionally removes the now-redundant
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -18,7 +19,6 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
 
 CHECKPOINT_RE = re.compile(r"checkpoint-[0-9]+")
 WEIGHT_PATTERNS = (
@@ -44,6 +44,14 @@ def discover_weight_files(checkpoint_dir: Path) -> list[Path]:
             if path.is_file() and path.stat().st_size > 0:
                 files[path.name] = path
     return [files[name] for name in sorted(files)]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,7 +182,11 @@ def main() -> int:
         "chronos2_hidden_size": args.chronos2_hidden_size,
         "patch_size": args.patch_size,
         "model_files": [
-            {"name": path.name, "size_bytes": path.stat().st_size}
+            {
+                "name": path.name,
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
             for path in weight_files
         ],
         "checkpoint_directories_before_cleanup": [path.name for path in checkpoint_dirs],

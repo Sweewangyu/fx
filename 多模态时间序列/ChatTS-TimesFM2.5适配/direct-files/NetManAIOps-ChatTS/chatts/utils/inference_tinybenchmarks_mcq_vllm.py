@@ -11,16 +11,15 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 # Keep this at module scope. vLLM uses spawn; every worker must execute the
 # ChatTS model/processor registration before it creates Qwen2/3TSForCausalLM.
-import chatts.vllm.chatts_vllm as _chatts_vllm  # noqa: F401,E402
-
+import chatts.vllm.chatts_vllm as _chatts_vllm  # noqa: F401
 
 TASKS = (
     "tinyArc",
@@ -190,7 +189,7 @@ def _read_saved_dataset(path: Path, split: str) -> list[dict[str, Any]]:
             raise ValueError(f"Saved dataset {path} has no {split!r} split: {list(dataset)}")
         dataset = dataset[split]
     if not isinstance(dataset, Dataset):
-        raise ValueError(f"Unsupported saved dataset object in {path}")
+        raise TypeError(f"Unsupported saved dataset object in {path}")
     return [_plain(row) for row in dataset]
 
 
@@ -273,12 +272,95 @@ def load_task_rows(
                     f"found {len(rows)} rows, expected the 100-row tiny eval split"
                 )
             return rows, path
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report every invalid local candidate.
             failures.append(f"{path}: {exc}")
             if explicit_path:
                 break
     preview = "\n  ".join(failures[:6])
     raise RuntimeError(f"No valid local {task} eval split found. Tried:\n  {preview}")
+
+
+def _partition_stratum(row: dict[str, Any]) -> str:
+    """Return the category/difficulty stratum used by locked 20/80 views."""
+
+    category = next(
+        (
+            row[key]
+            for key in ("category", "subject", "subcategory", "task")
+            if row.get(key) not in (None, "")
+        ),
+        "",
+    )
+    difficulty = next(
+        (
+            row[key]
+            for key in ("difficulty", "level")
+            if row.get(key) not in (None, "")
+        ),
+        "",
+    )
+    return f"{category}|{difficulty}"
+
+
+def partition_task_rows(
+    task: str,
+    rows: list[dict[str, Any]],
+    partition: str,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Create an exact, deterministic, hash-stratified 20/80 partition.
+
+    ``search-dev`` receives 20 percent of a task and ``final-test`` receives
+    the disjoint complement.  Quotas are apportioned across category and
+    difficulty strata with the largest-remainder method, then stable content
+    hashes choose rows inside each stratum.  The historical ``all`` behavior
+    is unchanged.
+    """
+
+    if partition == "all":
+        return rows
+    if partition not in {"search-dev", "final-test"}:
+        raise ValueError(f"Unsupported data partition: {partition}")
+    if len(rows) < 2:
+        raise ValueError(
+            f"{task} needs at least two rows for a disjoint search-dev/final-test split"
+        )
+
+    grouped: dict[str, list[tuple[str, int]]] = {}
+    for index, row in enumerate(rows):
+        serialized = json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+        )
+        digest = hashlib.sha256(f"{seed}\0{task}\0{serialized}\0{index}".encode()).hexdigest()
+        grouped.setdefault(_partition_stratum(row), []).append((digest, index))
+
+    target = max(1, min(len(rows) - 1, int(len(rows) * 0.2 + 0.5)))
+    quotas = {name: len(items) // 5 for name, items in grouped.items()}
+    remaining = target - sum(quotas.values())
+    allocation_order = sorted(
+        grouped,
+        key=lambda name: (
+            -(len(grouped[name]) % 5),
+            hashlib.sha256(f"{seed}\0{task}\0{name}".encode()).hexdigest(),
+        ),
+    )
+    for name in allocation_order:
+        if remaining <= 0:
+            break
+        if quotas[name] < len(grouped[name]):
+            quotas[name] += 1
+            remaining -= 1
+    if remaining:
+        raise RuntimeError(f"Could not allocate the requested {target} search-dev rows")
+
+    dev_indices: set[int] = set()
+    for name, items in grouped.items():
+        dev_indices.update(index for _, index in sorted(items)[: quotas[name]])
+    want_dev = partition == "search-dev"
+    selected = [row for index, row in enumerate(rows) if (index in dev_indices) == want_dev]
+    if not selected:
+        raise ValueError(f"{task} {partition} partition is empty")
+    return selected
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -582,6 +664,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument(
+        "--data-partition",
+        choices=("all", "search-dev", "final-test"),
+        default="all",
+        help="Deterministic hash-stratified data view; all preserves historical behavior.",
+    )
+    parser.add_argument("--partition-seed", type=int, default=42)
     parser.add_argument("--allow-size-mismatch", action="store_true")
     parser.add_argument("--inspect-data-only", action="store_true")
     return parser.parse_args()
@@ -593,6 +682,8 @@ def main() -> int:
         raise SystemExit("GPU count, request chunk size, and max model length must be positive")
     if args.seed < 0:
         raise SystemExit("--seed must be non-negative")
+    if args.partition_seed < 0:
+        raise SystemExit("--partition-seed must be non-negative")
     if not 0 < args.gpu_memory_utilization <= 1:
         raise SystemExit("--gpu-memory-utilization must be in (0, 1]")
     task_names = [canonical_task(item.strip()) for item in args.tasks.split(",") if item.strip()]
@@ -613,6 +704,7 @@ def main() -> int:
             explicit.get(task),
             allow_size_mismatch=args.allow_size_mismatch,
         )
+        rows = partition_task_rows(task, rows, args.data_partition, args.partition_seed)
         if args.max_samples > 0:
             rows = rows[: args.max_samples]
         datasets[task] = (rows, source)
@@ -682,6 +774,8 @@ def main() -> int:
         "macro_score": macro,
         "num_tasks": len(task_results),
         "seed": args.seed,
+        "data_partition": args.data_partition,
+        "partition_seed": args.partition_seed,
         "note": (
             "Raw 100-item tiny-set metrics only; no GPIRT/IRT++ extrapolation is applied. "
             "tinyTruthfulQA is MC2 probability mass; other tasks are length-normalized accuracy."

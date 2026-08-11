@@ -9,7 +9,9 @@ STAGE2_OUT="${3:?Usage: train_chronos2_best_stage2.sh <learning-rate> <stage1-di
 
 PROJECT_ROOT="${PROJECT_ROOT:-/workspace/ChatTS-Training}"
 CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
+DATASET_DIR="${DATASET_DIR:-${PROJECT_ROOT}/data}"
 FINALIZER="${FINALIZER:-${PROJECT_ROOT}/scripts/finalize_chatts_best_checkpoint.py}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-$(dirname "$STAGE2_OUT")/logs/tensorboard/stage2}"
 SEED="${SEED:-42}"
 DEEPSPEED_INCLUDE="${DEEPSPEED_INCLUDE:-localhost:0,1,2,3,4,5,6,7}"
@@ -35,6 +37,7 @@ STAGE2_PREPROCESSING_NUM_WORKERS="${STAGE2_PREPROCESSING_NUM_WORKERS:-96}"
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer." >&2; exit 2; }
 [[ "$LR" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] || { echo "Invalid learning rate: $LR" >&2; exit 2; }
 [[ "$STAGE2_MAX_STEPS" =~ ^[0-9]+$ ]] || { echo "STAGE2_MAX_STEPS must be non-negative." >&2; exit 2; }
+[[ -n "$DATASET_DIR" ]] || { echo "DATASET_DIR must not be empty." >&2; exit 2; }
 [[ -d "$PROJECT_ROOT" ]] || { echo "Training project not found: $PROJECT_ROOT" >&2; exit 1; }
 [[ -f "$STAGE1_OUT/config.json" ]] || { echo "Stage1 model config not found: $STAGE1_OUT/config.json" >&2; exit 1; }
 [[ -f "$STAGE1_OUT/best_model_manifest.json" ]] || { echo "Stage1 best-model manifest not found." >&2; exit 1; }
@@ -54,13 +57,13 @@ TRAIN_LENGTH_ARGS=(--num_train_epochs "$STAGE2_NUM_TRAIN_EPOCHS")
 if (( STAGE2_MAX_STEPS > 0 )); then
     TRAIN_LENGTH_ARGS+=(--max_steps "$STAGE2_MAX_STEPS")
 fi
-DATASET_ARGS=(--dataset "$STAGE2_DATASETS" --mix_strategy "$STAGE2_MIX_STRATEGY")
+DATASET_ARGS=(--dataset_dir "$DATASET_DIR" --dataset "$STAGE2_DATASETS" --mix_strategy "$STAGE2_MIX_STRATEGY")
 if [[ -n "$STAGE2_INTERLEAVE_PROBS" ]]; then
     DATASET_ARGS+=(--interleave_probs "$STAGE2_INTERLEAVE_PROBS")
 fi
 
 echo "[Stage2] seed=$SEED lr=$LR ts_lr=$STAGE2_TIMESERIES_SFT_LR stage1_best=$STAGE1_OUT output=$STAGE2_OUT"
-echo "[Stage2] datasets=$STAGE2_DATASETS mix=$STAGE2_MIX_STRATEGY interleave_probs=${STAGE2_INTERLEAVE_PROBS:-<none>}"
+echo "[Stage2] dataset_dir=$DATASET_DIR datasets=$STAGE2_DATASETS mix=$STAGE2_MIX_STRATEGY interleave_probs=${STAGE2_INTERLEAVE_PROBS:-<none>}"
 cd "$PROJECT_ROOT"
 deepspeed --include "$DEEPSPEED_INCLUDE" --master_port="$MASTER_PORT" src/train.py \
     --deepspeed ds_config/ds_config_2.json \
@@ -104,7 +107,7 @@ deepspeed --include "$DEEPSPEED_INCLUDE" --master_port="$MASTER_PORT" src/train.
     --report_to tensorboard \
     --logging_dir "$TENSORBOARD_DIR"
 
-python3 "$FINALIZER" \
+"$PYTHON_BIN" "$FINALIZER" \
     --checkpoint-dir "$STAGE2_OUT" \
     --stage stage2 \
     --seed "$SEED" \

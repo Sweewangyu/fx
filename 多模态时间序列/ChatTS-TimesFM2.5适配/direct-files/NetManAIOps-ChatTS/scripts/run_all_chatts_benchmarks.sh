@@ -24,6 +24,14 @@ LOG_ROOT="${LOG_ROOT:-${OUTPUT_ROOT}/logs}"
 STATUS_FILE="${STATUS_FILE:-${OUTPUT_ROOT}/benchmark_status.tsv}"
 SUMMARY_FILE="${SUMMARY_FILE:-${OUTPUT_ROOT}/all_benchmarks_summary.md}"
 MANIFEST_FILE="${MANIFEST_FILE:-${OUTPUT_ROOT}/run_manifest.json}"
+METRICS_FILE="${METRICS_FILE:-${OUTPUT_ROOT}/metrics.json}"
+
+# Comma-separated subset.  The default preserves the historical four-suite
+# order. RUN_ID is metadata only and does not prevent reuse of an otherwise
+# identical fingerprinted result.
+BENCHMARKS="${BENCHMARKS:-tsrbench,tinybenchmarks,ts_haystack,timeseriesexam}"
+RUN_ID="${RUN_ID:-manual}"
+EVAL_PROTOCOL_HASH="${EVAL_PROTOCOL_HASH:-}"
 
 FORCE_EVAL="${FORCE_EVAL:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
@@ -47,11 +55,14 @@ TSR_REQUEST_CHUNK_SIZE="${TSR_REQUEST_CHUNK_SIZE:-128}"
 TINY_MAX_MODEL_LEN="${TINY_MAX_MODEL_LEN:-6000}"
 TINY_REQUEST_CHUNK_SIZE="${TINY_REQUEST_CHUNK_SIZE:-16}"
 TINY_GPU_MEMORY_UTILIZATION="${TINY_GPU_MEMORY_UTILIZATION:-0.70}"
+TINY_DATA_PARTITION="${TINY_DATA_PARTITION:-all}"
+TINY_PARTITION_SEED="${TINY_PARTITION_SEED:-42}"
 
 HAYSTACK_MAX_MODEL_LEN="${HAYSTACK_MAX_MODEL_LEN:-40960}"
 HAYSTACK_MAX_NEW_TOKENS="${HAYSTACK_MAX_NEW_TOKENS:-500}"
 HAYSTACK_BATCH_SIZE="${HAYSTACK_BATCH_SIZE:-1}"
 HAYSTACK_REQUEST_CHUNK_SIZE="${HAYSTACK_REQUEST_CHUNK_SIZE:-8}"
+HAYSTACK_SPLIT="${HAYSTACK_SPLIT:-test}"
 
 EXAM_MAX_MODEL_LEN="${EXAM_MAX_MODEL_LEN:-8192}"
 EXAM_MAX_NEW_TOKENS="${EXAM_MAX_NEW_TOKENS:-1024}"
@@ -69,6 +80,15 @@ done
 [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || { echo "MAX_SAMPLES must be non-negative." >&2; exit 2; }
 [[ "$EVAL_NUM_GPUS" =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_NUM_GPUS must be positive." >&2; exit 2; }
 [[ "$TS_GPUS_PER_PROCESS" =~ ^[1-9][0-9]*$ ]] || { echo "TS_GPUS_PER_PROCESS must be positive." >&2; exit 2; }
+[[ "$TINY_PARTITION_SEED" =~ ^[0-9]+$ ]] || { echo "TINY_PARTITION_SEED must be non-negative." >&2; exit 2; }
+case "$TINY_DATA_PARTITION" in
+    all|search-dev|final-test) ;;
+    *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
+esac
+case "$HAYSTACK_SPLIT" in
+    train|validation|test) ;;
+    *) echo "HAYSTACK_SPLIT must be train, validation, or test." >&2; exit 2 ;;
+esac
 (( EVAL_NUM_GPUS == 8 )) || { echo "This runner is fixed to eight-GPU evaluation." >&2; exit 2; }
 (( EVAL_NUM_GPUS % TS_GPUS_PER_PROCESS == 0 )) || {
     echo "EVAL_NUM_GPUS must be divisible by TS_GPUS_PER_PROCESS." >&2
@@ -77,6 +97,36 @@ done
 [[ "$MODEL_NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || {
     echo "MODEL_NAME may contain only letters, digits, dot, underscore, and dash." >&2
     exit 2
+}
+[[ "$RUN_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    echo "RUN_ID may contain only letters, digits, dot, underscore, and dash." >&2
+    exit 2
+}
+
+SELECTED_SUITES=()
+selected_suite_csv=","
+IFS=',' read -r -a requested_suites <<< "$BENCHMARKS"
+for requested_suite in "${requested_suites[@]}"; do
+    requested_suite="${requested_suite//[[:space:]]/}"
+    case "$requested_suite" in
+        tsrbench|timeseriesexam|ts_haystack|tinybenchmarks) ;;
+        "") echo "BENCHMARKS contains an empty suite name: $BENCHMARKS" >&2; exit 2 ;;
+        *) echo "Unsupported benchmark '$requested_suite' in BENCHMARKS=$BENCHMARKS" >&2; exit 2 ;;
+    esac
+    [[ "$selected_suite_csv" != *",$requested_suite,"* ]] || {
+        echo "Duplicate benchmark '$requested_suite' in BENCHMARKS=$BENCHMARKS" >&2
+        exit 2
+    }
+    SELECTED_SUITES+=("$requested_suite")
+    selected_suite_csv+="$requested_suite,"
+done
+
+suite_selected() {
+    local wanted="$1" selected
+    for selected in "${SELECTED_SUITES[@]}"; do
+        [[ "$selected" == "$wanted" ]] && return 0
+    done
+    return 1
 }
 
 require_dir() {
@@ -91,23 +141,41 @@ require_file() {
 
 require_dir "ChatTS project" "$PROJECT_ROOT"
 require_dir "Chronos-2 backbone" "$CHRONOS2_MODEL_PATH"
-require_dir "TSRBench dataset root" "$TSRBENCH_DATASET_ROOT"
-require_dir "tinyBenchmarks dataset root" "$TINYBENCH_DATASET_ROOT"
-require_file "TS-Haystack registry" "$TS_HAYSTACK_ROOT/src/datasets/registry.py"
-require_dir "TS-Haystack data" "$TS_HAYSTACK_ROOT/data"
-require_file "TimeSeriesExam concepts" "$TIMESERIESEXAM_ROOT/evaluate/concepts.py"
-require_file "TimeSeriesExam dataset" "$TIMESERIESEXAM_DATA_FILE"
 require_file "Encoder inspector" "$PROJECT_ROOT/scripts/inspect_chatts_ts_encoder_checkpoints.py"
-require_file "TSRBench runner" "$PROJECT_ROOT/scripts/run_chatts_tsrbench.sh"
-require_file "tinyBenchmarks runner" "$PROJECT_ROOT/scripts/run_chatts_tinybenchmarks_mcq.sh"
-require_file "TS-Haystack runner" "$PROJECT_ROOT/scripts/run_chatts_ts_haystack.sh"
-require_file "TimeSeriesExam runner" "$PROJECT_ROOT/scripts/run_chatts_timeseriesexam.sh"
+ARTIFACT_HELPER="$PROJECT_ROOT/scripts/chatts_benchmark_artifacts.py"
+require_file "Benchmark artifact helper" "$ARTIFACT_HELPER"
+require_file "vLLM model adapter" "$PROJECT_ROOT/chatts/vllm/chatts_vllm.py"
 
-tsr_probe="$(find "$TSRBENCH_DATASET_ROOT" -type f -name perception.jsonl -print -quit)"
-[[ -n "$tsr_probe" ]] || {
-    echo "Cannot find perception.jsonl under $TSRBENCH_DATASET_ROOT" >&2
-    exit 1
-}
+if suite_selected tsrbench; then
+    require_dir "TSRBench dataset root" "$TSRBENCH_DATASET_ROOT"
+    require_file "TSRBench runner" "$PROJECT_ROOT/scripts/run_chatts_tsrbench.sh"
+    require_file "TSRBench evaluator" "$PROJECT_ROOT/scripts/evaluate_tsrbench.py"
+    require_file "TSRBench inference module" "$PROJECT_ROOT/chatts/utils/inference_tsrbench_vllm.py"
+    tsr_probe="$(find "$TSRBENCH_DATASET_ROOT" -type f -name perception.jsonl -print -quit)"
+    [[ -n "$tsr_probe" ]] || {
+        echo "Cannot find perception.jsonl under $TSRBENCH_DATASET_ROOT" >&2
+        exit 1
+    }
+fi
+if suite_selected tinybenchmarks; then
+    require_dir "tinyBenchmarks dataset root" "$TINYBENCH_DATASET_ROOT"
+    require_file "tinyBenchmarks runner" "$PROJECT_ROOT/scripts/run_chatts_tinybenchmarks_mcq.sh"
+    require_file "tinyBenchmarks inference module" "$PROJECT_ROOT/chatts/utils/inference_tinybenchmarks_mcq_vllm.py"
+fi
+if suite_selected ts_haystack; then
+    require_file "TS-Haystack registry" "$TS_HAYSTACK_ROOT/src/datasets/registry.py"
+    require_dir "TS-Haystack data" "$TS_HAYSTACK_ROOT/data"
+    require_file "TS-Haystack runner" "$PROJECT_ROOT/scripts/run_chatts_ts_haystack.sh"
+    require_file "TS-Haystack evaluator" "$PROJECT_ROOT/scripts/evaluate_ts_haystack.py"
+    require_file "TS-Haystack inference module" "$PROJECT_ROOT/chatts/utils/inference_ts_haystack_vllm.py"
+fi
+if suite_selected timeseriesexam; then
+    require_file "TimeSeriesExam concepts" "$TIMESERIESEXAM_ROOT/evaluate/concepts.py"
+    require_file "TimeSeriesExam dataset" "$TIMESERIESEXAM_DATA_FILE"
+    require_file "TimeSeriesExam runner" "$PROJECT_ROOT/scripts/run_chatts_timeseriesexam.sh"
+    require_file "TimeSeriesExam evaluator" "$PROJECT_ROOT/scripts/evaluate_timeseriesexam.py"
+    require_file "TimeSeriesExam inference module" "$PROJECT_ROOT/chatts/utils/inference_timeseriesexam_vllm.py"
+fi
 
 AVAILABLE_GPUS="${AVAILABLE_GPUS_OVERRIDE:-$($PYTHON_BIN -c 'import torch; print(torch.cuda.device_count())')}"
 if (( AVAILABLE_GPUS < 8 )); then
@@ -146,11 +214,14 @@ echo "============================================================"
 echo " ChatTS four-suite sequential eight-GPU evaluation"
 echo " Model:          $MODEL_PATH"
 echo " Model name:     $MODEL_NAME"
+echo " Run ID:         $RUN_ID"
 echo " Encoder:        chronos2 ($CHRONOS2_MODEL_PATH)"
 echo " Seed:           $SEED"
 echo " GPU allocation: $EVAL_GPUS (exclusive for each suite)"
 echo " TS engines:     $((EVAL_NUM_GPUS / TS_GPUS_PER_PROCESS)) x ${TS_GPUS_PER_PROCESS}-GPU"
 echo " Max samples:    $MAX_SAMPLES (0 means full benchmark)"
+echo " Benchmarks:     ${SELECTED_SUITES[*]}"
+echo " Protocol hash:  ${EVAL_PROTOCOL_HASH:-derived from code and arguments}"
 echo " Output:         $OUTPUT_ROOT"
 echo "============================================================"
 
@@ -194,7 +265,7 @@ run_tsrbench() {
         MAX_PROCESSED_INPUT_TOKENS="$((TSR_MAX_MODEL_LEN - TSR_MAX_NEW_TOKENS))" \
         ENABLE_THINKING=0 \
         SEED="$SEED" \
-        FORCE_INFERENCE="$FORCE_EVAL" \
+        FORCE_INFERENCE="${SUITE_FORCE_EVAL:-$FORCE_EVAL}" \
         PYTHON_BIN="$PYTHON_BIN" \
         bash "$PROJECT_ROOT/scripts/run_chatts_tsrbench.sh"
 }
@@ -205,7 +276,7 @@ run_tinybenchmarks() {
         --model "$MODEL_NAME=$MODEL_PATH"
         --baseline "$MODEL_NAME"
     )
-    if [[ "$FORCE_EVAL" == "1" ]]; then
+    if [[ "${SUITE_FORCE_EVAL:-$FORCE_EVAL}" == "1" ]]; then
         command+=(--force)
     fi
     env \
@@ -220,6 +291,8 @@ run_tinybenchmarks() {
         MAX_SAMPLES="$MAX_SAMPLES" \
         SEED="$SEED" \
         OFFLINE="$OFFLINE" \
+        DATA_PARTITION="$TINY_DATA_PARTITION" \
+        PARTITION_SEED="$TINY_PARTITION_SEED" \
         PYTHON_BIN="$PYTHON_BIN" \
         "${command[@]}"
 }
@@ -234,7 +307,7 @@ run_ts_haystack() {
         DATASETS=all \
         TASKS=all \
         CONTEXT_LENGTHS=all \
-        SPLIT=test \
+        SPLIT="$HAYSTACK_SPLIT" \
         NUM_GPUS="$EVAL_NUM_GPUS" \
         NUM_GPUS_PER_PROCESS="$TS_GPUS_PER_PROCESS" \
         BATCH_SIZE="$HAYSTACK_BATCH_SIZE" \
@@ -246,7 +319,7 @@ run_ts_haystack() {
         TEMPERATURE=0.0 \
         SEED="$SEED" \
         ENABLE_THINKING=0 \
-        FORCE_INFERENCE="$FORCE_EVAL" \
+        FORCE_INFERENCE="${SUITE_FORCE_EVAL:-$FORCE_EVAL}" \
         SCORE_ONLY=0 \
         PYTHON_BIN="$PYTHON_BIN" \
         bash "$PROJECT_ROOT/scripts/run_chatts_ts_haystack.sh"
@@ -274,11 +347,134 @@ run_timeseriesexam() {
         ADD_CONCEPTS=1 \
         ADD_EXAMPLES=1 \
         ENABLE_THINKING=0 \
-        FORCE_INFERENCE="$FORCE_EVAL" \
+        FORCE_INFERENCE="${SUITE_FORCE_EVAL:-$FORCE_EVAL}" \
         SCORE_ONLY=0 \
         OFFLINE="$OFFLINE" \
         PYTHON_BIN="$PYTHON_BIN" \
         bash "$PROJECT_ROOT/scripts/run_chatts_timeseriesexam.sh"
+}
+
+suite_summary_file() {
+    local name="$1" suite_output="$2"
+    case "$name" in
+        tsrbench) echo "$suite_output/tsrbench_summary_${MODEL_NAME}.json" ;;
+        tinybenchmarks) echo "$suite_output/$MODEL_NAME/metrics.json" ;;
+        ts_haystack) echo "$suite_output/ts_haystack_summary_${MODEL_NAME}.json" ;;
+        timeseriesexam)
+            echo "$suite_output/${MODEL_NAME}_query_hint_concepts_examples/timeseriesexam_summary_${MODEL_NAME}.json"
+            ;;
+        *) echo "Unknown suite: $name" >&2; return 2 ;;
+    esac
+}
+
+suite_artifact() {
+    local action="$1" name="$2" suite_output="$3"
+    local summary_file
+    summary_file="$(suite_summary_file "$name" "$suite_output")"
+    local -a command=(
+        "$PYTHON_BIN" "$ARTIFACT_HELPER" "$action"
+        --suite "$name"
+        --model-path "$MODEL_PATH"
+        --model-name "$MODEL_NAME"
+        --model-component "$CHRONOS2_MODEL_PATH"
+        --eval-protocol-hash "$EVAL_PROTOCOL_HASH"
+        --protocol-file "$PROJECT_ROOT/scripts/run_all_chatts_benchmarks.sh"
+        --protocol-file "$PROJECT_ROOT/chatts/vllm/chatts_vllm.py"
+        --protocol-file "$PROJECT_ROOT/chatts/utils/llm_utils.py"
+        --protocol "encoder=chronos2"
+        --protocol "seed=$SEED"
+        --protocol "max_samples=$MAX_SAMPLES"
+        --protocol "eval_num_gpus=$EVAL_NUM_GPUS"
+        --protocol "ts_gpus_per_process=$TS_GPUS_PER_PROCESS"
+    )
+
+    case "$name" in
+        tsrbench)
+            command+=(
+                --data-path "$TSRBENCH_DATASET_ROOT"
+                --protocol-file "$PROJECT_ROOT/scripts/run_chatts_tsrbench.sh"
+                --protocol-file "$PROJECT_ROOT/scripts/evaluate_tsrbench.py"
+                --protocol-file "$PROJECT_ROOT/chatts/utils/inference_tsrbench_vllm.py"
+                --protocol "datasets=all"
+                --protocol "prompt_mode=$TSR_PROMPT_MODE"
+                --protocol "max_model_len=$TSR_MAX_MODEL_LEN"
+                --protocol "max_new_tokens=$TSR_MAX_NEW_TOKENS"
+                --protocol "batch_size=$TSR_BATCH_SIZE"
+                --protocol "request_chunk_size=$TSR_REQUEST_CHUNK_SIZE"
+                --protocol "enable_thinking=0"
+            )
+            ;;
+        tinybenchmarks)
+            command+=(
+                --data-path "$TINYBENCH_DATASET_ROOT"
+                --protocol-file "$PROJECT_ROOT/scripts/run_chatts_tinybenchmarks_mcq.sh"
+                --protocol-file "$PROJECT_ROOT/scripts/summarize_tinybenchmarks_mcq.py"
+                --protocol-file "$PROJECT_ROOT/chatts/utils/inference_tinybenchmarks_mcq_vllm.py"
+                --protocol "tasks=tinyArc,tinyHellaswag,tinyMMLU,tinyTruthfulQA,tinyWinogrande"
+                --protocol "max_model_len=$TINY_MAX_MODEL_LEN"
+                --protocol "request_chunk_size=$TINY_REQUEST_CHUNK_SIZE"
+                --protocol "gpu_memory_utilization=$TINY_GPU_MEMORY_UTILIZATION"
+            )
+            if [[ "$TINY_DATA_PARTITION" != "all" ]]; then
+                command+=(
+                    --protocol "data_partition=$TINY_DATA_PARTITION"
+                    --protocol "partition_seed=$TINY_PARTITION_SEED"
+                )
+            fi
+            ;;
+        ts_haystack)
+            command+=(
+                --data-path "$TS_HAYSTACK_ROOT/data"
+                --data-path "$TS_HAYSTACK_ROOT/src/datasets/registry.py"
+                --protocol-file "$PROJECT_ROOT/scripts/run_chatts_ts_haystack.sh"
+                --protocol-file "$PROJECT_ROOT/scripts/evaluate_ts_haystack.py"
+                --protocol-file "$PROJECT_ROOT/chatts/utils/inference_ts_haystack_vllm.py"
+                --protocol-file "$TS_HAYSTACK_ROOT/src"
+                --protocol "datasets=all"
+                --protocol "tasks=all"
+                --protocol "context_lengths=all"
+                --protocol "split=$HAYSTACK_SPLIT"
+                --protocol "max_model_len=$HAYSTACK_MAX_MODEL_LEN"
+                --protocol "max_new_tokens=$HAYSTACK_MAX_NEW_TOKENS"
+                --protocol "batch_size=$HAYSTACK_BATCH_SIZE"
+                --protocol "request_chunk_size=$HAYSTACK_REQUEST_CHUNK_SIZE"
+                --protocol "temperature=0.0"
+                --protocol "enable_thinking=0"
+            )
+            ;;
+        timeseriesexam)
+            command+=(
+                --data-path "$TIMESERIESEXAM_DATA_FILE"
+                --data-path "$TIMESERIESEXAM_ROOT/evaluate/concepts.py"
+                --protocol-file "$PROJECT_ROOT/scripts/run_chatts_timeseriesexam.sh"
+                --protocol-file "$PROJECT_ROOT/scripts/evaluate_timeseriesexam.py"
+                --protocol-file "$PROJECT_ROOT/chatts/utils/inference_timeseriesexam_vllm.py"
+                --protocol "add_question_hint=1"
+                --protocol "add_concepts=1"
+                --protocol "add_examples=1"
+                --protocol "max_model_len=$EXAM_MAX_MODEL_LEN"
+                --protocol "max_new_tokens=$EXAM_MAX_NEW_TOKENS"
+                --protocol "batch_size=$EXAM_BATCH_SIZE"
+                --protocol "request_chunk_size=$EXAM_REQUEST_CHUNK_SIZE"
+                --protocol "temperature=0.0"
+                --protocol "enable_thinking=0"
+            )
+            ;;
+        *) echo "Unknown suite: $name" >&2; return 2 ;;
+    esac
+
+    case "$action" in
+        cache-status) command+=(--manifest "$suite_output/.chatts_benchmark_manifest.json") ;;
+        write-suite-manifest)
+            command+=(
+                --output-dir "$suite_output"
+                --summary-file "$summary_file"
+                --run-id "$RUN_ID"
+            )
+            ;;
+        *) echo "Unknown artifact action: $action" >&2; return 2 ;;
+    esac
+    "${command[@]}"
 }
 
 SUITE_NAMES=()
@@ -292,19 +488,48 @@ run_step() {
     local name="$1" suite_output="$2"
     shift 2
     local log_file="$LOG_ROOT/${name}.log"
-    local status exit_code
+    local status exit_code cache_message cache_code
     echo
     echo "==================== starting $name ===================="
     echo "Exclusive GPUs: $EVAL_GPUS"
     echo "Log: $log_file"
-    if "$@" 2>&1 | tee "$log_file"; then
-        status=PASS
-        exit_code=0
-    else
-        exit_code=$?
-        status=FAIL
-        FAILED_SUITES=$((FAILED_SUITES + 1))
+    if [[ "$FORCE_EVAL" != "1" ]]; then
+        if cache_message="$(suite_artifact cache-status "$name" "$suite_output" 2>&1)"; then
+            echo "$cache_message"
+            echo "[$RUN_ID] Reused fingerprint-matched $name result." | tee -a "$log_file"
+            status=CACHED
+            exit_code=0
+        else
+            cache_code=$?
+            echo "$cache_message"
+            if (( cache_code != 1 )); then
+                echo "Cannot compute the $name cache fingerprint." | tee "$log_file" >&2
+                status=FAIL
+                exit_code="$cache_code"
+                FAILED_SUITES=$((FAILED_SUITES + 1))
+            fi
+        fi
     fi
+
+    if [[ -z "${status:-}" ]]; then
+        # A cache miss forces the child runner too, preventing its legacy
+        # path-only cache from reusing stale predictions.
+        if SUITE_FORCE_EVAL=1 "$@" 2>&1 | tee "$log_file"; then
+            if suite_artifact write-suite-manifest "$name" "$suite_output" 2>&1 | tee -a "$log_file"; then
+                status=PASS
+                exit_code=0
+            else
+                exit_code=$?
+                status=FAIL
+                FAILED_SUITES=$((FAILED_SUITES + 1))
+            fi
+        else
+            exit_code=$?
+            status=FAIL
+            FAILED_SUITES=$((FAILED_SUITES + 1))
+        fi
+    fi
+
     SUITE_NAMES+=("$name")
     SUITE_STATUSES+=("$status")
     SUITE_CODES+=("$exit_code")
@@ -313,10 +538,14 @@ run_step() {
     echo "==================== $name: $status ===================="
 }
 
-run_step tsrbench "$OUTPUT_ROOT/tsrbench" run_tsrbench
-run_step tinybenchmarks "$OUTPUT_ROOT/tinybenchmarks" run_tinybenchmarks
-run_step ts_haystack "$OUTPUT_ROOT/ts_haystack" run_ts_haystack
-run_step timeseriesexam "$OUTPUT_ROOT/timeseriesexam" run_timeseriesexam
+for selected_suite in "${SELECTED_SUITES[@]}"; do
+    case "$selected_suite" in
+        tsrbench) run_step tsrbench "$OUTPUT_ROOT/tsrbench" run_tsrbench ;;
+        tinybenchmarks) run_step tinybenchmarks "$OUTPUT_ROOT/tinybenchmarks" run_tinybenchmarks ;;
+        ts_haystack) run_step ts_haystack "$OUTPUT_ROOT/ts_haystack" run_ts_haystack ;;
+        timeseriesexam) run_step timeseriesexam "$OUTPUT_ROOT/timeseriesexam" run_timeseriesexam ;;
+    esac
+done
 
 {
     printf 'suite\tgpus\tstatus\texit_code\toutput_dir\tlog_file\n'
@@ -335,8 +564,11 @@ run_step timeseriesexam "$OUTPUT_ROOT/timeseriesexam" run_timeseriesexam
     echo "# ChatTS all-benchmark evaluation"
     echo
     echo "- Model: \`$MODEL_PATH\`"
+    echo "- Run ID: \`$RUN_ID\`"
     echo "- Seed: \`$SEED\`"
     echo "- Encoder: \`chronos2\`"
+    echo "- Benchmarks: \`${SELECTED_SUITES[*]}\`"
+    echo "- Evaluation protocol: \`${EVAL_PROTOCOL_HASH:-derived SHA256}\`"
     echo "- Scheduling: sequential, eight exclusive GPUs per suite"
     echo "- Full benchmark: \`$([[ "$MAX_SAMPLES" == "0" ]] && echo yes || echo no)\`"
     echo
@@ -353,51 +585,39 @@ run_step timeseriesexam "$OUTPUT_ROOT/timeseriesexam" run_timeseriesexam
     done
 } > "$SUMMARY_FILE"
 
-STATUS_FILE="$STATUS_FILE" \
-MANIFEST_FILE="$MANIFEST_FILE" \
-MODEL_PATH="$MODEL_PATH" \
-MODEL_NAME="$MODEL_NAME" \
-OUTPUT_ROOT="$OUTPUT_ROOT" \
-SEED="$SEED" \
-MAX_SAMPLES="$MAX_SAMPLES" \
-FORCE_EVAL="$FORCE_EVAL" \
-"$PYTHON_BIN" - <<'PY'
-import csv
-import json
-import os
-from datetime import datetime, timezone
-from pathlib import Path
+AGGREGATE_ARGS=()
+for index in "${!SUITE_NAMES[@]}"; do
+    AGGREGATE_ARGS+=(
+        --suite-manifest
+        "${SUITE_NAMES[$index]}=${SUITE_OUTPUTS[$index]}/.chatts_benchmark_manifest.json"
+    )
+done
 
-status_path = Path(os.environ["STATUS_FILE"])
-with status_path.open(encoding="utf-8", newline="") as stream:
-    suites = list(csv.DictReader(stream, delimiter="\t"))
-payload = {
-    "status": "pass" if all(item["status"] == "PASS" for item in suites) else "fail",
-    "model_path": os.environ["MODEL_PATH"],
-    "model_name": os.environ["MODEL_NAME"],
-    "ts_encoder_type": "chronos2",
-    "seed": int(os.environ["SEED"]),
-    "max_samples": int(os.environ["MAX_SAMPLES"]),
-    "force_eval": os.environ["FORCE_EVAL"] == "1",
-    "scheduling": "sequential",
-    "exclusive_gpus_per_suite": 8,
-    "output_root": os.environ["OUTPUT_ROOT"],
-    "suites": suites,
-    "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-}
-path = Path(os.environ["MANIFEST_FILE"])
-temporary = path.with_suffix(path.suffix + ".tmp")
-with temporary.open("w", encoding="utf-8") as stream:
-    json.dump(payload, stream, ensure_ascii=False, indent=2)
-    stream.write("\n")
-temporary.replace(path)
-PY
+aggregate_code=0
+"$PYTHON_BIN" "$ARTIFACT_HELPER" aggregate \
+    --status-file "$STATUS_FILE" \
+    "${AGGREGATE_ARGS[@]}" \
+    --metrics-file "$METRICS_FILE" \
+    --run-manifest-file "$MANIFEST_FILE" \
+    --run-id "$RUN_ID" \
+    --model-path "$MODEL_PATH" \
+    --model-name "$MODEL_NAME" \
+    --seed "$SEED" \
+    --max-samples "$MAX_SAMPLES" \
+    --force-eval "$FORCE_EVAL" \
+    --output-root "$OUTPUT_ROOT" \
+    --eval-protocol-hash "$EVAL_PROTOCOL_HASH" || aggregate_code=$?
+if (( aggregate_code != 0 && FAILED_SUITES == 0 )); then
+    echo "Metric aggregation failed with exit code $aggregate_code." >&2
+    FAILED_SUITES=$((FAILED_SUITES + 1))
+fi
 
 echo
 echo "==================== benchmark status ===================="
 column -t -s $'\t' "$STATUS_FILE" 2>/dev/null || cat "$STATUS_FILE"
 echo "Summary:  $SUMMARY_FILE"
 echo "Manifest: $MANIFEST_FILE"
+echo "Metrics:  $METRICS_FILE"
 echo "Outputs:  $OUTPUT_ROOT"
 echo "=========================================================="
 

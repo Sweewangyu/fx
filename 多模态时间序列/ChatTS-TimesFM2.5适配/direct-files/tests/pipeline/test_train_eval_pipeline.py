@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,17 +12,18 @@ from pathlib import Path
 
 
 DIRECT_FILES = Path(__file__).resolve().parents[2]
+CHATTS_REPO = Path(
+    os.environ.get("CHATTS_REPO_ROOT", DIRECT_FILES.parent / "ChatTS")
+).resolve()
 FINALIZER = DIRECT_FILES / "scripts" / "finalize_chatts_best_checkpoint.py"
 TRAIN_RUNNER = DIRECT_FILES / "scripts" / "full" / "run_chronos2_best_two_stage.sh"
 EVAL_RUNNER = (
-    DIRECT_FILES
-    / "NetManAIOps-ChatTS"
+    CHATTS_REPO
     / "scripts"
     / "run_all_chatts_benchmarks.sh"
 )
 CONFIG_LOADER = (
-    DIRECT_FILES
-    / "NetManAIOps-ChatTS"
+    CHATTS_REPO
     / "scripts"
     / "load_train_eval_config.py"
 )
@@ -97,6 +99,10 @@ class FinalizeCheckpointTest(unittest.TestCase):
             self.assertEqual(manifest["input_model_dir"], str(stage1.resolve()))
             self.assertEqual(
                 manifest["input_best_model"]["selected_checkpoint"], "checkpoint-50"
+            )
+            self.assertEqual(
+                manifest["model_files"][0]["sha256"],
+                "d531fd39d473a326ce8c632facd6ade7b75cceae53b480d6044a41d0faa4d27c",
             )
 
     def test_finalizer_rejects_missing_selected_checkpoint(self) -> None:
@@ -187,6 +193,7 @@ evaluation:
             chronos = root / "chronos2"
             output = root / "output"
             project.mkdir()
+            (project / "data").mkdir()
             chronos.mkdir()
             write_json(model / "config.json", {})
             env = os.environ.copy()
@@ -227,6 +234,32 @@ evaluation:
         project = root / "chatts"
         scripts = project / "scripts"
         scripts.mkdir(parents=True)
+        shutil.copy2(
+            CHATTS_REPO / "scripts" / "chatts_benchmark_artifacts.py",
+            scripts / "chatts_benchmark_artifacts.py",
+        )
+        shutil.copy2(EVAL_RUNNER, scripts / "run_all_chatts_benchmarks.sh")
+
+        # The top-level runner fingerprints these files as part of the
+        # evaluation protocol.  The fixture deliberately uses inert stubs: the
+        # child benchmark runners below emit representative summaries without
+        # importing either ChatTS or a benchmark implementation.
+        protocol_files = (
+            scripts / "evaluate_tsrbench.py",
+            scripts / "evaluate_ts_haystack.py",
+            scripts / "evaluate_timeseriesexam.py",
+            scripts / "summarize_tinybenchmarks_mcq.py",
+            project / "chatts" / "vllm" / "chatts_vllm.py",
+            project / "chatts" / "utils" / "llm_utils.py",
+            project / "chatts" / "utils" / "inference_tsrbench_vllm.py",
+            project / "chatts" / "utils" / "inference_tinybenchmarks_mcq_vllm.py",
+            project / "chatts" / "utils" / "inference_ts_haystack_vllm.py",
+            project / "chatts" / "utils" / "inference_timeseriesexam_vllm.py",
+        )
+        for path in protocol_files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# offline protocol fixture\n", encoding="utf-8")
+
         sync_dir = root / "sync"
         sync_dir.mkdir()
         fake_runner = """#!/usr/bin/env bash
@@ -243,6 +276,25 @@ sleep 0.02
 if [[ "${FAIL_RUNNER:-}" == "$name" ]]; then
     exit 7
 fi
+case "$name" in
+    run_chatts_tsrbench.sh)
+        mkdir -p "$OUTPUT_ROOT"
+        printf '%s\n' '{"overall":{"dataset_size":2,"generated":2,"parsed":2,"correct":1,"coverage":1.0,"parse_rate":1.0,"accuracy_strict":0.5,"accuracy_parsed":0.5}}' > "$OUTPUT_ROOT/tsrbench_summary_${MODEL_NAME}.json"
+        ;;
+    run_chatts_tinybenchmarks_mcq.sh)
+        mkdir -p "$OUTPUT_ROOT/$MODEL_NAME"
+        printf '%s\n' '{"tasks":{"tinyArc":{"score":0.50},"tinyHellaswag":{"score":0.51},"tinyMMLU":{"score":0.52},"tinyTruthfulQA":{"score":0.53},"tinyWinogrande":{"score":0.54}}}' > "$OUTPUT_ROOT/$MODEL_NAME/metrics.json"
+        ;;
+    run_chatts_ts_haystack.sh)
+        mkdir -p "$OUTPUT_ROOT"
+        printf '%s\n' '{"overall":{"total":2,"generated":2,"parsed":2,"correct":1,"coverage":1.0,"parse_rate":1.0,"accuracy_strict":0.5,"accuracy_generated":0.5,"mean_iou":0.75,"mean_timestamp_error_s":0.25}}' > "$OUTPUT_ROOT/ts_haystack_summary_${MODEL_NAME}.json"
+        ;;
+    run_chatts_timeseriesexam.sh)
+        summary_dir="$OUTPUT_ROOT/${MODEL_NAME}_query_hint_concepts_examples"
+        mkdir -p "$summary_dir"
+        printf '%s\n' '{"overall":{"total":2,"generated":2,"parsed":2,"coverage":1.0,"parse_rate":1.0,"official_flexible_accuracy":0.5,"official_strict_accuracy":0.5,"letter_accuracy":0.5,"letter_accuracy_parsed":0.5}}' > "$summary_dir/timeseriesexam_summary_${MODEL_NAME}.json"
+        ;;
+esac
 """
         runner_names = (
             "run_chatts_tsrbench.sh",

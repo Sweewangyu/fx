@@ -17,6 +17,8 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 DTYPE="${DTYPE:-auto}"
 SEED="${SEED:-42}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
+DATA_PARTITION="${DATA_PARTITION:-all}"
+PARTITION_SEED="${PARTITION_SEED:-42}"
 ALLOW_SIZE_MISMATCH="${ALLOW_SIZE_MISMATCH:-0}"
 FORCE="${FORCE:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
@@ -60,6 +62,8 @@ Useful environment variables:
   REQUEST_CHUNK_SIZE=32           Candidate prompts submitted per call.
   CHATTS_VLLM_MAX_MODEL_LEN=8192  vLLM context allocation.
   MAX_SAMPLES=5                   Smoke-test only the first N examples.
+  DATA_PARTITION=search-dev       Locked hash-stratified view (all/search-dev/final-test).
+  PARTITION_SEED=42               Stable split seed.
   SEED=42                         vLLM engine/sampling seed.
   OFFLINE=1                       Force local Hugging Face files (default: 1).
 
@@ -193,6 +197,16 @@ if [[ "$SUMMARY_ONLY" != "1" ]]; then
         --seed "$SEED"
         --max-samples "$MAX_SAMPLES"
     )
+    case "$DATA_PARTITION" in
+        all) ;;
+        search-dev|final-test)
+            COMMON_ARGS+=(--data-partition "$DATA_PARTITION" --partition-seed "$PARTITION_SEED")
+            ;;
+        *)
+            echo "DATA_PARTITION must be all, search-dev, or final-test: $DATA_PARTITION" >&2
+            exit 2
+            ;;
+    esac
     for task_file in "${TASK_FILE_SPECS[@]}"; do
         COMMON_ARGS+=(--task-file "$task_file")
     done
