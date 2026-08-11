@@ -26,7 +26,10 @@ STAGE1_DATASETS="${STAGE1_DATASETS:-align_256,ift}"
 STAGE2_DATASETS="${STAGE2_DATASETS:-sft,align_random,finiverse_time_mqa,finiverse_tsaqa}"
 STAGE1_MIX_STRATEGY="${STAGE1_MIX_STRATEGY:-interleave_over}"
 STAGE2_MIX_STRATEGY="${STAGE2_MIX_STRATEGY:-concat}"
-STAGE1_INTERLEAVE_PROBS="${STAGE1_INTERLEAVE_PROBS:-0.9,0.1}"
+# Use `-` (not `:-`) so an explicitly empty value disables interleave
+# probabilities. Dataset Studio exports use concat and intentionally set this
+# to empty; when the variable is unset the historical 0.9/0.1 default remains.
+STAGE1_INTERLEAVE_PROBS="${STAGE1_INTERLEAVE_PROBS-0.9,0.1}"
 STAGE2_INTERLEAVE_PROBS="${STAGE2_INTERLEAVE_PROBS:-}"
 STAGE1_TIMESERIES_SFT_LR="${STAGE1_TIMESERIES_SFT_LR:-$S1_LR}"
 STAGE2_TIMESERIES_SFT_LR="${STAGE2_TIMESERIES_SFT_LR:-$S2_LR}"

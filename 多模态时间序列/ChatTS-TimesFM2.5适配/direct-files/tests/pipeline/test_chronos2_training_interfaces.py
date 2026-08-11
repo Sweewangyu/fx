@@ -64,6 +64,8 @@ printf '%s\n' "$@" >> "$CAPTURE_PATH"
                     "PYTHON_BIN": sys.executable,
                     "CAPTURE_PATH": str(capture),
                     "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+                    "STAGE1_MIX_STRATEGY": "concat",
+                    "STAGE1_INTERLEAVE_PROBS": "",
                     "STAGE1_PREPROCESSING_NUM_WORKERS": "1",
                     "STAGE2_PREPROCESSING_NUM_WORKERS": "1",
                 }
@@ -108,6 +110,7 @@ printf '%s\n' "$@" >> "$CAPTURE_PATH"
             self.assertEqual(
                 {args[index + 1] for index in best_model_positions}, {"True"}
             )
+            self.assertNotIn("--interleave_probs", args)
 
 
 class PipelineModeTest(unittest.TestCase):

@@ -1,0 +1,22 @@
+paths:
+  registry_path: ../demo_data/sources.json
+  annotations_root: ../demo_data/merged_labels
+  data_root: ../demo_data
+  output_root: ../exports
+
+selection:
+  run_name: demo-six-source-split
+  stage1:
+    sources: [chatts_align_256, chatts_align_random, chatts_ift, chatts_sft, time_mqa, tsaqa]
+    qualities: [weak, acceptable, good, excellent]
+    difficulties: [very_easy, easy, moderate]
+    abilities: []
+  stage2:
+    sources: [chatts_align_256, chatts_align_random, chatts_ift, chatts_sft, time_mqa, tsaqa]
+    qualities: [weak, acceptable, good, excellent]
+    difficulties: [moderate, hard, very_hard]
+    abilities: []
+
+server:
+  host: 127.0.0.1
+  port: 7865

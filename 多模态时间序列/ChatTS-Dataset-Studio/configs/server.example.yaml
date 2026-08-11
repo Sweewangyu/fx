@@ -1,0 +1,40 @@
+paths:
+  # datataste 的 datav2 数据源注册表。
+  registry_path: /workspace/datataste/data/versions/datav2/sources.json
+  # SFT_CURATOR merge_tsqa_annotations.py 的输出根目录；目录下应有
+  # annotations/*.jsonl（优先）或 annotated/*.jsonl。
+  annotations_root: /workspace/SFT_CURATOR/merged_labels
+  # 用于解析 sources.json 中的相对路径。
+  data_root: /workspace/datataste
+  # 每次导出会在这里新建 <run_name>/，不会覆盖已有目录。
+  output_root: /workspace/chatts-dataset-exports
+
+selection:
+  run_name: six-source-medium-split-v1
+  stage1:
+    sources:
+      - chatts_align_256
+      - chatts_align_random
+      - chatts_ift
+      - chatts_sft
+      - time_mqa
+      - tsaqa
+    qualities: [weak, acceptable, good, excellent]
+    difficulties: [very_easy, easy, moderate]
+    abilities: []
+  stage2:
+    sources:
+      - chatts_align_256
+      - chatts_align_random
+      - chatts_ift
+      - chatts_sft
+      - time_mqa
+      - tsaqa
+    qualities: [weak, acceptable, good, excellent]
+    difficulties: [moderate, hard, very_hard]
+    abilities: []
+
+server:
+  # 推荐在服务器上保持 127.0.0.1，再用 SSH 端口转发访问。
+  host: 127.0.0.1
+  port: 7865

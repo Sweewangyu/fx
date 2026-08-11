@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f3f0e8">
+    <title>ChatTS Dataset Studio</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到工作区</a>
+
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="ChatTS Dataset Studio 首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>
+          <strong>ChatTS</strong>
+          <small>Dataset Studio</small>
+        </span>
+      </a>
+      <div class="connection-pill" id="health-pill" role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="health-text">正在连接本地服务</span>
+      </div>
+    </header>
+
+    <main id="workspace">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">LOCAL · OFFLINE · REPRODUCIBLE</p>
+          <h1 id="hero-title">把标注数据变成<br><em>可训练的两阶段配方</em></h1>
+          <p class="hero-description">
+            按数据集、质量、难度和能力维度精确筛选，预览真实样本量，再分别导出 Stage 1 与 Stage 2 数据。
+          </p>
+          <div class="recipe-summary" aria-label="默认配方">
+            <div>
+              <span class="recipe-number">01</span>
+              <p><strong>Stage 1</strong><br>中等及以下 · weak 以上</p>
+            </div>
+            <span class="recipe-arrow" aria-hidden="true">→</span>
+            <div>
+              <span class="recipe-number">02</span>
+              <p><strong>Stage 2</strong><br>中等及以上 · weak 以上</p>
+            </div>
+          </div>
+        </div>
+        <aside class="hero-note" aria-label="数据处理原则">
+          <span class="note-index">A / B</span>
+          <p>训练 JSONL 只保留 <code>input</code>、<code>timeseries</code>、<code>output</code>。</p>
+          <p>完整标注会写入独立 sidecar，便于复查与复现。</p>
+          <div class="local-seal"><span>只读源数据</span><span>流式导出</span></div>
+        </aside>
+      </section>
+
+      <section class="panel path-panel" aria-labelledby="paths-title">
+        <div class="section-heading">
+          <div>
+            <span class="step-label">STEP 01</span>
+            <h2 id="paths-title">连接数据目录</h2>
+          </div>
+          <p>填写服务器上的绝对路径。扫描只读取 registry 与标注，不修改源文件。</p>
+        </div>
+
+        <div class="path-grid">
+          <label class="field field-wide">
+            <span>数据源注册表 <b>必填</b></span>
+            <input id="registry-path" type="text" spellcheck="false" autocomplete="off"
+              placeholder="/workspace/datataste/data/versions/datav2/sources.json">
+          </label>
+          <label class="field field-wide">
+            <span>合并标注目录 <b>必填</b></span>
+            <input id="annotations-root" type="text" spellcheck="false" autocomplete="off"
+              placeholder="/workspace/SFT_CURATOR/merged_labels">
+          </label>
+          <label class="field">
+            <span>datataste 根目录 <i>可选</i></span>
+            <input id="data-root" type="text" spellcheck="false" autocomplete="off"
+              placeholder="/workspace/datataste">
+          </label>
+          <label class="field">
+            <span>导出根目录 <b>必填</b></span>
+            <input id="output-root" type="text" spellcheck="false" autocomplete="off"
+              placeholder="/workspace/dataset-exports">
+          </label>
+        </div>
+
+        <div class="action-row">
+          <button class="button button-primary" id="scan-button" type="button" disabled>
+            <span>扫描数据与标注</span><span aria-hidden="true">↗</span>
+          </button>
+          <p class="inline-status" id="scan-status" aria-live="polite">等待扫描</p>
+        </div>
+      </section>
+
+      <section class="panel datasets-panel is-locked" id="datasets-section" aria-labelledby="datasets-title">
+        <div class="section-heading">
+          <div>
+            <span class="step-label">STEP 02</span>
+            <h2 id="datasets-title">选择训练数据源</h2>
+          </div>
+          <div class="catalog-stats" id="catalog-stats" aria-live="polite">
+            <span>尚未扫描</span>
+          </div>
+        </div>
+
+        <div class="dataset-toolbar">
+          <label class="search-field">
+            <span class="sr-only">搜索数据集</span>
+            <span aria-hidden="true">⌕</span>
+            <input id="dataset-search" type="search" placeholder="按名称、family 或 training role 搜索">
+          </label>
+          <div class="segmented-actions" aria-label="批量选择数据集">
+            <button type="button" id="select-defaults">选择示例六源</button>
+            <button type="button" id="select-all">全选可用源</button>
+            <button type="button" id="clear-sources">清空</button>
+          </div>
+        </div>
+
+        <div class="source-legend" aria-hidden="true">
+          <span>数据集</span><span>样本数 / 标注状态</span><span>Stage 1</span><span>Stage 2</span>
+        </div>
+        <div class="source-list" id="source-list">
+          <div class="empty-state">
+            <span aria-hidden="true">⌁</span>
+            <p>连接目录后，数据集会出现在这里</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="rules-section is-locked" id="rules-section" aria-labelledby="rules-title">
+        <div class="section-heading section-heading-outside">
+          <div>
+            <span class="step-label">STEP 03</span>
+            <h2 id="rules-title">定义两阶段筛选规则</h2>
+          </div>
+          <p>每个阶段独立选择；“中等”默认同时进入两个阶段，因此会产生有意的重叠。</p>
+        </div>
+
+        <div class="stage-grid">
+          <article class="stage-card stage-one" data-stage="stage1">
+            <header>
+              <div>
+                <span class="stage-kicker">ALIGNMENT</span>
+                <h3>Stage 1</h3>
+              </div>
+              <span class="stage-source-count" id="stage1-source-count">0 个数据源</span>
+            </header>
+            <p class="stage-intro">优先使用更稳定、难度适中的样本完成特征对齐。</p>
+            <div class="rule-groups" id="stage1-rules"></div>
+          </article>
+
+          <article class="stage-card stage-two" data-stage="stage2">
+            <header>
+              <div>
+                <span class="stage-kicker">REASONING</span>
+                <h3>Stage 2</h3>
+              </div>
+              <span class="stage-source-count" id="stage2-source-count">0 个数据源</span>
+            </header>
+            <p class="stage-intro">保留中高难度样本，让语言模型学习时序推理与回答。</p>
+            <div class="rule-groups" id="stage2-rules"></div>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel preview-panel is-locked" id="preview-section" aria-labelledby="preview-title">
+        <div class="section-heading">
+          <div>
+            <span class="step-label">STEP 04</span>
+            <h2 id="preview-title">预览筛选结果</h2>
+          </div>
+          <button class="button button-dark" id="preview-button" type="button">
+            计算样本量 <span aria-hidden="true">→</span>
+          </button>
+        </div>
+
+        <div class="metric-grid" aria-live="polite">
+          <article class="metric-card metric-stage1">
+            <span>Stage 1 样本</span><strong id="metric-stage1">—</strong><small id="metric-stage1-detail">等待预览</small>
+          </article>
+          <article class="metric-card metric-stage2">
+            <span>Stage 2 样本</span><strong id="metric-stage2">—</strong><small id="metric-stage2-detail">等待预览</small>
+          </article>
+          <article class="metric-card metric-overlap">
+            <span>阶段重叠</span><strong id="metric-overlap">—</strong><small id="metric-overlap-detail">中等难度可同时出现</small>
+          </article>
+        </div>
+
+        <div class="preview-detail" id="preview-detail" hidden>
+          <div class="distribution-grid">
+            <article>
+              <div class="subheading"><h3>Stage 1 构成</h3><span id="stage1-dist-total"></span></div>
+              <div class="bar-list" id="stage1-distribution"></div>
+            </article>
+            <article>
+              <div class="subheading"><h3>Stage 2 构成</h3><span id="stage2-dist-total"></span></div>
+              <div class="bar-list" id="stage2-distribution"></div>
+            </article>
+          </div>
+
+          <div class="table-wrap">
+            <div class="subheading"><h3>按数据源拆分</h3><span>精确行数</span></div>
+            <table>
+              <thead><tr><th scope="col">数据源</th><th scope="col">源数据</th><th scope="col">Stage 1</th><th scope="col">Stage 2</th><th scope="col">重叠</th></tr></thead>
+              <tbody id="source-results"></tbody>
+            </table>
+          </div>
+        </div>
+        <p class="preview-message" id="preview-message" aria-live="polite">完成规则选择后，点击“计算样本量”。</p>
+      </section>
+
+      <section class="panel export-panel is-locked" id="export-section" aria-labelledby="export-title">
+        <div class="section-heading">
+          <div>
+            <span class="step-label">STEP 05</span>
+            <h2 id="export-title">保存训练数据</h2>
+          </div>
+          <p>导出在后台流式执行。页面和本地服务需要保持开启，源数据不会被改写。</p>
+        </div>
+
+        <div class="export-layout">
+          <div>
+            <label class="field run-name-field">
+              <span>运行名称 <b>必填</b></span>
+              <input id="run-name" type="text" spellcheck="false" autocomplete="off" placeholder="six-source-split-v1">
+              <small>只允许字母、数字、点、下划线和短横线；已存在的目录不会被覆盖。</small>
+            </label>
+            <button class="button button-export" id="export-button" type="button">
+              <span>开始导出</span><span aria-hidden="true">↗</span>
+            </button>
+          </div>
+
+          <div class="export-progress" id="export-progress">
+            <div class="progress-heading">
+              <span id="progress-phase">尚未开始</span><strong id="progress-percent">0%</strong>
+            </div>
+            <progress class="progress-track" aria-label="导出进度" max="100" value="0" id="progress-bar">0%</progress>
+            <p id="progress-detail" aria-live="polite">预览确认后即可导出。</p>
+          </div>
+        </div>
+
+        <div class="export-result" id="export-result" hidden>
+          <span class="result-check" aria-hidden="true">✓</span>
+          <div>
+            <strong>导出完成</strong>
+            <p id="result-summary"></p>
+            <dl id="result-paths"></dl>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>ChatTS Dataset Studio <span>·</span> 本地数据配方工具</p>
+      <p>源文件只读，导出结果包含 SHA256 与可复现 manifest。</p>
+    </footer>
+
+    <div class="toast-region" id="toast-region" aria-live="assertive" aria-atomic="true"></div>
+  </body>
+</html>
