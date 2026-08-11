@@ -229,6 +229,38 @@ def write_summary(
     return rows
 
 
+def write_wide_summary(
+    path: Path,
+    datasets: list[str],
+    quality: dict[str, Counter],
+    difficulty: dict[str, Counter],
+) -> None:
+    fields = ["dataset", "total"]
+    for prefix, levels in (
+        ("quality", QUALITY_LEVELS),
+        ("difficulty", DIFFICULTY_LEVELS),
+    ):
+        for level in levels:
+            fields.extend((f"{prefix}_{level}_count", f"{prefix}_{level}_percent"))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for dataset in datasets:
+            total = sum(quality[dataset].values())
+            row: dict[str, Any] = {"dataset": dataset, "total": total}
+            for prefix, levels, values in (
+                ("quality", QUALITY_LEVELS, quality[dataset]),
+                ("difficulty", DIFFICULTY_LEVELS, difficulty[dataset]),
+            ):
+                for level in levels:
+                    count = int(values[level])
+                    row[f"{prefix}_{level}_count"] = count
+                    row[f"{prefix}_{level}_percent"] = round(100.0 * count / total, 4)
+            writer.writerow(row)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="为每个数据集分别绘制质量分布图和难度分布图"
@@ -321,8 +353,16 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
+        long_summary_path = output_dir / "dataset_distribution_summary.csv"
+        wide_summary_path = output_dir / "dataset_distribution_wide.csv"
         summary_rows = write_summary(
-            output_dir / "dataset_distribution_summary.csv",
+            long_summary_path,
+            datasets,
+            quality,
+            difficulty,
+        )
+        write_wide_summary(
+            wide_summary_path,
             datasets,
             quality,
             difficulty,
@@ -332,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
             "input": str(input_path),
             "dataset_count": len(datasets),
             "datasets": summary_rows,
+            "summary_csv": str(long_summary_path),
+            "wide_summary_csv": str(wide_summary_path),
             "outputs": outputs,
         }
         (output_dir / "manifest.json").write_text(

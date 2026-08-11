@@ -194,9 +194,13 @@ merged_labels/reports/dataset_plots/
 └── ...
 ```
 
-每张图展示 5 个等级的样本数，并在柱顶标出数量和百分比。目录下同时生成
-`dataset_distribution_summary.csv` 和 `manifest.json`，用于核对绘图数字。只画一个或几个数据集
-时可重复传入 `--dataset`：
+每张图展示 5 个等级的样本数，并在柱顶标出数量和百分比。目录下同时生成：
+
+- `dataset_distribution_summary.csv`：长表，每个数据集的每个等级一行；
+- `dataset_distribution_wide.csv`：宽表，每个数据集一行，包含质量和难度各等级的数量与百分比；
+- `manifest.json`：机器可读清单和完整分布。
+
+只画一个或几个数据集时可重复传入 `--dataset`：
 
 ```bash
 python plot_dataset_distributions.py \
