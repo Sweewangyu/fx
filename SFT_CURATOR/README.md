@@ -167,3 +167,39 @@ python merge_tsqa_annotations.py --config merge_config.yaml
 其 `ability_label` 为 `null`，报表中归到 `UNMAPPED`；因此报表同时给出总 QA 数与“15 维有效
 覆盖率”。为方便直接分组，每条记录还包含必有值的 `ability_bucket`：正常样本等于
 `ability_label`，超出范围的样本为 `UNMAPPED`。
+
+## 绘制每个数据集的质量和难度分布
+
+合并完成后，[`plot_dataset_distributions.py`](plot_dataset_distributions.py) 直接读取已经聚合
+好的 `source_ability_quality_difficulty.csv`，不重新扫描原始时间序列。安装绘图库并运行：
+
+```bash
+python -m pip install matplotlib
+
+python plot_dataset_distributions.py \
+  --input merged_labels/reports/source_ability_quality_difficulty.csv \
+  --output-dir merged_labels/reports/dataset_plots
+```
+
+每个数据集单独生成两张 PNG：
+
+```text
+merged_labels/reports/dataset_plots/
+├── time_r1/
+│   ├── quality_distribution.png
+│   └── difficulty_distribution.png
+├── opentslm_tsqa/
+│   ├── quality_distribution.png
+│   └── difficulty_distribution.png
+└── ...
+```
+
+每张图展示 5 个等级的样本数，并在柱顶标出数量和百分比。目录下同时生成
+`dataset_distribution_summary.csv` 和 `manifest.json`，用于核对绘图数字。只画一个或几个数据集
+时可重复传入 `--dataset`：
+
+```bash
+python plot_dataset_distributions.py \
+  --dataset time_r1 \
+  --dataset opentslm_tsqa
+```
