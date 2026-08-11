@@ -12,6 +12,7 @@ import yaml
 from .catalog import CatalogCache
 from .exporter import export_selection, parse_rules, preview_selection
 from .models import StudioError
+from .registry_builder import build_registry
 from .server import serve
 
 
@@ -88,12 +89,31 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("-c", "--config", required=True, type=Path)
         if name == "catalog":
             _path_arguments(command)
+    registry_parser = subparsers.add_parser(
+        "build-registry",
+        help="Create sources.json from every merged_labels/annotated/*.jsonl file",
+    )
+    registry_parser.add_argument("--merged-labels-root", required=True, type=Path)
+    registry_parser.add_argument("--output", required=True, type=Path)
+    registry_parser.add_argument("--data-root", type=Path)
+    registry_parser.add_argument("--metadata-registry", type=Path)
+    registry_parser.add_argument("--force", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "build-registry":
+            result = build_registry(
+                args.merged_labels_root,
+                args.output,
+                data_root=args.data_root,
+                metadata_registry=args.metadata_registry,
+                force=args.force,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         config = _apply_path_args(_load_config(args.config), args)
         if args.command == "serve":
             host = args.host or config.pop("host", "127.0.0.1")

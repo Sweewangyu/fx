@@ -52,6 +52,29 @@ cd /workspace/ChatTS-Dataset-Studio
 PYTHONPATH=src python3 -m chatts_dataset_studio serve -c configs/server.yaml
 ```
 
+如果希望把 `merged_labels/annotated/` 下的全部数据集加入页面，不需要手写
+`sources.json`。下面的命令会扫描所有 `.jsonl`、校验首行 QA 格式，并生成完整注册表：
+
+```bash
+chatts-dataset-studio build-registry \
+  --merged-labels-root /share/airesearch/data/finiverse/traindata/merged_labels \
+  --data-root /share/airesearch/data/finiverse/traindata \
+  --output /share/airesearch/data/finiverse/traindata/sources.json
+```
+
+若仍保留 datataste 原始 `sources.json`，可用它补回 family、split 和 training role：
+
+```bash
+chatts-dataset-studio build-registry \
+  --merged-labels-root /share/airesearch/data/finiverse/traindata/merged_labels \
+  --data-root /share/airesearch/data/finiverse/traindata \
+  --metadata-registry /workspace/datataste/data/versions/datav2/sources.json \
+  --output /share/airesearch/data/finiverse/traindata/sources.json \
+  --force
+```
+
+`--force` 仅用于明确替换已有注册表；生成器不会修改任何 QA 或标注文件。
+
 服务器建议只监听 `127.0.0.1`。从本机建立隧道后访问 `http://127.0.0.1:7865`：
 
 ```bash
