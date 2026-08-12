@@ -162,7 +162,7 @@
             <label class="field readonly-field"><span>训练方案</span><select id="train-profile" disabled aria-disabled="true"><option value="chronos2-full">Chronos-2 两阶段</option></select></label>
             <label class="field"><span>随机种子</span><input id="train-seed" type="number" min="0" step="1" value="42"></label>
             <label class="field"><span>GPU</span><input id="deepspeed-include" type="text" value="localhost:0,1,2,3,4,5,6,7" spellcheck="false"></label>
-            <label class="field field-span-3"><span>基础模型地址</span><input id="base-model-path" type="text" spellcheck="false" autocomplete="off" placeholder="/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B"></label>
+            <label class="field field-span-3"><span>基础模型地址</span><input id="base-model-path" type="text" spellcheck="false" autocomplete="off" placeholder="/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B"><small class="field-help" id="base-model-sync-hint">识别末尾参数量后，会同步更新模型输出目录。</small></label>
             <label class="field field-span-3 readonly-field"><span>模型输出根目录（自动追加版本）</span><input id="train-output-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
           </div>
           <div class="path-preview"><span>最终输出</span><code id="final-model-preview">—</code></div>
@@ -228,7 +228,7 @@
         <div class="page-heading"><div><p class="eyebrow">Benchmark</p><h1>评测参数</h1></div><span class="status-chip" id="evaluation-version">未选择版本</span></div>
         <section class="launch-guide" aria-labelledby="launch-guide-title">
           <div class="launch-guide-heading">
-            <div><h2 id="launch-guide-title">启动流程</h2><p>训练与评测按同一数据版本连续执行。</p></div>
+            <div><h2 id="launch-guide-title">启动流程</h2><p>训练与评测按同一数据版本连续执行。</p><p class="execution-topology" id="execution-topology">宿主机控制面 → 训练容器 → 评测容器</p></div>
             <span class="status-chip" id="integration-state">检查中</span>
           </div>
           <ol class="launch-steps">
@@ -310,6 +310,11 @@
       <div class="job-progress"><span id="job-phase">—</span><strong id="job-percent">—</strong></div>
       <progress id="job-progress" max="100" value="0">0%</progress>
       <pre id="job-log" tabindex="0">等待日志</pre>
+      <section class="job-diff" id="job-diff" hidden>
+        <h3>与上一次训练的不同</h3>
+        <p id="job-diff-summary"></p>
+        <div class="job-diff-list" id="job-diff-list"></div>
+      </section>
       <div class="artifact-list" id="job-artifacts"></div>
     </dialog>
 

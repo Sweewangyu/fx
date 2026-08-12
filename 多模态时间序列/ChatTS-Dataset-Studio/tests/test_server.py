@@ -8,6 +8,8 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import pytest
+
 from chatts_dataset_studio.catalog import CatalogCache
 from chatts_dataset_studio.exporter import export_selection
 from chatts_dataset_studio.server import StudioHTTPServer, StudioService
@@ -60,8 +62,11 @@ def _versioned_orphan(
 
 
 def test_real_http_api_catalog_preview_and_background_export(
-    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+    labeled_corpus: dict[str, Any],
+    default_selection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("chatts_dataset_studio.pipeline.shutil.which", lambda _: "/bin/docker")
     defaults = {
         "registry_path": str(labeled_corpus["registry_path"]),
         "annotations_root": str(labeled_corpus["annotations_root"]),
@@ -262,8 +267,11 @@ def test_publish_preserves_tampered_orphan_and_refuses_adoption(
 
 
 def test_version_publish_register_activate_and_pipeline_preflight_api(
-    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+    labeled_corpus: dict[str, Any],
+    default_selection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("chatts_dataset_studio.pipeline.shutil.which", lambda _: "/bin/docker")
     training_root = labeled_corpus["tmp_path"] / "ChatTS-Training"
     (training_root / "data").mkdir(parents=True)
     evaluation_root = labeled_corpus["tmp_path"] / "ChatTS"

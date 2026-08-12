@@ -551,6 +551,10 @@ tinyBenchmarks 在这个总控流程中只评测 Stage2 最佳模型，不加载
 
 ## 宿主机一键训练再评测
 
+该入口必须由 Docker 宿主机执行。Dataset Studio 作为轻量控制面运行在宿主机，再通过
+`docker exec` 顺序调用 `chatts` 和 `ragas`；不要从训练容器内运行，也不要为此向训练容器
+挂载 Docker Socket。
+
 训练文件需要复制到 `chatts` 容器挂载的 ChatTS-Training 项目：
 
 ```bash

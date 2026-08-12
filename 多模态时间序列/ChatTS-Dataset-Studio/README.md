@@ -17,7 +17,9 @@ ChatTS 的本地数据版本、两阶段训练和四套评测控制台。它不 
 
 ## 服务器目录
 
-一键训练评测需要三个同级项目；评测入口实际位于 `ChatTS`：
+一键训练评测推荐采用“宿主机控制面 + 两个计算容器”。Dataset Studio 很轻，放在
+Docker 宿主机运行；它通过 `docker exec` 调度 `chatts` 训练容器和 `ragas` 评测容器，
+训练、评测环境仍然完全隔离：
 
 ```text
 <workspace>/
@@ -29,6 +31,10 @@ ChatTS 的本地数据版本、两阶段训练和四套评测控制台。它不 
 如果只有前两个目录，可以完成 source 扫描、数据版本发布、训练注册和配置预览，但无法运行
 现有四套评测。`ChatTS/scripts/run_train_then_eval.sh` 还要求训练容器 `chatts`、评测容器
 `ragas` 正在运行，并能看到相同的 `/share/...` 数据、模型与输出目录。
+
+不要在训练容器里启动控制面：容器里通常没有 Docker CLI，也不应该为了该功能把
+`/var/run/docker.sock` 挂入训练容器，因为这相当于授予宿主机级控制权限。把三个代码目录放在
+宿主机的同一 workspace 即可；代码和数据仍可通过原有 volume 挂载给两个计算容器。
 
 ## 你的 traindata 路径
 
@@ -56,7 +62,16 @@ cp configs/server.example.yaml configs/server.yaml
 chatts-dataset-studio serve -c configs/server.yaml
 ```
 
-不安装包也可以：
+不安装包也可以。推荐直接在 Docker 宿主机运行启动脚本，它会先检查 Docker CLI、daemon 和
+配置文件：
+
+```bash
+cp configs/server.example.yaml configs/server.yaml
+# 将 integration.training_root、evaluation_root、pipeline_script 改成宿主机绝对路径
+bash scripts/start_host_control_plane.sh configs/server.yaml
+```
+
+等价的手动命令：
 
 ```bash
 PYTHONPATH=src python3 -m chatts_dataset_studio serve -c configs/server.yaml
@@ -154,6 +169,26 @@ CONFIG_FILE=<studio-generated.yaml> bash ../ChatTS/scripts/run_train_then_eval.s
 `/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B`。`server.yaml` 中的
 `integration.base_model_path` 只是页面默认值，不再锁定用户输入。
 
+当模型目录名含 `8B`、`4B`、`1.7B` 等参数量时，页面和服务端会同步替换
+`model_output_base` 与 `model_name_base` 中最后一个参数量标记。例如把基础模型从
+`ChatTS-Qwen3-8B` 改成 `ChatTS-Qwen3-4B`，会将输出从
+`ChatTS-msxf-8B-datav3` 自动改为 `ChatTS-msxf-4B-datav3`；数据版本和 seed 规则保持不变。
+
+每次真正启动训练（Preflight 不计）前，Studio 都会先在
+`<state_root>/pipeline/run-records/<job_id>/` 写入运行档案：
+
+```text
+training_eval_config.resolved.yaml  # 本次完整训练/评测参数
+training_data.json                  # 数据版本、快照 SHA256、dataset keys 和 manifest
+diff_from_previous.json             # 与上一次训练的机器可读差异
+diff_from_previous.md               # 与上一次训练的易读差异表
+comparison.json                     # 供下一次训练比较的规范化配置
+run_record.json                     # 本次运行档案索引
+```
+
+这些文件在训练进程启动前落盘，并显示在任务详情的“产物”中。第一次训练会明确记录“无上次
+训练”；第二次起会同时比较数据快照、基础模型、输出目录、Stage1/Stage2 参数以及评测协议。
+
 如果评测页显示“一键启动暂不可用”，表示 Studio 宿主机侧没有找到完整的
 `integration` 配置，页面会直接列出具体原因。最常见的是启动时没有传
 `-c configs/server.yaml`，或 `pipeline_script` 不是宿主机上真实存在的
@@ -167,6 +202,10 @@ integration:
 ```
 
 修改 YAML 后需要重启 Studio；先点“预检”，通过后再点“训练 + 评测”。
+
+如果日志出现 `Docker CLI is unavailable`，说明 Dataset Studio 仍运行在计算容器里。退出该
+Studio 进程，在 Docker 宿主机执行 `scripts/start_host_control_plane.sh`。训练不需要搬出
+`chatts`，评测也不需要搬出 `ragas`。
 
 ## 兼容 CLI
 

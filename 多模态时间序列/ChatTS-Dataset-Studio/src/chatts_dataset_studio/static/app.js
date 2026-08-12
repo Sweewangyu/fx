@@ -9,6 +9,7 @@ const state = {
   nextVersion: null,
   activeVersion: null,
   pipelineEnabled: false,
+  modelOutputBaseTemplate: "",
   jobs: [],
   activeJobId: null,
   busy: new Set(),
@@ -831,6 +832,31 @@ function renderJobDialog(job) {
   $("#job-progress").value = Math.max(0, Math.min(100, percent));
   const log = Array.isArray(job.log_tail) ? job.log_tail.join("\n") : (job.log_tail || job.log || job.error || "等待日志");
   $("#job-log").textContent = log;
+  const diff = job.diff_from_previous;
+  const diffPanel = $("#job-diff");
+  const diffList = $("#job-diff-list");
+  diffList.replaceChildren();
+  diffPanel.hidden = !diff || job.kind !== "train_eval";
+  if (diff && job.kind === "train_eval") {
+    if (!diff.has_previous_run) {
+      $("#job-diff-summary").textContent = "这是第一条训练记录，没有可比较的上一次训练。";
+    } else if (!diff.change_count) {
+      $("#job-diff-summary").textContent = `与上一次训练 ${diff.previous_job_id} 的数据和参数完全一致。`;
+    } else {
+      const displaySuffix = diff.truncated ? `（页面显示前 ${diff.displayed_change_count} 项，完整差异见产物）` : "";
+      $("#job-diff-summary").textContent = `相对训练 ${diff.previous_job_id}，共有 ${diff.change_count} 项变化。${displaySuffix}`;
+      for (const change of diff.changes || []) {
+        const row = element("div", "job-diff-row");
+        row.append(
+          element("strong", "", change.path),
+          element("code", "", JSON.stringify(change.before)),
+          element("span", "", "→"),
+          element("code", "", JSON.stringify(change.after)),
+        );
+        diffList.append(row);
+      }
+    }
+  }
   const artifacts = $("#job-artifacts");
   artifacts.replaceChildren();
   const values = job.artifacts || job.result?.artifacts || job.result || {};
@@ -875,6 +901,33 @@ function updateDerivedPaths() {
   const cleanRoot = root.replace(/\/$/, "").replace(/(?:[-_]?data-?v\d+)$/i, "");
   $("#final-model-preview").textContent = cleanRoot && version ? `${cleanRoot}-${version}/best_seed${seed}` : "由服务端按版本生成";
   $("#suite-count").textContent = `${$$("#benchmark-suites input:checked").length} 项`;
+}
+
+function modelScaleFromPath(path) {
+  const name = path.split("/").filter(Boolean).at(-1) || "";
+  const matches = [...name.matchAll(/(^|[^A-Za-z0-9])(\d+(?:\.\d+)?)\s*([BM])(?=$|[^A-Za-z0-9])/gi)];
+  if (!matches.length) return null;
+  const match = matches.at(-1);
+  return `${match[2]}${match[3].toUpperCase()}`;
+}
+
+function withModelScale(template, scale) {
+  if (!template || !scale) return template;
+  const matches = [...template.matchAll(/(^|[^A-Za-z0-9])(\d+(?:\.\d+)?)\s*([BM])(?=$|[^A-Za-z0-9])/gi)];
+  if (!matches.length) return template;
+  const match = matches.at(-1);
+  const tokenStart = match.index + match[1].length;
+  const tokenEnd = match.index + match[0].length;
+  return `${template.slice(0, tokenStart)}${scale}${template.slice(tokenEnd)}`;
+}
+
+function syncModelOutputScale() {
+  const scale = modelScaleFromPath($("#base-model-path").value.trim());
+  $("#train-output-root").value = withModelScale(state.modelOutputBaseTemplate, scale);
+  $("#base-model-sync-hint").textContent = scale
+    ? `已识别 ${scale}，模型输出目录已同步。`
+    : "未识别到 8B / 4B / 1.7B 形式的参数量，将保留服务端输出目录模板。";
+  updateDerivedPaths();
 }
 
 function integrationMissingItems(pipeline, integration) {
@@ -922,6 +975,11 @@ function renderIntegrationStatus(pipeline, integration) {
   list.replaceChildren();
   const items = missing.length ? missing : ["integration.pipeline_script（路径未配置或文件不存在）"];
   for (const item of items) list.append(element("li", "", item));
+  const trainingContainer = integration.training_container || "chatts";
+  const evaluationContainer = integration.evaluation_container || "ragas";
+  $("#execution-topology").textContent = integration.execution_mode === "docker_host"
+    ? `宿主机 Dataset Studio → ${trainingContainer}（训练）→ ${evaluationContainer}（评测）`
+    : `执行模式：${integration.execution_mode || "未配置"}`;
   renderLaunchSteps();
 }
 
@@ -934,7 +992,8 @@ function applyDefaults(defaults) {
   state.pipelineEnabled = Boolean(integration.enabled);
   $("#training-root").value = integration.training_root || defaults.training_root || "由服务端配置";
   $("#base-model-path").value = training.base_model_path || defaults.base_model_path || "";
-  $("#train-output-root").value = training.output_root || defaults.train_output_root || "";
+  state.modelOutputBaseTemplate = training.output_root || defaults.train_output_root || "";
+  $("#train-output-root").value = state.modelOutputBaseTemplate;
   $("#train-profile").value = training.profile || "chronos2-full";
   $("#train-seed").value = training.seed ?? 42;
   $("#deepspeed-include").value = training.deepspeed_include || "localhost:0,1,2,3,4,5,6,7";
@@ -1036,6 +1095,7 @@ function bindEvents() {
   $("#version-name").addEventListener("input", updateDerivedPaths);
   $("#train-seed").addEventListener("input", updateDerivedPaths);
   $("#base-model-path").addEventListener("input", () => {
+    syncModelOutputScale();
     const pipeline = state.defaults?.pipeline || {};
     renderIntegrationStatus(pipeline, pipeline.integration || state.defaults?.integration || {});
     renderActionState();

@@ -207,7 +207,12 @@ if not math.isfinite(value) or not 0.0 < value <= 1.0:
     raise SystemExit("TINY_GPU_MEMORY_UTILIZATION must be in (0, 1].")
 PY
 
-command -v docker >/dev/null 2>&1 || { echo "docker command not found on the host." >&2; exit 1; }
+command -v docker >/dev/null 2>&1 || {
+    echo "Docker CLI is unavailable to the ChatTS control plane." >&2
+    echo "Run Dataset Studio and this pipeline on the Docker host; training and evaluation remain in their existing containers." >&2
+    echo "Do not install Docker or mount the Docker Socket into the training container just to run this pipeline." >&2
+    exit 1
+}
 
 require_running_container() {
     local container="$1"

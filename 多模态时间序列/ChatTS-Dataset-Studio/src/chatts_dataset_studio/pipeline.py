@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -404,6 +405,33 @@ def _versioned_name(base: str, version: str) -> str:
     return f"{clean}-{version}"
 
 
+_MODEL_SCALE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*([BM])(?=$|[^A-Za-z0-9])"
+)
+
+
+def _model_scale(base_model_path: str) -> str | None:
+    """Return the final 8B/4B/1.7B-style scale in a model directory name."""
+
+    matches = list(_MODEL_SCALE_RE.finditer(PurePosixPath(base_model_path).name))
+    if not matches:
+        return None
+    match = matches[-1]
+    return f"{match.group(1)}{match.group(2).upper()}"
+
+
+def _with_model_scale(template: str, scale: str | None) -> str:
+    """Replace the final model-scale token in a configured output template."""
+
+    if scale is None:
+        return template
+    matches = list(_MODEL_SCALE_RE.finditer(template))
+    if not matches:
+        return template
+    match = matches[-1]
+    return f"{template[:match.start()]}{scale}{template[match.end():]}"
+
+
 def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) -> dict[str, Any]:
     _reject_unknown(request, _EVALUATION_KEYS, "evaluation")
     values = {**EVALUATION_DEFAULTS, **request}
@@ -532,6 +560,16 @@ def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) ->
 def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
     """Return safe UI defaults without exposing host-side executable paths."""
     disabled_reasons: list[str] = []
+    execution_mode = integration.get("execution_mode", "docker_host")
+    if execution_mode != "docker_host":
+        disabled_reasons.append(
+            f"integration.execution_mode must be docker_host, got: {execution_mode}"
+        )
+    elif shutil.which("docker") is None:
+        disabled_reasons.append(
+            "Docker CLI is unavailable to Dataset Studio; run the Studio control plane "
+            "on the Docker host, not inside the training/evaluation container"
+        )
     for key in ("pipeline_script", "training_root", "evaluation_root"):
         value = integration.get(key)
         if not isinstance(value, str) or not value:
@@ -567,11 +605,21 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, str) or not value:
             disabled_reasons.append(f"integration.{key} is not configured")
     enabled = not disabled_reasons
+    default_base_model = integration.get("base_model_path")
+    default_scale = (
+        _model_scale(default_base_model) if isinstance(default_base_model, str) else None
+    )
+    configured_model_output = integration.get("model_output_base")
+    default_model_output = (
+        _with_model_scale(configured_model_output, default_scale)
+        if isinstance(configured_model_output, str)
+        else configured_model_output
+    )
     return {
         "training": {
             "profile": "chronos2-full",
-            "base_model_path": integration.get("base_model_path"),
-            "output_root": integration.get("model_output_base"),
+            "base_model_path": default_base_model,
+            "output_root": default_model_output,
             "seed": 42,
             "force_train": False,
             "keep_stage1": False,
@@ -594,6 +642,7 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
         "integration": {
             "enabled": enabled,
             "disabled_reasons": disabled_reasons,
+            "execution_mode": execution_mode,
             "training_root": integration.get("training_root"),
             "evaluation_root": integration.get("evaluation_root"),
             "training_container": integration.get("training_container", "chatts"),
@@ -648,9 +697,11 @@ def resolve_pipeline_request(
         training_request.get("base_model_path", integration.get("base_model_path")),
         "training.base_model_path",
     )
+    model_scale = _model_scale(base_model_path)
     model_output_base = integration.get("model_output_base")
     if not isinstance(model_output_base, str) or not model_output_base:
         raise StudioError("Missing server integration setting: model_output_base")
+    model_output_base = _with_model_scale(model_output_base, model_scale)
     train_output_root = _versioned_name(model_output_base, version)
     supplied_output = training_request.get("output_root")
     if supplied_output not in (None, "", train_output_root):
@@ -675,6 +726,7 @@ def resolve_pipeline_request(
     model_name_base = integration.get("model_name_base", "chatts-msxf-8B")
     if not isinstance(model_name_base, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", model_name_base):
         raise StudioError("model_name_base must be a safe slug")
+    model_name_base = _with_model_scale(model_name_base, model_scale)
     model_name = f"{_versioned_name(model_name_base, version)}-seed{seed}"
     eval_output_base = integration.get("evaluation_output_base")
     if not isinstance(eval_output_base, str) or not eval_output_base:
@@ -738,6 +790,7 @@ def resolve_pipeline_request(
         "schema_version": "chatts-dataset-studio-pipeline-v1",
         "version": version,
         "dataset_snapshot_hash": snapshot_hash,
+        "dataset_names": dataset_names,
         "config": config,
         "derived": {
             "train_output_root": train_output_root,
@@ -745,6 +798,7 @@ def resolve_pipeline_request(
             "model_name": model_name,
             "evaluation_output_root": eval_output_root,
             "run_id": run_id,
+            "model_scale": model_scale,
         },
     }
     result["config_hash"] = _hash(config)
@@ -759,6 +813,7 @@ class PipelineJobs:
         self.jobs_root = self.state_root / "jobs"
         self.config_root = self.state_root / "configs"
         self.logs_root = self.state_root / "logs"
+        self.run_records_root = self.state_root / "run-records"
         self.status_root = self.state_root / "worker-status"
         self.run_lock_path = self.state_root / ".pipeline-run.lock"
         self.pipeline_script = (
@@ -918,6 +973,178 @@ class PipelineJobs:
             else:
                 self._mark_interrupted(job_id)
 
+    @staticmethod
+    def _diff_values(before: Any, after: Any, path: str = "") -> list[dict[str, Any]]:
+        if isinstance(before, dict) and isinstance(after, dict):
+            changes: list[dict[str, Any]] = []
+            for key in sorted(set(before) | set(after)):
+                child = f"{path}.{key}" if path else key
+                if key not in before:
+                    changes.append({"path": child, "before": None, "after": after[key]})
+                elif key not in after:
+                    changes.append({"path": child, "before": before[key], "after": None})
+                else:
+                    changes.extend(PipelineJobs._diff_values(before[key], after[key], child))
+            return changes
+        if before != after:
+            return [{"path": path, "before": before, "after": after}]
+        return []
+
+    @staticmethod
+    def _comparison_config(config: dict[str, Any]) -> dict[str, Any]:
+        comparable = json.loads(json.dumps(config))
+        pipeline = comparable.get("pipeline")
+        if isinstance(pipeline, dict):
+            for key in ("trial_id", "trial_config_hash", "preflight_only"):
+                pipeline.pop(key, None)
+        return comparable
+
+    @staticmethod
+    def _read_mapping(path: Path) -> dict[str, Any] | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _previous_training_comparison(self) -> tuple[str | None, dict[str, Any] | None]:
+        for job in self.list():
+            if job.get("kind") != "train_eval":
+                continue
+            comparison_path = job.get("comparison_path")
+            if isinstance(comparison_path, str):
+                comparison = self._read_mapping(Path(comparison_path))
+                if comparison is not None:
+                    return str(job.get("job_id")), comparison
+            config_path = job.get("config_path")
+            if not isinstance(config_path, str) or not Path(config_path).is_file():
+                continue
+            try:
+                previous_config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                continue
+            if not isinstance(previous_config, dict):
+                continue
+            return str(job.get("job_id")), {
+                "data": {
+                    "version": job.get("version"),
+                    "dataset_snapshot_hash": job.get("dataset_snapshot_hash"),
+                    "snapshot_dir": previous_config.get("training", {}).get("dataset_dir"),
+                },
+                "config": self._comparison_config(previous_config),
+            }
+        return None, None
+
+    def _write_run_record(
+        self,
+        job_id: str,
+        resolved: dict[str, Any],
+        config: dict[str, Any],
+        config_path: Path,
+    ) -> dict[str, Any]:
+        record_root = self.run_records_root / job_id
+        record_root.mkdir(parents=True, exist_ok=False)
+        exported_config = record_root / "training_eval_config.resolved.yaml"
+        exported_config.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+        snapshot_dir = Path(str(config["training"]["dataset_dir"]))
+        snapshot_manifest_path = snapshot_dir / "manifest.json"
+        snapshot_manifest = self._read_mapping(snapshot_manifest_path)
+        data_export = {
+            "schema_version": "chatts-dataset-studio-training-data-v1",
+            "exported_at": _utc_now(),
+            "version": resolved["version"],
+            "dataset_snapshot_hash": resolved["dataset_snapshot_hash"],
+            "snapshot_dir": str(snapshot_dir),
+            "snapshot_manifest_path": str(snapshot_manifest_path),
+            "dataset_names": resolved.get("dataset_names", {}),
+            "snapshot_manifest": snapshot_manifest,
+        }
+        data_path = record_root / "training_data.json"
+        data_path.write_text(
+            json.dumps(data_export, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+
+        comparison = {
+            "data": {key: value for key, value in data_export.items() if key != "exported_at"},
+            "config": self._comparison_config(config),
+        }
+        comparison_path = record_root / "comparison.json"
+        comparison_path.write_text(
+            json.dumps(comparison, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        previous_job_id, previous = self._previous_training_comparison()
+        changes = self._diff_values(previous, comparison) if previous is not None else []
+        diff_export = {
+            "schema_version": "chatts-dataset-studio-run-diff-v1",
+            "current_job_id": job_id,
+            "previous_job_id": previous_job_id,
+            "has_previous_run": previous is not None,
+            "change_count": len(changes),
+            "changes": changes,
+        }
+        diff_json_path = record_root / "diff_from_previous.json"
+        diff_json_path.write_text(
+            json.dumps(diff_export, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        diff_md_path = record_root / "diff_from_previous.md"
+        lines = ["# 与上一次训练的差异", ""]
+        if previous is None:
+            lines.append("这是第一条训练记录，没有可比较的上一次训练。")
+        elif not changes:
+            lines.append(f"与上一次训练 `{previous_job_id}` 的数据和参数完全一致。")
+        else:
+            lines.extend(
+                [
+                    f"上一次训练：`{previous_job_id}`",
+                    "",
+                    f"共 {len(changes)} 项变化。",
+                    "",
+                    "| 配置项 | 上一次 | 本次 |",
+                    "| --- | --- | --- |",
+                ]
+            )
+            for change in changes:
+                before = json.dumps(change["before"], ensure_ascii=False, sort_keys=True)
+                after = json.dumps(change["after"], ensure_ascii=False, sort_keys=True)
+                lines.append(
+                    f"| `{change['path']}` | `{before.replace('|', '&#124;')}` | "
+                    f"`{after.replace('|', '&#124;')}` |"
+                )
+        diff_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        record = {
+            "schema_version": "chatts-dataset-studio-run-record-v1",
+            "job_id": job_id,
+            "created_at": _utc_now(),
+            "version": resolved["version"],
+            "dataset_snapshot_hash": resolved["dataset_snapshot_hash"],
+            "config_hash": config["pipeline"]["trial_config_hash"],
+            "previous_job_id": previous_job_id,
+            "artifacts": {
+                "训练参数配置": str(exported_config),
+                "训练数据清单": str(data_path),
+                "与上次差异 JSON": str(diff_json_path),
+                "与上次差异报告": str(diff_md_path),
+                "不可变数据快照": str(snapshot_dir),
+            },
+        }
+        record_path = record_root / "run_record.json"
+        record_path.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        return {
+            **record["artifacts"],
+            "运行档案": str(record_path),
+            "comparison": str(comparison_path),
+            "diff_summary": {
+                **{key: value for key, value in diff_export.items() if key != "changes"},
+                "changes": changes[:100],
+                "displayed_change_count": min(len(changes), 100),
+                "truncated": len(changes) > 100,
+            },
+        }
+
     def start(self, resolved: dict[str, Any], *, preflight: bool = False) -> dict[str, Any]:
         if self.pipeline_script is None or not self.pipeline_script.is_file():
             raise StudioError(
@@ -944,6 +1171,13 @@ class PipelineJobs:
             config_path.write_text(
                 yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
             )
+            artifacts = {"训练参数配置": str(config_path)}
+            comparison_path = None
+            diff_summary = None
+            if not preflight:
+                artifacts = self._write_run_record(job_id, resolved, config, config_path)
+                comparison_path = artifacts.pop("comparison")
+                diff_summary = artifacts.pop("diff_summary")
             job = {
                 "schema_version": "chatts-dataset-studio-job-v1",
                 "job_id": job_id,
@@ -954,8 +1188,11 @@ class PipelineJobs:
                 "dataset_snapshot_hash": resolved["dataset_snapshot_hash"],
                 "config_hash": effective_config_hash,
                 "config_path": str(config_path),
+                "comparison_path": comparison_path,
+                "diff_from_previous": diff_summary,
                 "log_path": str(log_path),
                 "derived": resolved["derived"],
+                "artifacts": artifacts,
             }
             self._write(job)
             status_path = self._status_path(job_id)

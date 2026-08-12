@@ -32,6 +32,9 @@ selection:
 
 # 浏览器不能覆盖以下脚本和运行路径。相对 host 路径以本 YAML 所在目录为基准。
 integration:
+  # 推荐拓扑：Dataset Studio 在 Docker 宿主机运行，通过 docker exec 顺序调用
+  # chatts 训练容器和 ragas 评测容器。不要把 Docker Socket 挂进训练容器。
+  execution_mode: docker_host
   training_root: ../../ChatTS-Training
   evaluation_root: ../../ChatTS
   pipeline_script: ../../ChatTS/scripts/run_train_then_eval.sh
