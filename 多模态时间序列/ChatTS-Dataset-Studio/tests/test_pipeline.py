@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -349,6 +350,232 @@ def test_pipeline_job_persists_resolved_yaml_and_log(tmp_path: Path) -> None:
     ).hexdigest()
     assert job["config_hash"] == expected_hash
     assert saved_config["pipeline"]["trial_config_hash"] == expected_hash
+
+
+def test_pipeline_jobs_queue_fifo_freezes_configs_and_continues_after_failure(
+    tmp_path: Path,
+) -> None:
+    integration = _integration(tmp_path)
+    script = Path(str(integration["pipeline_script"]))
+    script.parent.mkdir(parents=True)
+    run_state = tmp_path / "fake-pipeline"
+    run_state.mkdir()
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        f"RUN_STATE={shlex.quote(str(run_state))}\n"
+        "printf '%s\\n' \"$(basename \"$CONFIG_FILE\" .yaml)\" >> \"$RUN_STATE/order.txt\"\n"
+        "if mkdir \"$RUN_STATE/first.once\" 2>/dev/null; then\n"
+        "  touch \"$RUN_STATE/first-started\"\n"
+        "  while [[ ! -f \"$RUN_STATE/release-first\" ]]; do sleep 0.02; done\n"
+        "  exit 9\n"
+        "fi\n"
+        "sleep 0.05\n",
+        encoding="utf-8",
+    )
+    jobs = PipelineJobs(tmp_path / "state", script)
+    version3 = _version(tmp_path)
+    version4 = json.loads(json.dumps(version3))
+    version4.update(
+        {
+            "version": "datav4",
+            "snapshot_dir": str(tmp_path / "versions" / "datav4"),
+            "dataset_snapshot_hash": "b" * 64,
+        }
+    )
+
+    first = jobs.start(resolve_pipeline_request({}, version3, integration))
+    deadline = time.monotonic() + 5
+    while not (run_state / "first-started").is_file():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    second_resolved = resolve_pipeline_request(
+        {"training": {"stage2": {"learning_rate": "2e-5"}}},
+        version4,
+        integration,
+    )
+    second = jobs.start(second_resolved)
+    second_config = Path(second["config_path"])
+    second_config_before = second_config.read_bytes()
+    # Mutating the caller's object after submission must not change the queued
+    # experiment; the resolved YAML is the queue's immutable execution input.
+    second_resolved["config"]["training"]["stage2"]["learning_rate"] = "9e-5"
+    third = jobs.start(
+        resolve_pipeline_request(
+            {"training": {"stage2": {"warmup_ratio": 0.05}}},
+            version4,
+            integration,
+        )
+    )
+
+    assert jobs.get(first["job_id"], include_log=False)["status"] == "running"
+    assert jobs.get(second["job_id"], include_log=False)["queue_position"] == 1
+    assert jobs.get(third["job_id"], include_log=False)["queue_position"] == 2
+    assert second_config.read_bytes() == second_config_before
+
+    (run_state / "release-first").touch()
+    deadline = time.monotonic() + 8
+    while True:
+        states = {
+            item["job_id"]: item["status"]
+            for item in jobs.list()
+            if item["job_id"] in {first["job_id"], second["job_id"], third["job_id"]}
+        }
+        if all(value in {"completed", "failed"} for value in states.values()):
+            break
+        assert time.monotonic() < deadline, states
+        time.sleep(0.01)
+
+    assert states == {
+        first["job_id"]: "failed",
+        second["job_id"]: "completed",
+        third["job_id"]: "completed",
+    }
+    assert (run_state / "order.txt").read_text(encoding="utf-8").splitlines() == [
+        first["job_id"],
+        second["job_id"],
+        third["job_id"],
+    ]
+    saved_second = yaml.safe_load(second_config.read_text(encoding="utf-8"))
+    assert saved_second["pipeline"]["data_version"] == "datav4"
+    assert saved_second["pipeline"]["dataset_snapshot_hash"] == "b" * 64
+    assert saved_second["training"]["stage2"]["learning_rate"] == "2e-05"
+
+
+def test_pipeline_jobs_restart_preserves_and_dispatches_queued_job(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    jobs_root = state / "jobs"
+    configs_root = state / "configs"
+    logs_root = state / "logs"
+    jobs_root.mkdir(parents=True)
+    configs_root.mkdir(parents=True)
+    logs_root.mkdir(parents=True)
+    script = tmp_path / "ChatTS" / "scripts" / "run_train_then_eval.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\necho restored-ok\n", encoding="utf-8")
+    job_id = "3" * 32
+    config_path = configs_root / f"{job_id}.yaml"
+    config_path.write_text("pipeline:\n  data_version: datav4\n", encoding="utf-8")
+    (jobs_root / f"{job_id}.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "kind": "train_eval",
+                "status": "queued",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "config_path": str(config_path),
+                "log_path": str(logs_root / f"{job_id}.log"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # A temporarily incomplete host integration must leave durable queue state
+    # untouched instead of converting it to a failed/interrupted run.
+    unavailable = PipelineJobs(state, None)
+    assert unavailable.get(job_id, include_log=False)["status"] == "queued"
+    assert unavailable.get(job_id, include_log=False)["queue_position"] == 1
+
+    restored = PipelineJobs(state, script)
+    deadline = time.monotonic() + 5
+    while restored.get(job_id, include_log=False)["status"] not in {
+        "completed",
+        "failed",
+    }:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    recovered = restored.get(job_id)
+    assert recovered["status"] == "completed"
+    assert recovered["exit_code"] == 0
+    assert "restored-ok" in recovered["log_tail"]
+
+
+def test_pipeline_jobs_restart_tracks_running_then_dispatches_queued(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    jobs_root = state / "jobs"
+    configs_root = state / "configs"
+    logs_root = state / "logs"
+    status_root = state / "worker-status"
+    for path in (jobs_root, configs_root, logs_root, status_root):
+        path.mkdir(parents=True)
+    script = tmp_path / "ChatTS" / "scripts" / "run_train_then_eval.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\nset -Eeuo pipefail\necho next-ok\n", encoding="utf-8")
+    running_id = "4" * 32
+    queued_id = "5" * 32
+    queued_config = configs_root / f"{queued_id}.yaml"
+    queued_config.write_text("pipeline:\n  data_version: datav4\n", encoding="utf-8")
+    running_job = {
+        "job_id": running_id,
+        "kind": "train_eval",
+        "status": "running",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "queue_sequence": 1,
+        "log_path": str(logs_root / f"{running_id}.log"),
+        "pid": os.getpid(),
+    }
+    queued_job = {
+        "job_id": queued_id,
+        "kind": "train_eval",
+        "status": "queued",
+        "created_at": "2026-01-01T00:00:01+00:00",
+        "queue_sequence": 2,
+        "config_path": str(queued_config),
+        "log_path": str(logs_root / f"{queued_id}.log"),
+    }
+    (jobs_root / f"{running_id}.json").write_text(
+        json.dumps(running_job), encoding="utf-8"
+    )
+    (jobs_root / f"{queued_id}.json").write_text(
+        json.dumps(queued_job), encoding="utf-8"
+    )
+    running_status_path = status_root / f"{running_id}.json"
+    running_status_path.write_text(
+        json.dumps(
+            {
+                "job_id": running_id,
+                "status": "running",
+                "pid": os.getpid(),
+                "started_at": "2026-01-01T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restored = PipelineJobs(state, script)
+    assert restored.get(running_id, include_log=False)["status"] == "running"
+    assert restored.get(queued_id, include_log=False)["queue_position"] == 1
+    # Simulate the detached worker publishing its terminal status after the
+    # Studio process has restarted and attached a recovery watcher.
+    running_status_path.write_text(
+        json.dumps(
+            {
+                "job_id": running_id,
+                "status": "completed",
+                "pid": os.getpid(),
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:01:00+00:00",
+                "duration_seconds": 60.0,
+                "exit_code": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    deadline = time.monotonic() + 5
+    while restored.get(queued_id, include_log=False)["status"] not in {
+        "completed",
+        "failed",
+    }:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    assert restored.get(running_id, include_log=False)["status"] == "completed"
+    recovered_queued = restored.get(queued_id)
+    assert recovered_queued["status"] == "completed"
+    assert "next-ok" in recovered_queued["log_tail"]
 
 
 def test_training_run_exports_data_config_and_diff_from_previous(tmp_path: Path) -> None:

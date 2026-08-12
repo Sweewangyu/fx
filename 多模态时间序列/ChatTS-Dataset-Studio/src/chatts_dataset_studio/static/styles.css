@@ -257,6 +257,7 @@ td { font-family: var(--mono); }
 .job-row { width: 100%; min-height: 52px; padding: 0; border: 0; border-top: 1px solid var(--line); background: transparent; cursor: pointer; text-align: left; font-size: 16px; }
 .job-row:hover { color: var(--teal); }
 .job-status { width: max-content; padding: 3px 7px; border-radius: 10px; background: var(--surface-muted); }
+.job-status.queued { background: #fff1cd; color: #7a5700; }
 .job-status.running, .job-status.training, .job-status.evaluating, .job-status.exporting { background: var(--blue-soft); color: var(--blue); }
 .job-status.completed { background: var(--teal-soft); color: var(--teal-dark); }
 .job-status.failed { background: var(--danger-soft); color: var(--danger); }

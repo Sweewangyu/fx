@@ -806,7 +806,7 @@ def resolve_pipeline_request(
 
 
 class PipelineJobs:
-    """Persistent, local-only subprocess launcher for the fixed host pipeline."""
+    """Persistent FIFO scheduler for the fixed host training/evaluation pipeline."""
 
     def __init__(self, state_root: str | Path, pipeline_script: str | Path | None):
         self.state_root = Path(state_root).expanduser().resolve()
@@ -846,10 +846,56 @@ class PipelineJobs:
             raise StudioError(f"Pipeline job is not an object: {path}")
         return value
 
-    def list(self) -> list[dict[str, Any]]:
+    def _list_raw(self) -> list[dict[str, Any]]:
         if not self.jobs_root.is_dir():
             return []
-        jobs = [self._read(path) for path in self.jobs_root.glob("*.json")]
+        return [self._read(path) for path in self.jobs_root.glob("*.json")]
+
+    @staticmethod
+    def _fifo_key(job: dict[str, Any]) -> tuple[int, str, str]:
+        sequence = job.get("queue_sequence")
+        return (
+            sequence if isinstance(sequence, int) and not isinstance(sequence, bool) else 0,
+            str(job.get("created_at", "")),
+            str(job.get("job_id", "")),
+        )
+
+    def _next_queue_sequence_locked(self) -> int:
+        sequences = [
+            value
+            for job in self._list_raw()
+            if isinstance((value := job.get("queue_sequence")), int)
+            and not isinstance(value, bool)
+            and value > 0
+        ]
+        return max(sequences, default=0) + 1
+
+    def _decorate_queue_positions(
+        self, jobs: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        positions = {
+            str(job.get("job_id")): position
+            for position, job in enumerate(
+                sorted(
+                    (item for item in jobs if item.get("status") == "queued"),
+                    key=self._fifo_key,
+                ),
+                1,
+            )
+        }
+        decorated = []
+        for job in jobs:
+            current = dict(job)
+            job_id = str(current.get("job_id", ""))
+            if job_id in positions:
+                current["queue_position"] = positions[job_id]
+            else:
+                current.pop("queue_position", None)
+            decorated.append(current)
+        return decorated
+
+    def list(self) -> list[dict[str, Any]]:
+        jobs = self._decorate_queue_positions(self._list_raw())
         return sorted(jobs, key=lambda item: item.get("created_at", ""), reverse=True)
 
     def get(self, job_id: str, *, include_log: bool = True) -> dict[str, Any]:
@@ -857,6 +903,22 @@ class PipelineJobs:
         if not path.is_file():
             raise StudioError(f"Unknown pipeline job: {job_id}")
         job = self._read(path)
+        if job.get("status") == "queued":
+            positions = {
+                str(item.get("job_id")): item.get("queue_position")
+                for item in self._decorate_queue_positions(self._list_raw())
+            }
+            position = positions.get(job_id)
+            if position is None:
+                # The scheduler may have promoted this item between the first
+                # read and the queue scan. Return the authoritative latest
+                # record instead of surfacing a transient KeyError to the API.
+                job = self._read(path)
+                job.pop("queue_position", None)
+            else:
+                job["queue_position"] = position
+        else:
+            job.pop("queue_position", None)
         if include_log:
             log_path = Path(job["log_path"])
             if log_path.is_file():
@@ -894,38 +956,150 @@ class PipelineJobs:
             return None
         return value
 
-    def _apply_worker_status(self, job_id: str, status: dict[str, Any]) -> None:
-        with self.lock:
-            job = self.get(job_id, include_log=False)
-            for key in (
-                "status",
-                "pid",
-                "started_at",
-                "finished_at",
-                "duration_seconds",
-                "exit_code",
-                "error",
-            ):
-                if key in status:
-                    job[key] = status[key]
-            self._write(job)
-            self.processes.pop(job_id, None)
+    def _apply_worker_status_locked(
+        self, job_id: str, status: dict[str, Any]
+    ) -> None:
+        job = self._read(self._path(job_id))
+        for key in (
+            "status",
+            "pid",
+            "started_at",
+            "finished_at",
+            "duration_seconds",
+            "exit_code",
+            "error",
+        ):
+            if key in status:
+                job[key] = status[key]
+        self._write(job)
+        self.processes.pop(job_id, None)
 
-    def _mark_interrupted(self, job_id: str) -> None:
-        with self.lock:
-            job = self.get(job_id, include_log=False)
-            if job.get("status") not in {"queued", "running"}:
-                return
+    def _mark_interrupted_locked(self, job_id: str) -> None:
+        job = self._read(self._path(job_id))
+        if job.get("status") != "running":
+            return
+        job.update(
+            {
+                "status": "failed",
+                "finished_at": _utc_now(),
+                "exit_code": 125,
+                "error": "Pipeline worker exited without a final status record",
+            }
+        )
+        self._write(job)
+        self.processes.pop(job_id, None)
+
+    def _worker_command(self, job: dict[str, Any]) -> list[str]:
+        if self.pipeline_script is None:
+            raise StudioError("One-click pipeline is disabled")
+        return [
+            sys.executable,
+            str(Path(__file__).with_name("pipeline_worker.py")),
+            "--job-id",
+            str(job["job_id"]),
+            "--lock-path",
+            str(self.run_lock_path),
+            "--status-path",
+            str(self._status_path(str(job["job_id"]))),
+            "--script",
+            str(self.pipeline_script),
+            "--config",
+            str(job["config_path"]),
+            "--cwd",
+            str(self.pipeline_script.parent.parent),
+        ]
+
+    def _launch_locked(self, job: dict[str, Any]) -> bool:
+        job_id = str(job["job_id"])
+        if self.pipeline_script is None or not self.pipeline_script.is_file():
             job.update(
                 {
                     "status": "failed",
                     "finished_at": _utc_now(),
-                    "exit_code": 125,
-                    "error": "Pipeline worker exited without a final status record",
+                    "exit_code": 126,
+                    "error": (
+                        "Could not start fixed pipeline script: pipeline_script "
+                        "is missing on the host"
+                    ),
                 }
             )
             self._write(job)
-            self.processes.pop(job_id, None)
+            return False
+        config_path = Path(str(job.get("config_path", "")))
+        if not config_path.is_file():
+            job.update(
+                {
+                    "status": "failed",
+                    "finished_at": _utc_now(),
+                    "exit_code": 126,
+                    "error": f"Could not start queued pipeline: config is missing: {config_path}",
+                }
+            )
+            self._write(job)
+            return False
+
+        status_path = self._status_path(job_id)
+        try:
+            status_path.unlink(missing_ok=True)
+            self.logs_root.mkdir(parents=True, exist_ok=True)
+            with Path(str(job["log_path"])).open("wb") as log_stream:
+                process = subprocess.Popen(  # noqa: S603 - configured executable only.
+                    self._worker_command(job),
+                    cwd=self.pipeline_script.parent.parent,
+                    env=dict(os.environ),
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        except OSError as exc:
+            job.update(
+                {
+                    "status": "failed",
+                    "finished_at": _utc_now(),
+                    "exit_code": 126,
+                    "error": f"Could not start fixed pipeline script: {exc}",
+                }
+            )
+            self._write(job)
+            return False
+
+        job.update(
+            {
+                "status": "running",
+                "started_at": _utc_now(),
+                "pid": process.pid,
+            }
+        )
+        job.pop("queue_position", None)
+        self._write(job)
+        self.processes[job_id] = process
+        threading.Thread(
+            target=self._watch,
+            args=(job_id, process),
+            name=f"pipeline-{job_id[:8]}",
+            daemon=True,
+        ).start()
+        return True
+
+    def _dispatch_next_locked(self) -> None:
+        jobs = self._list_raw()
+        if any(job.get("status") == "running" for job in jobs):
+            return
+        # Keep pending work durable if the host is restarted with an incomplete
+        # integration mount/config. A later correctly configured restart will
+        # dispatch it; submitting new work is already rejected by start().
+        if self.pipeline_script is None or not self.pipeline_script.is_file():
+            return
+        queued = sorted(
+            (job for job in jobs if job.get("status") == "queued"),
+            key=self._fifo_key,
+        )
+        # If a queued item has lost its immutable config or the configured
+        # launcher disappeared, fail it explicitly and continue draining the
+        # queue instead of blocking every later experiment forever.
+        for job in queued:
+            if self._launch_locked(job):
+                return
 
     def _watch(self, job_id: str, process: subprocess.Popen[bytes] | None = None) -> None:
         if process is not None:
@@ -946,32 +1120,63 @@ class PipelineJobs:
         for _ in range(20):
             status = self._read_worker_status(job_id)
             if status and status.get("status") in {"completed", "failed"}:
-                self._apply_worker_status(job_id, status)
+                with self.lock:
+                    self._apply_worker_status_locked(job_id, status)
+                    self._dispatch_next_locked()
                 return
             time.sleep(0.05)
-        self._mark_interrupted(job_id)
+        with self.lock:
+            self._mark_interrupted_locked(job_id)
+            self._dispatch_next_locked()
 
     def _recover(self) -> None:
-        for job in self.list():
-            if job.get("status") not in {"queued", "running"}:
-                continue
-            job_id = job.get("job_id")
-            if not isinstance(job_id, str):
-                continue
-            status = self._read_worker_status(job_id)
-            if status and status.get("status") in {"completed", "failed"}:
-                self._apply_worker_status(job_id, status)
-                continue
-            pid = (status or {}).get("pid", job.get("pid"))
-            if self._pid_alive(pid):
-                threading.Thread(
-                    target=self._watch,
-                    args=(job_id,),
-                    name=f"pipeline-recover-{job_id[:8]}",
-                    daemon=True,
-                ).start()
-            else:
-                self._mark_interrupted(job_id)
+        recovered_running: list[str] = []
+        with self.lock:
+            for job in sorted(self._list_raw(), key=self._fifo_key):
+                if job.get("status") not in {"queued", "running"}:
+                    continue
+                job_id = job.get("job_id")
+                if not isinstance(job_id, str):
+                    continue
+                status = self._read_worker_status(job_id)
+                if status and status.get("status") in {"completed", "failed"}:
+                    self._apply_worker_status_locked(job_id, status)
+                    continue
+                pid = (status or {}).get("pid", job.get("pid"))
+                if self._pid_alive(pid):
+                    # Covers a service crash after Popen but before the queued
+                    # record was promoted to running.
+                    if job.get("status") == "queued":
+                        job["status"] = "running"
+                        for key in ("pid", "started_at"):
+                            if status and key in status:
+                                job[key] = status[key]
+                        job.setdefault("pid", pid)
+                        job.setdefault("started_at", _utc_now())
+                        self._write(job)
+                    recovered_running.append(job_id)
+                elif job.get("status") == "running":
+                    # Recheck once because the worker may have atomically
+                    # published its terminal status between the first read and
+                    # the PID check.
+                    final_status = self._read_worker_status(job_id)
+                    if final_status and final_status.get("status") in {
+                        "completed",
+                        "failed",
+                    }:
+                        self._apply_worker_status_locked(job_id, final_status)
+                    else:
+                        self._mark_interrupted_locked(job_id)
+                # A genuine queued item has no worker yet and remains queued.
+            self._dispatch_next_locked()
+
+        for job_id in recovered_running:
+            threading.Thread(
+                target=self._watch,
+                args=(job_id,),
+                name=f"pipeline-recover-{job_id[:8]}",
+                daemon=True,
+            ).start()
 
     @staticmethod
     def _diff_values(before: Any, after: Any, path: str = "") -> list[dict[str, Any]]:
@@ -1151,13 +1356,6 @@ class PipelineJobs:
                 "One-click pipeline is disabled or pipeline_script does not exist on the host"
             )
         with self.lock:
-            active = [
-                item
-                for item in self.list()
-                if item.get("status") in {"queued", "running"}
-            ]
-            if active:
-                raise StudioError(f"A pipeline job is already active: {active[0]['job_id']}")
             job_id = uuid.uuid4().hex
             self.config_root.mkdir(parents=True, exist_ok=True)
             self.logs_root.mkdir(parents=True, exist_ok=True)
@@ -1184,6 +1382,7 @@ class PipelineJobs:
                 "kind": "preflight" if preflight else "train_eval",
                 "status": "queued",
                 "created_at": _utc_now(),
+                "queue_sequence": self._next_queue_sequence_locked(),
                 "version": resolved["version"],
                 "dataset_snapshot_hash": resolved["dataset_snapshot_hash"],
                 "config_hash": effective_config_hash,
@@ -1195,50 +1394,5 @@ class PipelineJobs:
                 "artifacts": artifacts,
             }
             self._write(job)
-            status_path = self._status_path(job_id)
-            worker_command = [
-                sys.executable,
-                str(Path(__file__).with_name("pipeline_worker.py")),
-                "--job-id",
-                job_id,
-                "--lock-path",
-                str(self.run_lock_path),
-                "--status-path",
-                str(status_path),
-                "--script",
-                str(self.pipeline_script),
-                "--config",
-                str(config_path),
-                "--cwd",
-                str(self.pipeline_script.parent.parent),
-            ]
-            try:
-                with log_path.open("wb") as log_stream:
-                    process = subprocess.Popen(  # noqa: S603 - configured executable only.
-                        worker_command,
-                        cwd=self.pipeline_script.parent.parent,
-                        env=dict(os.environ),
-                        stdout=log_stream,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True,
-                    )
-            except OSError as exc:
-                job.update(
-                    {
-                        "status": "failed",
-                        "finished_at": _utc_now(),
-                        "error": f"Could not start fixed pipeline script: {exc}",
-                    }
-                )
-                self._write(job)
-                raise StudioError(job["error"]) from exc
-            job.update({"status": "running", "started_at": _utc_now(), "pid": process.pid})
-            self._write(job)
-            self.processes[job_id] = process
-            threading.Thread(
-                target=self._watch,
-                args=(job_id, process),
-                name=f"pipeline-{job_id[:8]}",
-                daemon=True,
-            ).start()
-            return job
+            self._dispatch_next_locked()
+            return self.get(job_id, include_log=False)

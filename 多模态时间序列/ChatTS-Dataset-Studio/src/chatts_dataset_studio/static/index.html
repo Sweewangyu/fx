@@ -80,7 +80,7 @@
             <button class="quick-action" type="button" data-tab-link="recipe"><span>1</span><strong>选择数据</strong><small>数据源与筛选规则</small></button>
             <button class="quick-action" type="button" data-tab-link="versions"><span>2</span><strong>发布版本</strong><small>记录组成并注册</small></button>
             <button class="quick-action" id="overview-preflight" type="button"><span>3</span><strong>环境预检</strong><small>检查路径、容器和 GPU</small></button>
-            <button class="quick-action featured" id="overview-run" type="button"><span>4</span><strong>训练 + 评测</strong><small>启动完整流水线</small></button>
+            <button class="quick-action featured" id="overview-run" type="button"><span>4</span><strong>训练 + 评测</strong><small>启动或加入 FIFO 队列</small></button>
           </div>
         </section>
 
@@ -235,7 +235,7 @@
             <li id="launch-step-version"><span>1</span><div><strong>选择并激活版本</strong><small>在“版本”页发布、注册并设为当前版本。</small></div></li>
             <li id="launch-step-training"><span>2</span><div><strong>配置训练参数</strong><small>在“训练”页确认基础模型、GPU 和两阶段参数。</small></div></li>
             <li id="launch-step-preflight"><span>3</span><div><strong>运行 Preflight</strong><small>检查服务端路径、容器、GPU 与脚本。</small></div></li>
-            <li id="launch-step-run"><span>4</span><div><strong>一键训练 + 评测</strong><small>预检通过后启动完整流水线，进度在“任务”页查看。</small></div></li>
+            <li id="launch-step-run"><span>4</span><div><strong>一键训练 + 评测</strong><small>有任务运行时自动排队，完成后按提交顺序启动。</small></div></li>
           </ol>
           <div class="integration-diagnostic" id="integration-diagnostic" role="status" aria-live="polite" hidden>
             <strong>一键启动暂不可用</strong>
@@ -289,7 +289,7 @@
           </div></details>
         </section>
         <section class="card run-bar" aria-labelledby="run-title">
-          <div><h2 id="run-title">启动</h2><p id="run-status" aria-live="polite">先发布并注册数据版本。</p></div>
+          <div><h2 id="run-title">启动 / 排队</h2><p id="run-status" aria-live="polite">先发布并注册数据版本；运行期间可继续提交下一版本。</p></div>
           <div class="button-row"><button class="button secondary run-button" data-run-mode="preflight" type="button">预检</button><button class="button primary run-button" data-run-mode="train_eval" type="button">训练 + 评测</button></div>
         </section>
       </section>
