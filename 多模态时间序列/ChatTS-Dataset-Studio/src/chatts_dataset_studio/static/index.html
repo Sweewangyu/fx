@@ -162,7 +162,7 @@
             <label class="field readonly-field"><span>训练方案</span><select id="train-profile" disabled aria-disabled="true"><option value="chronos2-full">Chronos-2 两阶段</option></select></label>
             <label class="field"><span>随机种子</span><input id="train-seed" type="number" min="0" step="1" value="42"></label>
             <label class="field"><span>GPU</span><input id="deepspeed-include" type="text" value="localhost:0,1,2,3,4,5,6,7" spellcheck="false"></label>
-            <label class="field field-span-3 readonly-field"><span>基础模型（服务端配置）</span><input id="base-model-path" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-3"><span>基础模型地址</span><input id="base-model-path" type="text" spellcheck="false" autocomplete="off" placeholder="/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B"></label>
             <label class="field field-span-3 readonly-field"><span>模型输出根目录（自动追加版本）</span><input id="train-output-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
           </div>
           <div class="path-preview"><span>最终输出</span><code id="final-model-preview">—</code></div>
@@ -226,6 +226,24 @@
 
       <section id="panel-evaluation" role="tabpanel" aria-labelledby="tab-evaluation" data-panel="evaluation" hidden>
         <div class="page-heading"><div><p class="eyebrow">Benchmark</p><h1>评测参数</h1></div><span class="status-chip" id="evaluation-version">未选择版本</span></div>
+        <section class="launch-guide" aria-labelledby="launch-guide-title">
+          <div class="launch-guide-heading">
+            <div><h2 id="launch-guide-title">启动流程</h2><p>训练与评测按同一数据版本连续执行。</p></div>
+            <span class="status-chip" id="integration-state">检查中</span>
+          </div>
+          <ol class="launch-steps">
+            <li id="launch-step-version"><span>1</span><div><strong>选择并激活版本</strong><small>在“版本”页发布、注册并设为当前版本。</small></div></li>
+            <li id="launch-step-training"><span>2</span><div><strong>配置训练参数</strong><small>在“训练”页确认基础模型、GPU 和两阶段参数。</small></div></li>
+            <li id="launch-step-preflight"><span>3</span><div><strong>运行 Preflight</strong><small>检查服务端路径、容器、GPU 与脚本。</small></div></li>
+            <li id="launch-step-run"><span>4</span><div><strong>一键训练 + 评测</strong><small>预检通过后启动完整流水线，进度在“任务”页查看。</small></div></li>
+          </ol>
+          <div class="integration-diagnostic" id="integration-diagnostic" role="status" aria-live="polite" hidden>
+            <strong>一键启动暂不可用</strong>
+            <p id="integration-summary"></p>
+            <ul id="integration-missing"></ul>
+            <p>请在 Dataset Studio 的服务端 YAML 中补齐 <code>integration</code> 配置并重启服务；同时确认训练/评测脚本及 Chronos-2 路径可访问。</p>
+          </div>
+        </section>
         <section class="card">
           <div class="card-heading"><h2>评测套件</h2><span id="suite-count">4 项</span></div>
           <fieldset class="suite-grid" id="benchmark-suites"><legend class="sr-only">选择评测套件</legend>

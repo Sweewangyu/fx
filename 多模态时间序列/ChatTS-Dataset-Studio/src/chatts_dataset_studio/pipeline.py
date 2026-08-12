@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -229,6 +229,18 @@ def _fixed_value(
     if expected in (None, ""):
         raise StudioError(f"Missing server integration setting: {integration_key}")
     return expected
+
+
+def _user_posix_absolute_path(value: Any, field: str) -> str:
+    """Validate a container/shared-filesystem path supplied by the dashboard."""
+
+    if not isinstance(value, str) or not value:
+        raise StudioError(f"{field} must be a non-empty absolute POSIX path")
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise StudioError(f"{field} must not contain NUL or newline characters")
+    if not PurePosixPath(value).is_absolute():
+        raise StudioError(f"{field} must be a non-empty absolute POSIX path")
+    return value
 
 
 def _version_record_fields(record: dict[str, Any]) -> tuple[str, str, dict[str, list[str]]]:
@@ -519,7 +531,42 @@ def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) ->
 
 def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
     """Return safe UI defaults without exposing host-side executable paths."""
-    script = integration.get("pipeline_script")
+    disabled_reasons: list[str] = []
+    for key in ("pipeline_script", "training_root", "evaluation_root"):
+        value = integration.get(key)
+        if not isinstance(value, str) or not value:
+            disabled_reasons.append(f"integration.{key} is not configured")
+            continue
+        path = Path(value).expanduser()
+        if key == "pipeline_script":
+            if not path.is_file():
+                disabled_reasons.append(
+                    f"integration.pipeline_script does not exist or is not a file: {path}"
+                )
+        elif not path.is_dir():
+            disabled_reasons.append(
+                f"integration.{key} does not exist or is not a directory: {path}"
+            )
+    required_container_settings = (
+        "train_project_root",
+        "eval_project_root",
+        "training_script",
+        "evaluation_script",
+        "model_output_base",
+        "evaluation_output_base",
+        "train_chronos2_model_path",
+        "eval_chronos2_model_path",
+        "tsrbench_root",
+        "tinybench_dataset_root",
+        "ts_haystack_root",
+        "timeseriesexam_root",
+        "timeseriesexam_data_file",
+    )
+    for key in required_container_settings:
+        value = integration.get(key)
+        if not isinstance(value, str) or not value:
+            disabled_reasons.append(f"integration.{key} is not configured")
+    enabled = not disabled_reasons
     return {
         "training": {
             "profile": "chronos2-full",
@@ -545,7 +592,8 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
             "timeseriesexam_data_file": integration.get("timeseriesexam_data_file"),
         },
         "integration": {
-            "enabled": bool(script and Path(str(script)).expanduser().is_file()),
+            "enabled": enabled,
+            "disabled_reasons": disabled_reasons,
             "training_root": integration.get("training_root"),
             "evaluation_root": integration.get("evaluation_root"),
             "training_container": integration.get("training_container", "chatts"),
@@ -596,8 +644,9 @@ def resolve_pipeline_request(
     train_project_root = _fixed_value(
         training_request, "project_root", integration, "train_project_root"
     )
-    base_model_path = _fixed_value(
-        training_request, "base_model_path", integration, "base_model_path"
+    base_model_path = _user_posix_absolute_path(
+        training_request.get("base_model_path", integration.get("base_model_path")),
+        "training.base_model_path",
     )
     model_output_base = integration.get("model_output_base")
     if not isinstance(model_output_base, str) or not model_output_base:

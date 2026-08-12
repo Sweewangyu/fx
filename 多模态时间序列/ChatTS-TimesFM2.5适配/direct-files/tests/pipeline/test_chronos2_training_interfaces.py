@@ -1,4 +1,4 @@
-# ruff: noqa: PLW1510 -- this module intentionally uses unittest.TestCase.
+# ruff: noqa: PLW1510, PT009 -- this module intentionally uses unittest.TestCase.
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "full" / "run_chronos2_best_two_stage.sh"

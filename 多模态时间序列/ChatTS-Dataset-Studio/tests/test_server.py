@@ -80,6 +80,18 @@ def test_real_http_api_catalog_preview_and_background_export(
         status, public_defaults = _json_request(base_url, "/api/defaults")
         assert status == 200
         assert public_defaults["target_sources"] == list(labeled_corpus["sources"])
+        assert public_defaults["pipeline"]["integration"]["enabled"] is False
+        disabled_reasons = public_defaults["pipeline"]["integration"][
+            "disabled_reasons"
+        ]
+        assert disabled_reasons[:3] == [
+            "integration.pipeline_script is not configured",
+            "integration.training_root is not configured",
+            "integration.evaluation_root is not configured",
+        ]
+        assert "integration.train_project_root is not configured" in disabled_reasons
+        assert "integration.timeseriesexam_data_file is not configured" in disabled_reasons
+        assert not any("base_model_path" in reason for reason in disabled_reasons)
         assert public_defaults["presets"]["stage1"]["difficulties"] == [
             "very_easy",
             "easy",
@@ -332,6 +344,12 @@ def test_version_publish_register_activate_and_pipeline_preflight_api(
         assert versions["versions"][0]["notes"] == "first all-source recipe"
         profile = training_root / "data" / "studio_versions" / "datav3.json"
         assert profile.is_file()
+
+        status, public_defaults = _json_request(base_url, "/api/defaults")
+        assert status == 200
+        pipeline_integration = public_defaults["pipeline"]["integration"]
+        assert pipeline_integration["enabled"] is True
+        assert pipeline_integration["disabled_reasons"] == []
 
         status, duplicate_started = _json_request(
             base_url,

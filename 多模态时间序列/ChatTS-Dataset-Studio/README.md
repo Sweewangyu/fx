@@ -150,6 +150,24 @@ CONFIG_FILE=<studio-generated.yaml> bash ../ChatTS/scripts/run_train_then_eval.s
 数据版本和 `DATASET_SNAPSHOT_HASH` 会同时进入训练与评测容器。训练完成以
 `TRAINING_COMPLETE.json` 为准；评测完成以 `metrics.json.status == "pass"` 为准。
 
+“训练”页的基础模型地址可直接填写，它是训练容器内可见的绝对路径，例如
+`/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B`。`server.yaml` 中的
+`integration.base_model_path` 只是页面默认值，不再锁定用户输入。
+
+如果评测页显示“一键启动暂不可用”，表示 Studio 宿主机侧没有找到完整的
+`integration` 配置，页面会直接列出具体原因。最常见的是启动时没有传
+`-c configs/server.yaml`，或 `pipeline_script` 不是宿主机上真实存在的
+`ChatTS/scripts/run_train_then_eval.sh`。前三个值建议写宿主机绝对路径：
+
+```yaml
+integration:
+  training_root: /actual/workspace/ChatTS-Training
+  evaluation_root: /actual/workspace/ChatTS
+  pipeline_script: /actual/workspace/ChatTS/scripts/run_train_then_eval.sh
+```
+
+修改 YAML 后需要重启 Studio；先点“预检”，通过后再点“训练 + 评测”。
+
 ## 兼容 CLI
 
 ```bash

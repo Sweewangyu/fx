@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+
 EXPORT_SCHEMA = "chatts-dataset-studio-export-v1"
 SNAPSHOT_SCHEMAS = {
     "chatts-dataset-snapshot-v1",

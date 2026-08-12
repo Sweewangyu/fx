@@ -159,7 +159,7 @@ function renderActionState() {
   const scanned = Boolean(state.catalog);
   const previewReady = Boolean(state.preview && state.previewFingerprint === selectionFingerprint());
   const hasVersion = Boolean(versionName(state.activeVersion));
-  const canRun = hasVersion && state.pipelineEnabled;
+  const canRun = hasVersion && state.pipelineEnabled && $("#base-model-path").value.trim().startsWith("/");
   $("#scan-button").disabled = !state.defaults || state.busy.has("scan-button");
   $("#rebuild-sources").disabled = !state.defaults || state.busy.has("rebuild-sources");
   $("#preview-button").disabled = !scanned || state.busy.has("preview-button");
@@ -570,6 +570,7 @@ function renderCurrentVersion() {
   $("#stage1-datasets").textContent = Array.isArray(stage1) && stage1.length ? stage1.join(", ") : "由数据版本生成";
   $("#stage2-datasets").textContent = Array.isArray(stage2) && stage2.length ? stage2.join(", ") : "由数据版本生成";
   updateDerivedPaths();
+  renderLaunchSteps();
   renderActionState();
 }
 
@@ -717,6 +718,7 @@ function runPayload(mode) {
     mode,
     version: versionName(state.activeVersion),
     training: {
+      base_model_path: $("#base-model-path").value.trim(),
       seed: Number($("#train-seed").value),
       deepspeed_include: $("#deepspeed-include").value.trim(),
       master_port: Number($("#master-port").value),
@@ -731,6 +733,8 @@ function runPayload(mode) {
 
 function validateRun(mode) {
   if (!versionName(state.activeVersion)) throw new Error("请先选择已注册的数据版本");
+  const baseModelPath = $("#base-model-path").value.trim();
+  if (!baseModelPath.startsWith("/")) throw new Error("请填写训练容器内可见的基础模型绝对路径");
   if (["eval", "train_eval"].includes(mode) && !evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
 }
 
@@ -805,6 +809,7 @@ function renderJobs() {
   $("#running-job-count").textContent = String(running);
   $("#overview-pipeline").textContent = running ? `${running} 个运行中` : (state.jobs[0] ? jobStatusLabel(state.jobs[0].status) : "空闲");
   $("#overview-job-meta").textContent = state.jobs[0] ? `${jobType(state.jobs[0])} · ${state.jobs[0].version || state.jobs[0].data_version || "—"}` : "没有运行中的任务";
+  renderLaunchSteps();
 }
 
 async function refreshJobs({ quiet = false } = {}) {
@@ -872,6 +877,54 @@ function updateDerivedPaths() {
   $("#suite-count").textContent = `${$$("#benchmark-suites input:checked").length} 项`;
 }
 
+function integrationMissingItems(pipeline, integration) {
+  const training = pipeline.training || {};
+  const evaluation = pipeline.evaluation || {};
+  const required = [
+    ["integration.pipeline_script", integration.pipeline_script],
+    ["integration.training_root", integration.training_root],
+    ["integration.evaluation_root", integration.evaluation_root],
+    ["training.base_model_path（也可在训练页填写）", $("#base-model-path").value.trim() || training.base_model_path],
+    ["integration.model_output_base", training.output_root],
+    ["integration.evaluation_output_base", evaluation.output_root],
+    ["integration.tsrbench_root", evaluation.tsrbench_root],
+    ["integration.tinybench_dataset_root", evaluation.tinybench_dataset_root],
+    ["integration.ts_haystack_root", evaluation.ts_haystack_root],
+    ["integration.timeseriesexam_root", evaluation.timeseriesexam_root],
+    ["integration.timeseriesexam_data_file", evaluation.timeseriesexam_data_file],
+  ];
+  return required.filter(([, value]) => value === null || value === undefined || value === "").map(([name]) => name);
+}
+
+function renderLaunchSteps() {
+  const version = versionName(state.activeVersion);
+  const sameVersion = (job) => !job.version || !version || job.version === version;
+  const preflightDone = state.jobs.some((job) => job.kind === "preflight" && job.status === "completed" && sameVersion(job));
+  const pipelineDone = state.jobs.some((job) => ["train_eval", "pipeline"].includes(job.kind) && job.status === "completed" && sameVersion(job));
+  $("#launch-step-version").classList.toggle("complete", Boolean(version));
+  $("#launch-step-training").classList.toggle("complete", Boolean($("#base-model-path").value.trim()));
+  $("#launch-step-preflight").classList.toggle("complete", preflightDone);
+  $("#launch-step-run").classList.toggle("complete", pipelineDone);
+}
+
+function renderIntegrationStatus(pipeline, integration) {
+  const enabled = Boolean(integration.enabled);
+  const missing = Array.isArray(integration.disabled_reasons)
+    ? integration.disabled_reasons
+    : (Array.isArray(integration.missing) ? integration.missing : integrationMissingItems(pipeline, integration));
+  $("#integration-state").textContent = enabled ? "服务已就绪" : "需要配置";
+  $("#integration-state").className = `status-chip ${enabled ? "active" : "error"}`;
+  $("#integration-diagnostic").hidden = enabled;
+  $("#integration-summary").textContent = enabled
+    ? ""
+    : "服务端未启用完整流水线。以下配置缺失、不可访问，或 pipeline_script 文件不存在：";
+  const list = $("#integration-missing");
+  list.replaceChildren();
+  const items = missing.length ? missing : ["integration.pipeline_script（路径未配置或文件不存在）"];
+  for (const item of items) list.append(element("li", "", item));
+  renderLaunchSteps();
+}
+
 function applyDefaults(defaults) {
   const paths = defaults.paths || defaults;
   for (const [key, input] of Object.entries(pathFields)) if (typeof paths[key] === "string") input.value = paths[key];
@@ -880,7 +933,7 @@ function applyDefaults(defaults) {
   const integration = pipeline.integration || defaults.integration || {};
   state.pipelineEnabled = Boolean(integration.enabled);
   $("#training-root").value = integration.training_root || defaults.training_root || "由服务端配置";
-  $("#base-model-path").value = training.base_model_path || defaults.base_model_path || "由服务端配置";
+  $("#base-model-path").value = training.base_model_path || defaults.base_model_path || "";
   $("#train-output-root").value = training.output_root || defaults.train_output_root || "";
   $("#train-profile").value = training.profile || "chronos2-full";
   $("#train-seed").value = training.seed ?? 42;
@@ -929,7 +982,10 @@ function applyDefaults(defaults) {
   $("#haystack-root").value = evaluation.ts_haystack_root || "由服务端配置";
   $("#timeseriesexam-root").value = evaluation.timeseriesexam_root || "由服务端配置";
   $("#timeseriesexam-file").value = evaluation.timeseriesexam_data_file || "由服务端配置";
-  $("#run-status").textContent = state.pipelineEnabled ? "发布并激活版本后可启动。" : "服务端尚未配置训练流水线。";
+  renderIntegrationStatus(pipeline, integration);
+  $("#run-status").textContent = state.pipelineEnabled
+    ? "先运行 Preflight；通过后点击“训练 + 评测”。"
+    : "请先按上方提示补齐服务端 integration 配置。";
   updateDerivedPaths();
 }
 
@@ -979,6 +1035,11 @@ function bindEvents() {
   $("#version-list").addEventListener("click", (event) => { const button = event.target.closest("button[data-version-action]"); if (button) versionAction(button); });
   $("#version-name").addEventListener("input", updateDerivedPaths);
   $("#train-seed").addEventListener("input", updateDerivedPaths);
+  $("#base-model-path").addEventListener("input", () => {
+    const pipeline = state.defaults?.pipeline || {};
+    renderIntegrationStatus(pipeline, pipeline.integration || state.defaults?.integration || {});
+    renderActionState();
+  });
   $("#benchmark-suites").addEventListener("change", updateDerivedPaths);
   $$(".run-button").forEach((button) => button.addEventListener("click", () => startRun(button.dataset.runMode, button)));
   $("#overview-preflight").addEventListener("click", () => startRun("preflight", $("#overview-preflight")));

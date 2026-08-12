@@ -12,7 +12,11 @@ import pytest
 import yaml
 
 from chatts_dataset_studio.models import StudioError
-from chatts_dataset_studio.pipeline import PipelineJobs, resolve_pipeline_request
+from chatts_dataset_studio.pipeline import (
+    PipelineJobs,
+    public_pipeline_defaults,
+    resolve_pipeline_request,
+)
 
 
 def _integration(tmp_path: Path) -> dict[str, object]:
@@ -86,6 +90,117 @@ def test_resolve_pipeline_derives_versioned_paths_and_snapshot_datasets(
     assert resolved["config_hash"]
 
 
+def test_resolve_pipeline_accepts_user_base_model_path_without_server_default(
+    tmp_path: Path,
+) -> None:
+    integration = _integration(tmp_path)
+    del integration["base_model_path"]
+
+    resolved = resolve_pipeline_request(
+        {"training": {"base_model_path": "/share/custom models/Qwen3-8B"}},
+        _version(tmp_path),
+        integration,
+    )
+
+    assert resolved["config"]["training"]["base_model_path"] == (
+        "/share/custom models/Qwen3-8B"
+    )
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        (None, "non-empty absolute POSIX path"),
+        ("", "non-empty absolute POSIX path"),
+        ("relative/model", "non-empty absolute POSIX path"),
+        (r"C:\\models\\qwen", "non-empty absolute POSIX path"),
+        ("/share/model\x00bad", "must not contain NUL or newline"),
+        ("/share/model\nbad", "must not contain NUL or newline"),
+        ("/share/model\rbad", "must not contain NUL or newline"),
+    ],
+)
+def test_resolve_pipeline_rejects_invalid_user_base_model_path(
+    tmp_path: Path, value: object, message: str
+) -> None:
+    integration = _integration(tmp_path)
+    del integration["base_model_path"]
+
+    with pytest.raises(StudioError, match=message):
+        resolve_pipeline_request(
+            {"training": {"base_model_path": value}},
+            _version(tmp_path),
+            integration,
+        )
+
+
+def test_public_pipeline_defaults_reports_all_host_readiness_failures(
+    tmp_path: Path,
+) -> None:
+    missing_script = tmp_path / "ChatTS" / "scripts" / "run_train_then_eval.sh"
+    training_root = tmp_path / "ChatTS-Training"
+    defaults = public_pipeline_defaults(
+        {
+            "pipeline_script": str(missing_script),
+            "training_root": str(training_root),
+        }
+    )
+    status = defaults["integration"]
+
+    assert status["enabled"] is False
+    assert status["disabled_reasons"] == [
+        (
+            "integration.pipeline_script does not exist or is not a file: "
+            f"{missing_script}"
+        ),
+        (
+            "integration.training_root does not exist or is not a directory: "
+            f"{training_root}"
+        ),
+        "integration.evaluation_root is not configured",
+        "integration.train_project_root is not configured",
+        "integration.eval_project_root is not configured",
+        "integration.training_script is not configured",
+        "integration.evaluation_script is not configured",
+        "integration.model_output_base is not configured",
+        "integration.evaluation_output_base is not configured",
+        "integration.train_chronos2_model_path is not configured",
+        "integration.eval_chronos2_model_path is not configured",
+        "integration.tsrbench_root is not configured",
+        "integration.tinybench_dataset_root is not configured",
+        "integration.ts_haystack_root is not configured",
+        "integration.timeseriesexam_root is not configured",
+        "integration.timeseriesexam_data_file is not configured",
+    ]
+
+
+def test_public_pipeline_defaults_enabled_matches_empty_disabled_reasons(
+    tmp_path: Path,
+) -> None:
+    integration = _integration(tmp_path)
+    script = Path(str(integration["pipeline_script"]))
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    Path(str(integration["training_root"])).mkdir(parents=True)
+    Path(str(integration["evaluation_root"])).mkdir(parents=True, exist_ok=True)
+
+    status = public_pipeline_defaults(integration)["integration"]
+
+    assert status["enabled"] is True
+    assert status["disabled_reasons"] == []
+
+
+def test_public_pipeline_defaults_uses_optional_base_model_default(
+    tmp_path: Path,
+) -> None:
+    integration = _integration(tmp_path)
+    integration["base_model_path"] = "/share/default/model"
+    assert public_pipeline_defaults(integration)["training"]["base_model_path"] == (
+        "/share/default/model"
+    )
+    del integration["base_model_path"]
+    assert public_pipeline_defaults(integration)["training"]["base_model_path"] is None
+
+
 def test_resolve_pipeline_rejects_path_override_and_invalid_stage_mix(
     tmp_path: Path,
 ) -> None:
@@ -95,6 +210,15 @@ def test_resolve_pipeline_rejects_path_override_and_invalid_stage_mix(
             _version(tmp_path),
             _integration(tmp_path),
         )
+
+    custom_model = resolve_pipeline_request(
+        {"training": {"base_model_path": "/different/valid/model"}},
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+    assert custom_model["config"]["training"]["base_model_path"] == (
+        "/different/valid/model"
+    )
 
     with pytest.raises(StudioError, match="must contain 2 probabilities"):
         resolve_pipeline_request(
