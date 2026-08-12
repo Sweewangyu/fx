@@ -207,6 +207,19 @@ integration:
 Studio 进程，在 Docker 宿主机执行 `scripts/start_host_control_plane.sh`。训练不需要搬出
 `chatts`，评测也不需要搬出 `ragas`。
 
+如果首次运行因权限失败、重试时出现：
+
+```text
+Training registration conflicts with existing file: .../studio_versions/datav3.json
+```
+
+请先更新到包含幂等注册修复的版本，不要直接删除该文件，也不要使用 `chmod 777`。旧注册
+把 `PROJECT_ROOT`、`OUTPUT_ROOT` 等部署路径写进了 profile；从容器控制面切换到宿主机控制面
+后这些路径会变化，但它们不代表训练数据发生变化。新版按版本、数据快照 SHA256、manifest、
+selection 和 Stage1/Stage2 composition 判断数据身份：身份一致时对已有 `.json/.env/active.json`
+零写入复用，即使文件由另一个容器 UID 创建且当前用户只能读取也能重试；只有数据身份真的
+变化才拒绝，并在错误中列出不同字段。
+
 ## 兼容 CLI
 
 ```bash

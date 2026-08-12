@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -86,13 +87,65 @@ def test_register_writes_only_version_profile_env_and_active_pointer(
         model_output_base=output_base,
     )
     assert repeated["created"] is False
-    with pytest.raises(StudioError, match="conflicts"):
-        register_training_version(
-            training_root,
-            ledger.root,
-            "datav3",
-            model_output_base=labeled_corpus["tmp_path"] / "different-model-root",
+    changed_runtime = register_training_version(
+        training_root,
+        ledger.root,
+        "datav3",
+        model_output_base=labeled_corpus["tmp_path"] / "different-model-root",
+    )
+    assert changed_runtime["created"] is False
+    assert changed_runtime["reused_existing"] is True
+    assert changed_runtime["runtime_paths_differ"] is True
+    refreshed = json.loads((registry / "datav3.json").read_text(encoding="utf-8"))
+    assert refreshed["dataset_snapshot_hash"] == entry["dataset_snapshot_hash"]
+    assert refreshed["environment"]["OUTPUT_ROOT"].endswith(
+        "ChatTS-msxf-8B-datav3"
+    )
+
+
+def test_register_retries_legacy_runtime_paths_but_rejects_data_identity_change(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    _, ledger, entry = _export_and_record(labeled_corpus, default_selection, "retry")
+    training_root, _ = _training_root(labeled_corpus["tmp_path"])
+    register_training_version(training_root, ledger.root, "datav3")
+    registry = training_root / "data" / "studio_versions"
+    profile_path = registry / "datav3.json"
+    env_path = registry / "datav3.env"
+
+    legacy = json.loads(profile_path.read_text(encoding="utf-8"))
+    legacy["environment"]["PROJECT_ROOT"] = "/workspace/ChatTS-Training"
+    legacy["environment"]["OUTPUT_ROOT"] = "/old/8B-datav3"
+    profile_path.write_text(json.dumps(legacy, indent=2) + "\n", encoding="utf-8")
+    env_path.write_text(
+        "\n".join(
+            f"{key}={shlex.quote(value)}" for key, value in legacy["environment"].items()
         )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    profile_before = profile_path.read_bytes()
+    env_before = env_path.read_bytes()
+    profile_path.chmod(0o444)
+    env_path.chmod(0o444)
+
+    retried = register_training_version(training_root, ledger.root, "datav3")
+
+    assert retried["created"] is False
+    assert retried["reused_existing"] is True
+    assert retried["runtime_paths_differ"] is True
+    assert profile_path.read_bytes() == profile_before
+    assert env_path.read_bytes() == env_before
+
+    profile_path.chmod(0o644)
+    corrupted = json.loads(profile_path.read_text(encoding="utf-8"))
+    corrupted["dataset_snapshot_hash"] = "f" * 64
+    profile_path.write_text(json.dumps(corrupted, indent=2) + "\n", encoding="utf-8")
+    with pytest.raises(
+        StudioError, match="different fields: dataset_snapshot_hash"
+    ):
+        register_training_version(training_root, ledger.root, "datav3")
 
 
 def test_training_activation_can_roll_back_without_mutating_profiles(
@@ -127,6 +180,25 @@ def test_training_activation_can_roll_back_without_mutating_profiles(
     active = json.loads((registry / "active.json").read_text(encoding="utf-8"))
     assert active["version"] == "datav3"
     assert (registry / "datav4.json").read_bytes() == v4_before
+
+
+def test_training_activation_reuses_identical_read_only_pointer(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    _, ledger, _ = _export_and_record(labeled_corpus, default_selection, "active-retry")
+    training_root, _ = _training_root(labeled_corpus["tmp_path"])
+    register_training_version(training_root, ledger.root, "datav3", activate=True)
+    registry = training_root / "data" / "studio_versions"
+    active_path = registry / "active.json"
+    lock_path = registry / ".registry.lock"
+    before = active_path.read_bytes()
+    active_path.chmod(0o444)
+    lock_path.chmod(0o444)
+
+    result = activate_training_version(training_root, "datav3")
+
+    assert result["reused_active"] is True
+    assert active_path.read_bytes() == before
 
 
 def test_training_registration_verification_rejects_env_tampering(

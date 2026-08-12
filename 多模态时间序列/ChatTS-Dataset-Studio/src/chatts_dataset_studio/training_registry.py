@@ -82,7 +82,18 @@ def _registry_root(training_root: str | Path) -> tuple[Path, Path]:
 @contextmanager
 def _registry_lock(registry: Path, *, exclusive: bool) -> Iterator[None]:
     lock_path = registry / ".registry.lock"
-    with lock_path.open("a+b") as stream:
+    try:
+        stream = lock_path.open("a+b")
+    except PermissionError:
+        # A previous container may have created the lock with another UID.
+        # flock(2) does not require a writable descriptor, so idempotent
+        # registration/activation retries can safely reuse that file without
+        # changing its ownership or mode. Any later operation that genuinely
+        # needs to write registry state will still fail at the write itself.
+        if not lock_path.is_file():
+            raise
+        stream = lock_path.open("rb")
+    with stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         try:
             yield
@@ -171,21 +182,50 @@ def _json_bytes(payload: Any) -> bytes:
     )
 
 
-def _write_immutable(path: Path, content: bytes) -> bool:
-    if path.exists():
-        if not path.is_file() or path.read_bytes() != content:
-            raise StudioError(f"Training registration conflicts with existing file: {path}")
-        return False
-    atomic_write_bytes(path, content)
-    return True
+_PROFILE_IDENTITY_KEYS = (
+    "schema_version",
+    "version",
+    "snapshot_path",
+    "dataset_snapshot_hash",
+    "selection_hash",
+    "manifest_path",
+    "manifest_sha256",
+    "dataset_info_path",
+    "dataset_info_sha256",
+    "composition",
+)
 
 
-def _check_immutable(path: Path, content: bytes) -> bool:
+def _profile_identity(profile: dict[str, Any]) -> dict[str, Any]:
+    return {key: profile.get(key) for key in _PROFILE_IDENTITY_KEYS}
+
+
+def _profile_conflicts(existing: Any, expected: dict[str, Any]) -> list[str]:
+    if not isinstance(existing, dict):
+        return ["existing profile is not a JSON object"]
+    conflicts = []
+    for key in _PROFILE_IDENTITY_KEYS:
+        if existing.get(key) != expected.get(key):
+            conflicts.append(key)
+    return conflicts
+
+
+def _read_existing_profile(path: Path, expected: dict[str, Any]) -> dict[str, Any] | None:
     if not path.exists():
-        return False
-    if not path.is_file() or path.read_bytes() != content:
-        raise StudioError(f"Training registration conflicts with existing file: {path}")
-    return True
+        return None
+    if not path.is_file():
+        raise StudioError(f"Training registration path is not a file: {path}")
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StudioError(f"Cannot read existing training registration {path}: {exc}") from exc
+    conflicts = _profile_conflicts(existing, expected)
+    if conflicts:
+        raise StudioError(
+            f"Training registration conflicts with existing data identity: {path}; "
+            f"different fields: {', '.join(conflicts)}"
+        )
+    return existing
 
 
 def write_training_registration(
@@ -224,10 +264,42 @@ def write_training_registration(
     profile_content = _json_bytes(profile)
     env_content = _env_bytes(environment)
     with _registry_lock(registry, exclusive=True):
-        profile_exists = _check_immutable(profile_path, profile_content)
-        env_exists = _check_immutable(env_path, env_content)
-        profile_created = not profile_exists and _write_immutable(profile_path, profile_content)
-        env_created = not env_exists and _write_immutable(env_path, env_content)
+        existing_profile = _read_existing_profile(profile_path, profile)
+        profile_created = existing_profile is None
+        env_created = False
+        runtime_paths_differ = False
+        if profile_created:
+            if env_path.exists() and (
+                not env_path.is_file() or env_path.read_bytes() != env_content
+            ):
+                raise StudioError(
+                    f"Training registration has an orphan environment conflict: {env_path}"
+                )
+            atomic_write_bytes(profile_path, profile_content)
+            if not env_path.exists():
+                atomic_write_bytes(env_path, env_content)
+                env_created = True
+        else:
+            existing_environment = existing_profile.get("environment")
+            if not isinstance(existing_environment, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in existing_environment.items()
+            ):
+                raise StudioError(f"Training profile has an invalid environment: {profile_path}")
+            existing_env_content = _env_bytes(existing_environment)
+            if env_path.exists():
+                if not env_path.is_file() or env_path.read_bytes() != existing_env_content:
+                    raise StudioError(f"Training environment has changed: {version}")
+            else:
+                atomic_write_bytes(env_path, existing_env_content)
+                env_created = True
+            # Deployment/model paths are not part of the immutable dataset
+            # identity. Keep the existing registration byte-for-byte so a
+            # retry can reuse a read-only file left by another container UID.
+            runtime_paths_differ = existing_environment != environment
+            environment = existing_environment
+            profile_content = profile_path.read_bytes()
+            env_content = existing_env_content
         if activate:
             active = {
                 "schema_version": ACTIVE_SCHEMA,
@@ -246,6 +318,9 @@ def write_training_registration(
         "env_path": str(env_path),
         "active_path": str(registry / "active.json") if activate else None,
         "created": profile_created or env_created,
+        "reused_existing": existing_profile is not None,
+        "runtime_paths_differ": runtime_paths_differ,
+        "data_identity": _profile_identity(profile),
         "environment": environment,
     }
 
@@ -335,11 +410,23 @@ def activate_training_version(
             "dataset_snapshot_hash": verified["dataset_snapshot_hash"],
         }
         active_path = registry / "active.json"
-        atomic_write_json(active_path, active)
+        reused_active = False
+        if active_path.is_file():
+            try:
+                current_active = json.loads(active_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise StudioError(f"Cannot read active training pointer {active_path}: {exc}") from exc
+            if current_active == active:
+                reused_active = True
+            else:
+                atomic_write_json(active_path, active)
+        else:
+            atomic_write_json(active_path, active)
     return {
         "status": "active",
         "version": canonical,
         "active_path": str(active_path),
+        "reused_active": reused_active,
     }
 
 
