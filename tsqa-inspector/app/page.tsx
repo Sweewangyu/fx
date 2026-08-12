@@ -90,7 +90,7 @@ type MembersPayload = {
   members: Member[];
 };
 
-type Translation = { input?: string; output?: string };
+type Translation = Record<string, string>;
 
 const CHANNEL_COLORS = [
   "#1f7a69",
@@ -439,11 +439,16 @@ function MetadataGrid({ record }: { record: RecordPayload }) {
   );
 }
 
-function ChoicePanel({ choices, answer }: { choices: RecordPayload["choices"]; answer: string }) {
-  if (!choices || (Array.isArray(choices) && !choices.length)) return null;
-  const entries = Array.isArray(choices)
+function choiceEntries(choices: RecordPayload["choices"]): ReadonlyArray<readonly [string, string]> {
+  if (!choices) return [];
+  return Array.isArray(choices)
     ? choices.map((value, index) => ["ABCDEFG"[index] || String(index + 1), String(value)] as const)
     : Object.entries(choices).map(([key, value]) => [key, String(value)] as const);
+}
+
+function ChoicePanel({ choices, answer, translations }: { choices: RecordPayload["choices"]; answer: string; translations: Translation }) {
+  if (!choices || (Array.isArray(choices) && !choices.length)) return null;
+  const entries = choiceEntries(choices);
   const answerLetter = answer.match(/[A-G]/i)?.[0]?.toUpperCase();
   return (
     <section className="choice-panel">
@@ -451,7 +456,7 @@ function ChoicePanel({ choices, answer }: { choices: RecordPayload["choices"]; a
       <div className="choice-grid">
         {entries.map(([label, value]) => (
           <div className={label.toUpperCase() === answerLetter ? "choice-row choice-row--answer" : "choice-row"} key={label}>
-            <strong>{label}</strong><span>{value}</span>
+            <strong>{label}</strong><div><span>{value}</span>{translations[`choice_${label}`] && <small>{translations[`choice_${label}`]}</small>}</div>
           </div>
         ))}
       </div>
@@ -581,7 +586,10 @@ export default function Home() {
     setTranslationBusy(which);
     setError(null);
     const texts: Record<string, string> = {};
-    if (which === "input" || which === "both") texts.input = record.input;
+    if (which === "input" || which === "both") {
+      texts.input = record.input;
+      choiceEntries(record.choices).forEach(([label, value]) => { texts[`choice_${label}`] = value; });
+    }
     if (which === "output" || which === "both") texts.output = record.output;
     try {
       const payload = await apiJson<{ translations: Translation; cached: boolean }>(`${apiBase}/api/translate`, {
@@ -734,7 +742,7 @@ export default function Home() {
                   onTranslate={() => translate("input")}
                   accent="question"
                 />
-                <ChoicePanel choices={record.choices} answer={record.output} />
+                <ChoicePanel choices={record.choices} answer={record.output} translations={translations} />
                 <TextPanel
                   eyebrow="ASSISTANT / OUTPUT"
                   title="参考答案"

@@ -36,6 +36,7 @@ test("source wires record, template and Qwen translation APIs", async () => {
   assert.match(page, /\/api\/record\?dataset=/);
   assert.match(page, /\/api\/template-members\?dataset=/);
   assert.match(page, /\/api\/translate/);
+  assert.match(page, /choice_\$\{label\}/);
   assert.match(page, /<SeriesChart/);
   assert.match(config, /Qwen3\.6-27B/);
   assert.match(config, /frontend_origin:\s*"\*"/);

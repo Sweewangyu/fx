@@ -113,6 +113,8 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(33, 133, 111
 .choice-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; }
 .choice-row { display: grid; grid-template-columns: 25px 1fr; gap: 9px; align-items: start; padding: 9px 10px; border: 1px solid #e4e8e5; background: #fafbfa; border-radius: 6px; font-size: 10px; line-height: 1.5; }
 .choice-row strong { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 5px; background: #edf1ee; color: #526059; font: 700 10px var(--mono); }
+.choice-row > div { display: flex; flex-direction: column; gap: 4px; }
+.choice-row small { color: var(--green-dark); font-size: 10px; line-height: 1.5; padding-top: 4px; border-top: 1px dashed #cbded7; }
 .choice-row--answer { border-color: #9ccbbd; background: var(--green-soft); }
 .choice-row--answer strong { background: var(--green); color: white; }
 .benchmark-banner { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 1px; overflow: hidden; border: 1px solid #d9d3bd; background: #d9d3bd; border-radius: 8px; }
