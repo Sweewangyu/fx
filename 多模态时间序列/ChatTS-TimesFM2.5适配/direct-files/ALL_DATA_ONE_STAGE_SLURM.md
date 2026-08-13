@@ -64,6 +64,21 @@ training.env
 `/data/hpc/home/yu.wang17/chronos2` 绑定到容器的 `/workspace/chronos2`。
 它不会挂载其他代码仓库。
 
+## Triton/CUDA 缓存隔离
+
+脚本沿用集群上已验证的启动设置：
+
+```text
+singularity run --cleanenv
+LD_PRELOAD=/.singularity.d/libs/libcuda.so.1
+CUDA_HOME=/usr/local/cuda
+HOME=/tmp/chatts_all1_<job-id>/home
+TRITON_CACHE_DIR=/tmp/chatts_all1_<job-id>/triton
+```
+
+因此不会读取宿主机 `/data/hpc/home/yu.wang17/.triton` 中由其他 CUDA Driver
+编译的 `cuda_utils.so`，也不需要删除用户的全局 Triton 缓存。
+
 查看任务：
 
 ```bash
