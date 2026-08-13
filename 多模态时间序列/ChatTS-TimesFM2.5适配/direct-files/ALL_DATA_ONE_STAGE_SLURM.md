@@ -27,8 +27,10 @@
 - 完整 LLM + projector 全参数训练，Chronos-2 backbone 冻结；
 - 保持原 ZeRO-2，8 GPU，global batch 为 `2 × 32 × 8 = 512`。
 
-脚本不会复制大文件，只在任务自己的 `/tmp` 目录创建一个很小的
-`dataset_info.json`，其中的绝对路径直接指向上述六个 JSONL。
+脚本会在任务自己的 `/tmp/chatts_all1_<job-id>/dataset_registry/data` 中流式生成六个训练
+视图，只保留 `input`、`timeseries`、`output` 三列。行数和内容一一保留，不做筛选或采样。
+这样可以避开 annotated 附加字段中 `null`/字符串混合导致的 Arrow `string to null` 错误。
+临时训练视图需要与这六个三列 JSONL 大致相当的本地磁盘空间，任务结束后由节点清理。
 
 训练启动前会逐文件统计行数并打印总数。默认要求至少 400,000 条：如果仍然只找到约
 180,000 条，会在 DeepSpeed 启动前失败，不会消耗 GPU 进行错误实验。
@@ -74,7 +76,8 @@ Raw total rows:   5xxxxx
    tsaqa                     ...
 ```
 
-Trainer 的 `Num examples` 应接近这里打印的 `Raw total rows`。如果两者仍有差距，查看日志中
+由于保持原参数 `val_size=0.05`，Trainer 的训练 `Num examples` 应接近这里打印的
+`Raw total rows × 0.95`。如果差距明显更大，查看日志中
 的 `Dropped invalid example`、`Dropped lengthy example` 和 `[drop mismatch]`；那表示样本在
 ChatTS tokenizer/时序占位符校验阶段无效，而不是再次发生 quality/difficulty 筛选。
 

@@ -40,8 +40,11 @@ MASTER_PORT="${MASTER_PORT:-19901}"
 
 mkdir -p "$(dirname "$OUTPUT_DIR")" "$RUNTIME_DATASET_DIR"
 
-# Create only a tiny LLaMAFactory registry. The 500K source rows are not
-# copied: dataset_info.json points directly to the six unfiltered JSONL files.
+# Build six schema-stable training views containing only the three columns that
+# LLaMAFactory consumes.  The annotated sources contain optional audit fields
+# whose values can change from null to string in later Arrow chunks; pointing
+# datasets directly at those files can therefore fail with "string to null".
+# This is a column projection only: no row is filtered or sampled.
 PREPARED_JSON="$(python3 - "$RAW_DATASET_ROOT" "$RUNTIME_DATASET_DIR" "$SELECT_DATASETS" "$MIN_TOTAL_ROWS" <<'PY'
 import json
 import sys
@@ -81,20 +84,65 @@ else:
             if name not in source_names:
                 source_names.append(name)
 
+data_root = runtime_root / "data"
+data_root.mkdir(parents=True, exist_ok=True)
 dataset_info = {}
 counts = {}
+source_paths = {}
+prepared_paths = {}
 for source_name in source_names:
     path = raw_root / f"{source_name}.jsonl"
     if not path.is_file():
         raise SystemExit(f"Full source dataset not found: {path}")
-    with path.open("rb") as stream:
-        rows = sum(1 for line in stream if line.strip())
+    prepared_path = data_root / f"{source_name}.jsonl"
+    temporary_path = prepared_path.with_suffix(".jsonl.tmp")
+    rows = 0
+    try:
+        with path.open("r", encoding="utf-8") as source, temporary_path.open(
+            "w", encoding="utf-8"
+        ) as target:
+            for line_number, line in enumerate(source, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(f"Invalid JSON at {path}:{line_number}: {exc}") from exc
+                if not isinstance(record, dict):
+                    raise SystemExit(f"JSON row is not an object at {path}:{line_number}")
+                missing = [name for name in ("input", "timeseries", "output") if name not in record]
+                if missing:
+                    raise SystemExit(f"Missing {missing} at {path}:{line_number}")
+                if not isinstance(record["input"], str) or not isinstance(record["output"], str):
+                    raise SystemExit(f"input/output must be strings at {path}:{line_number}")
+                if not isinstance(record["timeseries"], list):
+                    raise SystemExit(f"timeseries must be a list at {path}:{line_number}")
+                projected = {
+                    "input": record["input"],
+                    "timeseries": record["timeseries"],
+                    "output": record["output"],
+                }
+                target.write(
+                    json.dumps(
+                        projected,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                rows += 1
+        temporary_path.replace(prepared_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
     if rows == 0:
         raise SystemExit(f"Full source dataset is empty: {path}")
     key = f"full_{source_name}"
     counts[source_name] = rows
+    source_paths[source_name] = str(path)
+    prepared_paths[source_name] = str(prepared_path)
     dataset_info[key] = {
-        "file_name": str(path),
+        "file_name": str(prepared_path),
         "columns": {
             "prompt": "input",
             "response": "output",
@@ -115,6 +163,8 @@ if total < minimum:
 result = {
     "dataset_keys": list(dataset_info),
     "source_counts": counts,
+    "source_paths": source_paths,
+    "prepared_paths": prepared_paths,
     "total_rows": total,
     "dataset_info": str(runtime_root / "dataset_info.json"),
 }
@@ -142,6 +192,7 @@ for name, rows in json.loads(sys.argv[1])["source_counts"].items():
     print(f"   {name:<24} {rows:>10,}")
 PY
 echo " Output:           $OUTPUT_DIR"
+echo " Training views:   $RUNTIME_DATASET_DIR/data (input,timeseries,output only)"
 echo " Epochs:           1"
 echo " Mix strategy:     concat"
 echo " LLM LR:           $LEARNING_RATE"
