@@ -41,6 +41,9 @@ mkdir -p log
 # 确认镜像路径
 ls -lh /data/hpc/home/yu.wang17/chatts_v1.sif
 
+# 确认本地 Chronos-2 权重；若路径不同，修改 sbatch 中的 HOST_CHRONOS2_PATH
+ls -lh /data/hpc/home/yu.wang17/chronos2
+
 # 确认当前激活的数据版本
 cat data/studio_versions/active.json
 
@@ -57,7 +60,9 @@ training.env
 ```
 
 训练数据、基础模型和输出均在 `/share`，因此容器命令显式使用
-`--bind /share:/share`。它不会挂载其他代码仓库。
+`--bind /share:/share`。Chronos-2 另行从宿主机
+`/data/hpc/home/yu.wang17/chronos2` 绑定到容器的 `/workspace/chronos2`。
+它不会挂载其他代码仓库。
 
 查看任务：
 

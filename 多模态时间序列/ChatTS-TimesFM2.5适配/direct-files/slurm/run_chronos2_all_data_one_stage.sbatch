@@ -15,9 +15,12 @@ HOST_ROOT=/data/hpc/home/yu.wang17
 TRAINING_DIR=$HOST_ROOT/ChatTS-Training
 SIF_IMAGE=$HOST_ROOT/chatts_v1.sif
 
-# 按服务器上的真实路径确认下面三项即可。
+# Chronos-2 权重在宿主机的实际目录。若你的目录名不同，只修改这一行。
+HOST_CHRONOS2_PATH="${HOST_CHRONOS2_PATH:-$HOST_ROOT/chronos2}"
+CONTAINER_CHRONOS2_PATH=/workspace/chronos2
+
+# 按服务器上的真实路径确认下面几项即可。
 MODEL_PATH=/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B
-CHRONOS2_MODEL_PATH=/workspace/chronos2
 OUTPUT_DIR=/share/airesearch/data/finiverse/output/ChatTS-all-data-one-stage/seed42-${SLURM_JOB_ID}
 
 # 可选：chatts、time-mqa、tsqa、all。
@@ -53,17 +56,31 @@ done
     echo "Base model config not found on host: $MODEL_PATH/config.json" >&2
     exit 1
 }
+[[ -d "$HOST_CHRONOS2_PATH" ]] || {
+    echo "Chronos-2 model directory not found on host: $HOST_CHRONOS2_PATH" >&2
+    echo "Edit HOST_CHRONOS2_PATH in this sbatch file to its real host path." >&2
+    exit 1
+}
+
+# New Apptainer versions prefer APPTAINER_TMPDIR. Preserve the configured
+# directory while avoiding the deprecated-variable warning.
+if [[ -n "${SINGULARITY_TMPDIR:-}" && -z "${APPTAINER_TMPDIR:-}" ]]; then
+    export APPTAINER_TMPDIR="$SINGULARITY_TMPDIR"
+    unset SINGULARITY_TMPDIR
+fi
 
 echo "Dataset snapshot: $DATASET_DIR"
 echo "Dataset selection: $SELECT_DATASETS"
+echo "Chronos-2 host:    $HOST_CHRONOS2_PATH"
 echo "Model output:      $OUTPUT_DIR"
 
 srun singularity exec --nv \
     --bind "$TRAINING_DIR:/workspace/ChatTS-Training" \
+    --bind "$HOST_CHRONOS2_PATH:$CONTAINER_CHRONOS2_PATH" \
     --bind /share:/share \
     --pwd /workspace/ChatTS-Training \
     --env MODEL_PATH="$MODEL_PATH" \
-    --env CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
+    --env CHRONOS2_MODEL_PATH="$CONTAINER_CHRONOS2_PATH" \
     --env DATASET_DIR="$DATASET_DIR" \
     --env OUTPUT_DIR="$OUTPUT_DIR" \
     --env SELECT_DATASETS="$SELECT_DATASETS" \
