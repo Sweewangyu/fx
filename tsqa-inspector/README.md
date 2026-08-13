@@ -51,7 +51,9 @@ data:
   registry: ../datataste/data/versions/datav2/sources.json
   template_stats: ../SFT_CURATOR/template_stats.json
   annotations_dir: ../SFT_CURATOR/merged_labels/annotations
-  tsrbench_root: ../TSRBench/dataset
+  tsrbench_root:
+    - ../TSRBench/dataset
+    - ../TSRBenchmark/dataset
 
 qwen:
   base_url: http://10.112.164.1:30001/v1
@@ -65,13 +67,33 @@ qwen:
 
 ```text
 perception/perception.jsonl
-reasoning/causal_reasoning.jsonl
+reasoning/causal_reasoning/causal_reasoning.jsonl
 prediction/time_series_forecasting.jsonl
 decision/quantitative_decision.jsonl
 ```
 
 服务会递归发现存在的任务文件；未下载 TSRBench 时不会报错，也不会影响训练集浏览。评测数据只作
 查看，页面会明确标记为 `evaluation_only`，不会并入 DataTaste 训练来源。
+
+官方 GitHub 仓库本身不提交数据文件，需要先在服务器下载：
+
+```bash
+git clone https://github.com/tianyi-lab/TSRBench.git /workspace/TSRBench
+cd /workspace/TSRBench
+python3 -m pip install huggingface_hub
+python3 download_data.py
+```
+
+官方脚本下载的是 Hugging Face `ParadiseYu/TSRBench`，完成后应生成
+`/workspace/TSRBench/dataset`。如果数据已放在其他位置，不必移动：
+
+```bash
+export TSRBENCH_ROOT=/实际目录/TSRBench/dataset
+./run_local.sh
+```
+
+启动服务时才读取路径配置；修改 YAML 或环境变量后需要重启 `run_local.sh`。TSRBench 筛选页会
+直接显示路径未找到或任务文件未匹配，不再以空白列表误导为“0条数据”。
 
 如果 Qwen 需要密钥：
 
@@ -82,6 +104,10 @@ export DT_QWEN_API_KEY='...'
 浏览器不会直接访问 Qwen，也不会接触密钥；翻译由 `server.py` 代理并缓存到
 `.cache/translations.sqlite`。服务端调用会显式绕过系统 HTTP 代理，适合当前集群上的私网 Qwen
 地址。
+
+若模型网关返回 HTTP 400，服务会自动使用较保守的 `max_tokens=1024` 并移除可选的
+`response_format` 参数重试一次；若仍失败，页面会显示模型服务返回的具体错误正文，而不再只显示
+`Bad Request`。
 
 ## 首次索引
 

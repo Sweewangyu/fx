@@ -151,6 +151,32 @@ class InspectorServerTest(unittest.TestCase):
             self.assertEqual(missing_event["series_count"], 2)
             self.assertEqual(missing_event["series_names"], ["wp_Team A", "wp_Team B"])
             self.assertEqual(missing_event["choices"], ["Turnover", "Timeout"])
+            self.assertTrue(store.tsrbench_status["found"])
+            self.assertEqual(store.tsrbench_status["tasks_found"], 2)
+
+    def test_tsrbench_missing_root_has_explicit_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root = root / "data"
+            data_root.mkdir()
+            (data_root / "sources.json").write_text('{"sources": []}', encoding="utf-8")
+            config = {
+                "data": {
+                    "root": "data",
+                    "registry": "data/sources.json",
+                    "tsrbench_root": ["missing-one/dataset", "missing-two/dataset"],
+                },
+                "qwen": {"base_url": "http://localhost:1/v1", "model": "fixture", "allow_no_key": True},
+                "server": {"cache_dir": "cache"},
+            }
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+            store = server.DatasetStore(config_path)
+            payload = store.datasets()
+            self.assertFalse(payload["tsrbench"]["found"])
+            self.assertEqual(payload["tsrbench"]["tasks_found"], 0)
+            self.assertIn(str((root / "missing-one" / "dataset").resolve()), payload["tsrbench"]["checked_paths"])
 
     def test_qwen_translation_proxy_and_cache(self):
         requests = []
@@ -204,6 +230,62 @@ class InspectorServerTest(unittest.TestCase):
                 self.assertTrue(second["cached"])
                 self.assertEqual(len(requests), 1)
                 self.assertEqual(requests[0]["response_format"], {"type": "json_object"})
+        finally:
+            qwen_server.shutdown()
+            qwen_server.server_close()
+            thread.join(timeout=2)
+
+    def test_qwen_http_400_uses_compatibility_retry(self):
+        requests = []
+
+        class StrictQwenHandler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):  # noqa: N802
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.append(body)
+                if "response_format" in body:
+                    encoded = b'{"error":{"message":"response_format is unsupported"}}'
+                    self.send_response(400)
+                else:
+                    encoded = json.dumps(
+                        {"choices": [{"message": {"content": '{"input":"兼容译文"}'}}]}
+                    ).encode()
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        qwen_server = ThreadingHTTPServer(("127.0.0.1", 0), StrictQwenHandler)
+        thread = threading.Thread(target=qwen_server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                data_root = root / "data"
+                data_root.mkdir()
+                (data_root / "sources.json").write_text('{"sources": []}', encoding="utf-8")
+                config = {
+                    "data": {"root": "data", "registry": "data/sources.json"},
+                    "qwen": {
+                        "base_url": f"http://127.0.0.1:{qwen_server.server_port}/v1",
+                        "model": "strict-qwen",
+                        "allow_no_key": True,
+                        "max_tokens": 8192,
+                    },
+                    "server": {"cache_dir": "cache"},
+                }
+                config_path = root / "config.yaml"
+                config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+                result = server.DatasetStore(config_path).translate({"input": "Translate."})
+
+                self.assertEqual(result["translations"]["input"], "兼容译文")
+                self.assertEqual(len(requests), 2)
+                self.assertIn("response_format", requests[0])
+                self.assertNotIn("response_format", requests[1])
+                self.assertEqual(requests[1]["max_tokens"], 1024)
         finally:
             qwen_server.shutdown()
             qwen_server.server_close()

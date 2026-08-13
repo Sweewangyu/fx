@@ -419,6 +419,14 @@ class DatasetStore:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_chart_points = int(server.get("max_chart_points", 900))
         self.template_page_size = int(server.get("template_page_size", 12))
+        self.tsrbench_status: Dict[str, Any] = {
+            "configured": False,
+            "found": False,
+            "root": None,
+            "checked_paths": [],
+            "tasks_found": 0,
+            "tasks_expected": len(TSRBENCH_TASKS),
+        }
         self.sources = self._load_sources()
         self.template_stats = self._load_template_stats()
         self._locks: Dict[str, threading.Lock] = {name: threading.Lock() for name in self.sources}
@@ -448,11 +456,46 @@ class DatasetStore:
     def _load_tsrbench_sources(self, result: Dict[str, Source]) -> None:
         data_config = self.config.get("data") or {}
         configured = data_config.get("tsrbench_root")
-        if not configured:
+        env_root = os.getenv("TSRBENCH_ROOT", "").strip()
+        candidates = []
+        if env_root:
+            candidates.append(resolve_path(self.config_path.parent, env_root))
+        if configured:
+            values = configured if isinstance(configured, list) else [configured]
+            candidates.extend(resolve_path(self.config_path.parent, value) for value in values)
+
+        # Also recognize common layouts when the project was copied next to,
+        # inside, or above the official TSRBench repository.
+        base = self.config_path.parent
+        candidates.extend(
+            [
+                base / "dataset",
+                base / "TSRBench" / "dataset",
+                base.parent / "TSRBench" / "dataset",
+                base.parent / "TSRBenchmark" / "dataset",
+                base.parent / "tsrbench" / "dataset",
+                base.parent.parent / "TSRBench" / "dataset",
+                base.parent.parent / "TSRBenchmark" / "dataset",
+                Path("/workspace/TSRBench/dataset"),
+                Path("/workspace/TSRBenchmark/dataset"),
+            ]
+        )
+        unique_candidates = []
+        seen = set()
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            key = str(resolved)
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append(resolved)
+
+        self.tsrbench_status["configured"] = bool(env_root or configured)
+        self.tsrbench_status["checked_paths"] = [str(path) for path in unique_candidates]
+        root = next((path for path in unique_candidates if path.is_dir()), None)
+        if root is None:
             return
-        root = resolve_path(self.config_path.parent, configured)
-        if not root.is_dir():
-            return
+        self.tsrbench_status["found"] = True
+        self.tsrbench_status["root"] = str(root)
         by_stem = {path.stem: path for path in root.rglob("*.jsonl") if path.is_file()}
         for task, (relative, major) in TSRBENCH_TASKS.items():
             expected = root / relative
@@ -471,6 +514,7 @@ class DatasetStore:
                 schema="tsrbench",
                 benchmark_task=task,
             )
+            self.tsrbench_status["tasks_found"] += 1
 
     def _load_template_stats(self) -> Dict[str, Dict[str, Any]]:
         if not self.template_stats_path.is_file():
@@ -671,7 +715,11 @@ class DatasetStore:
                     "benchmark_task": source.benchmark_task,
                 }
             )
-        return {"datasets": rows, "qwen": self.qwen_public_config()}
+        return {
+            "datasets": rows,
+            "qwen": self.qwen_public_config(),
+            "tsrbench": self.tsrbench_status,
+        }
 
     def qwen_public_config(self) -> Dict[str, Any]:
         qwen = self.config.get("qwen") or {}
@@ -895,15 +943,52 @@ class DatasetStore:
             headers=headers,
             method="POST",
         )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+        def submit(current_request: urllib.request.Request) -> Dict[str, Any]:
+            try:
+                with opener.open(
+                    current_request,
+                    timeout=float(qwen.get("timeout_seconds", 180)),
+                ) as response:
+                    parsed = json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace").strip()
+                message = f"Qwen HTTP {exc.code}: {details[:1600] or exc.reason}"
+                raise RuntimeError(message) from exc
+            except urllib.error.URLError as exc:
+                raise RuntimeError(f"Qwen request failed: {exc.reason}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("Qwen response is not a JSON object")
+            return parsed
+
         try:
             # Cluster deployments commonly set a global HTTP proxy that cannot
             # route private model-service addresses. Match the existing
             # annotation scripts' NO_PROXY behavior explicitly here.
-            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=float(qwen.get("timeout_seconds", 180))) as response:
-                response_payload = json.loads(response.read())
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Qwen request failed: {exc}") from exc
+            response_payload = submit(request)
+        except RuntimeError as primary_error:
+            # Some OpenAI-compatible vLLM gateways reject response_format, or
+            # reject a requested completion budget larger than their deployed
+            # context limit. Retry once with the conservative settings already
+            # used successfully by the taxonomy annotation command.
+            if "Qwen HTTP 400:" not in str(primary_error) or not bool(qwen.get("compatibility_retry", True)):
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            fallback_payload["max_tokens"] = min(int(payload["max_tokens"]), 1024)
+            fallback_request = urllib.request.Request(
+                base_url + "/chat/completions",
+                data=compact_json(fallback_payload),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                response_payload = submit(fallback_request)
+            except RuntimeError as fallback_error:
+                raise RuntimeError(
+                    f"{fallback_error}（兼容重试仍失败；首次错误：{primary_error}）"
+                ) from fallback_error
         content = response_payload["choices"][0]["message"].get("content", "")
         if content.startswith("```"):
             content = "\n".join(content.splitlines()[1:-1]).strip()
@@ -958,7 +1043,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         try:
             if parsed.path == "/api/health":
-                self._json({"ok": True, "datasets": len(self.store.sources), "qwen": self.store.qwen_public_config()})
+                self._json({
+                    "ok": True,
+                    "datasets": len(self.store.sources),
+                    "qwen": self.store.qwen_public_config(),
+                    "tsrbench": self.store.tsrbench_status,
+                })
             elif parsed.path == "/api/datasets":
                 self._json(self.store.datasets())
             elif parsed.path == "/api/record":

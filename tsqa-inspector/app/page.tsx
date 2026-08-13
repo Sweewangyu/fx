@@ -92,6 +92,15 @@ type MembersPayload = {
 
 type Translation = Record<string, string>;
 
+type TsrbenchStatus = {
+  configured: boolean;
+  found: boolean;
+  root: string | null;
+  checked_paths: string[];
+  tasks_found: number;
+  tasks_expected: number;
+};
+
 const CHANNEL_COLORS = [
   "#1f7a69",
   "#d97745",
@@ -482,13 +491,15 @@ export default function Home() {
   const [apiDraft, setApiDraft] = useState("http://localhost:8765");
   const [serverOk, setServerOk] = useState(false);
   const [qwenModel, setQwenModel] = useState("");
+  const [tsrbenchStatus, setTsrbenchStatus] = useState<TsrbenchStatus | null>(null);
   const [activeTab, setActiveTab] = useState<"record" | "template" | "raw">("record");
 
   const loadDatasets = useCallback(async () => {
     try {
-      const payload = await apiJson<{ datasets: Dataset[]; qwen: { model: string } }>(`${apiBase}/api/datasets`);
+      const payload = await apiJson<{ datasets: Dataset[]; qwen: { model: string }; tsrbench: TsrbenchStatus }>(`${apiBase}/api/datasets`);
       setDatasets(payload.datasets);
       setQwenModel(payload.qwen.model || "");
+      setTsrbenchStatus(payload.tsrbench);
       setServerOk(true);
       setError(null);
       setDatasetName((current) => payload.datasets.some((item) => item.name === current)
@@ -635,6 +646,15 @@ export default function Home() {
 
         <nav className="dataset-nav" aria-label="数据集">
           <div className="dataset-nav__title"><span>数据集</span><small>{filteredDatasets.length}</small></div>
+          {familyFilter === "tsrbench" && filteredDatasets.length === 0 && tsrbenchStatus && (
+            <div className="dataset-empty">
+              <strong>{tsrbenchStatus.found ? "没有发现标准任务文件" : "TSRBench路径未找到"}</strong>
+              <p>{tsrbenchStatus.found
+                ? `已找到目录，但12个任务文件均未匹配：${tsrbenchStatus.root}`
+                : "请设置 inspector_config.yaml 的 tsrbench_root，或在启动前设置 TSRBENCH_ROOT。"}</p>
+              {!tsrbenchStatus.found && tsrbenchStatus.checked_paths[0] && <code>{tsrbenchStatus.checked_paths[0]}</code>}
+            </div>
+          )}
           {filteredDatasets.map((dataset) => (
             <button
               type="button"

@@ -11,7 +11,12 @@ data:
 
   # Optional official TSRBench root. The inspector discovers all available
   # task JSONL files recursively. Missing roots are simply ignored.
-  tsrbench_root: ../TSRBench/dataset
+  # 官方仓库运行 download_data.py 后生成 dataset/。这里支持候选路径；
+  # 也可启动前 export TSRBENCH_ROOT=/实际绝对路径/dataset 覆盖。
+  tsrbench_root:
+    - ../TSRBench/dataset
+    - ../TSRBenchmark/dataset
+    - ../ChatTS-Training/TSRBench/dataset
 
 qwen:
   base_url: http://10.112.164.1:30001/v1
@@ -19,7 +24,10 @@ qwen:
   api_key_env: DT_QWEN_API_KEY
   allow_no_key: true
   timeout_seconds: 180
-  max_tokens: 8192
+  # 当前Qwen服务的标注脚本使用1024；翻译先给2048，HTTP 400时自动降至
+  # 1024并去掉response_format兼容参数重试一次。
+  max_tokens: 2048
+  compatibility_retry: true
 
 server:
   host: 0.0.0.0
