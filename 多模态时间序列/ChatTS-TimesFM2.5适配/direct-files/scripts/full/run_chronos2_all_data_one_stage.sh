@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Six unfiltered source datasets, one stage, one epoch, full-parameter SFT.
 
-PROJECT_ROOT="${PROJECT_ROOT:-/workspace/ChatTS-Training}"
+PROJECT_ROOT="/workspace/ChatTS-Training"
 MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the ChatTS base model}"
 CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
 OUTPUT_DIR="${OUTPUT_DIR:?Set OUTPUT_DIR}"
@@ -14,9 +14,6 @@ MIN_TOTAL_ROWS="${MIN_TOTAL_ROWS:-400000}"
 
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 TIMESERIES_SFT_LR="${TIMESERIES_SFT_LR:-$LEARNING_RATE}"
-CUTOFF_LEN="${CUTOFF_LEN:-10000}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-64}"
 SEED="${SEED:-42}"
 MASTER_PORT="${MASTER_PORT:-19901}"
 
@@ -146,10 +143,7 @@ for name, rows in json.loads(sys.argv[1])["source_counts"].items():
 PY
 echo " Output:           $OUTPUT_DIR"
 echo " Epochs:           1"
-echo " Validation:       disabled; every valid row participates in training"
 echo " Mix strategy:     concat"
-echo " Cutoff length:    $CUTOFF_LEN"
-echo " Global batch:     $((PER_DEVICE_TRAIN_BATCH_SIZE * 8 * GRADIENT_ACCUMULATION_STEPS))"
 echo " LLM LR:           $LEARNING_RATE"
 echo " Projector LR:     $TIMESERIES_SFT_LR"
 echo "============================================================"
@@ -157,7 +151,7 @@ echo "============================================================"
 cd "$PROJECT_ROOT"
 NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 \
 deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port="$MASTER_PORT" src/train.py \
-    --deepspeed ds_config/ds_config_3.json \
+    --deepspeed ds_config/ds_config_2.json \
     --stage sft \
     --model_name_or_path "$MODEL_PATH" \
     --ts_encoder_type chronos2 \
@@ -169,78 +163,45 @@ deepspeed --include localhost:0,1,2,3,4,5,6,7 --master_port="$MASTER_PORT" src/t
     --template chatts \
     --finetuning_type full \
     --output_dir "$OUTPUT_DIR" \
-    --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
-    --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 32 \
     --learning_rate "$LEARNING_RATE" \
     --timeseries_sft_lr "$TIMESERIES_SFT_LR" \
     --lr_scheduler_type cosine \
     --warmup_ratio 0.02 \
     --num_train_epochs 1 \
     --logging_steps 1 \
-    --save_strategy no \
+    --save_strategy steps \
+    --save_steps 200 \
+    --save_total_limit 1 \
     --plot_loss \
     --bf16 \
+    --save_only_model False \
     --save_safetensors False \
     --preprocessing_num_workers 32 \
     --overwrite_cache \
     --trust_remote_code True \
     --flash_attn fa2 \
-    --cutoff_len "$CUTOFF_LEN" \
-    --val_size 0 \
-    --eval_strategy no \
-    --load_best_model_at_end False \
+    --cutoff_len 2048 \
+    --val_size 0.05 \
+    --per_device_eval_batch_size 2 \
+    --eval_strategy steps \
+    --eval_steps 200 \
+    --load_best_model_at_end True \
+    --metric_for_best_model eval_loss \
+    --greater_is_better False \
     --seed "$SEED" \
     --data_seed "$SEED" \
     --report_to tensorboard \
     --logging_dir "$OUTPUT_DIR/tensorboard"
 
-# This experiment has no validation split: the root export is the final model
-# after exactly one epoch, not a validation-selected "best" checkpoint.
-python3 - "$OUTPUT_DIR" "$CHRONOS2_MODEL_PATH" "$MODEL_PATH" "$TOTAL_ROWS" "$SELECT_DATASETS" "$CUTOFF_LEN" "$PER_DEVICE_TRAIN_BATCH_SIZE" "$GRADIENT_ACCUMULATION_STEPS" "$RAW_DATASET_ROOT" "$PREPARED_JSON" <<'PY'
-import json
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-output = Path(sys.argv[1]).resolve()
-config_path = output / "config.json"
-config = json.loads(config_path.read_text(encoding="utf-8"))
-config["ts_encoder_type"] = "chronos2"
-config["chronos2_model_name_or_path"] = sys.argv[2]
-config["chronos2_hidden_size"] = 768
-ts_config = config.setdefault("ts", {})
-ts_config["patch_size"] = 16
-config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-prepared = json.loads(sys.argv[10])
-manifest = {
-    "schema_version": "chatts-full-data-one-stage-v2",
-    "status": "complete",
-    "experiment": "unfiltered-six-source-one-stage-sft",
-    "completed_at_utc": datetime.now(timezone.utc).isoformat(),
-    "output_dir": str(output),
-    "input_model_dir": sys.argv[3],
-    "raw_dataset_root": sys.argv[9],
-    "raw_source_rows": int(sys.argv[4]),
-    "raw_source_counts": prepared["source_counts"],
-    "dataset_keys": prepared["dataset_keys"],
-    "selection": sys.argv[5],
-    "epochs": 1,
-    "validation_size": 0,
-    "checkpoint_selection": "final_epoch",
-    "mix_strategy": "concat",
-    "cutoff_len": int(sys.argv[6]),
-    "per_device_train_batch_size": int(sys.argv[7]),
-    "gradient_accumulation_steps": int(sys.argv[8]),
-    "global_batch_size": int(sys.argv[7]) * 8 * int(sys.argv[8]),
-    "deepspeed": "ds_config/ds_config_3.json",
-    "finetuning_type": "full",
-    "ts_encoder_type": "chronos2",
-    "chronos2_model_name_or_path": sys.argv[2],
-}
-(output / "TRAINING_COMPLETE.json").write_text(
-    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-)
-PY
+python3 scripts/finalize_chatts_best_checkpoint.py \
+    --checkpoint-dir "$OUTPUT_DIR" \
+    --stage stage1 \
+    --seed "$SEED" \
+    --learning-rate "$LEARNING_RATE" \
+    --chronos2-model-path "$CHRONOS2_MODEL_PATH" \
+    --input-model-dir "$MODEL_PATH" \
+    --cleanup-checkpoints
 
 echo "Full-data training completed: $OUTPUT_DIR"

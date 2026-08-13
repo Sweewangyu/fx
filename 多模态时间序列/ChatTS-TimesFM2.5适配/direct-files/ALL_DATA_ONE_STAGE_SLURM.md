@@ -22,12 +22,10 @@
 - 单阶段 `concat`；
 - 不传 `interleave_probs`；
 - `1 epoch`；
-- `val_size=0`，不划出 5% validation；
-- `eval_strategy=no`；
-- `cutoff_len=10000`，避免旧配置中的 `2048` 让预处理器直接丢弃大量长样本；
-- 保存完整一轮结束时的最终模型；
+- 保持原训练参数：`val_size=0.05`、每 200 steps 评测并按 `eval_loss` 加载最佳 checkpoint；
+- 保持原 `cutoff_len=2048`；
 - 完整 LLM + projector 全参数训练，Chronos-2 backbone 冻结；
-- ZeRO-3，8 GPU，global batch 为 `1 × 64 × 8 = 512`。
+- 保持原 ZeRO-2，8 GPU，global batch 为 `2 × 32 × 8 = 512`。
 
 脚本不会复制大文件，只在任务自己的 `/tmp` 目录创建一个很小的
 `dataset_info.json`，其中的绝对路径直接指向上述六个 JSONL。
@@ -74,7 +72,6 @@ Raw total rows:   5xxxxx
    chatts_sft                ...
    time_mqa                  ...
    tsaqa                     ...
-Validation:       disabled; every valid row participates in training
 ```
 
 Trainer 的 `Num examples` 应接近这里打印的 `Raw total rows`。如果两者仍有差距，查看日志中
