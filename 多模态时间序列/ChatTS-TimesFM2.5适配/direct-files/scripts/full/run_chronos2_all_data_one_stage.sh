@@ -8,6 +8,9 @@ MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the ChatTS base model}"
 CHRONOS2_MODEL_PATH="${CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
 DATASET_DIR="${DATASET_DIR:?Set DATASET_DIR to a Dataset Studio snapshot}"
 OUTPUT_DIR="${OUTPUT_DIR:?Set OUTPUT_DIR}"
+# Supported selectors: chatts, time-mqa, tsqa, all. The default is exactly
+# ChatTS' four original datasets plus Time-MQA and TSQA.
+SELECT_DATASETS="${SELECT_DATASETS:-chatts,time-mqa,tsqa}"
 
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 TIMESERIES_SFT_LR="${TIMESERIES_SFT_LR:-$LEARNING_RATE}"
@@ -35,9 +38,11 @@ MASTER_PORT="${MASTER_PORT:-19901}"
     exit 2
 }
 
-# Read the exact dataset keys exported by Dataset Studio, then combine both
-# stages in first-seen order. No interleave probabilities are passed.
-ALL_DATASETS="$(python3 - "$DATASET_DIR/training.env" <<'PY'
+# Resolve short selectors to the exact versioned keys exported by Dataset
+# Studio. The ChatTS recipe intentionally selects each source from its
+# canonical stage so the same source is not included twice across stages.
+ALL_DATASETS="$(python3 - "$DATASET_DIR/training.env" "$DATASET_DIR/dataset_info.json" "$SELECT_DATASETS" <<'PY'
+import json
 import shlex
 import sys
 from pathlib import Path
@@ -49,13 +54,69 @@ for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
         key, value = fields[0].split("=", 1)
         values[key] = value
 
+info = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+selectors = [item.strip().lower() for item in sys.argv[3].split(",") if item.strip()]
+if not selectors:
+    raise SystemExit("SELECT_DATASETS must not be empty")
+
+available = []
+for variable in ("STAGE1_DATASETS", "STAGE2_DATASETS"):
+    for key in values.get(variable, "").split(","):
+        if not key or key in available:
+            continue
+        details = info.get(key)
+        if not isinstance(details, dict) or not isinstance(details.get("file_name"), str):
+            raise SystemExit(f"Invalid dataset_info entry: {key}")
+        relative = Path(details["file_name"])
+        available.append(key)
+
+recipes = {
+    "chatts": [
+        ("stage1", "chatts_align_256"),
+        ("stage1", "chatts_ift"),
+        ("stage2", "chatts_align_random"),
+        ("stage2", "chatts_sft"),
+    ],
+    "time-mqa": [("stage2", "time_mqa")],
+    "time_mqa": [("stage2", "time_mqa")],
+    "tsqa": [("stage2", "tsaqa")],
+    "tsaqa": [("stage2", "tsaqa")],
+}
+
+if "all" in selectors:
+    if len(selectors) != 1:
+        raise SystemExit("SELECT_DATASETS=all cannot be combined with other selectors")
+    print(",".join(available))
+    raise SystemExit(0)
+
+requested = []
+for selector in selectors:
+    try:
+        pairs = recipes[selector]
+    except KeyError as exc:
+        raise SystemExit(
+            f"Unknown dataset selector {selector!r}; use chatts,time-mqa,tsqa or all"
+        ) from exc
+    for pair in pairs:
+        if pair not in requested:
+            requested.append(pair)
+
 names = []
-for key in ("STAGE1_DATASETS", "STAGE2_DATASETS"):
-    for name in values.get(key, "").split(","):
-        if name and name not in names:
-            names.append(name)
-if not names:
-    raise SystemExit("training.env contains no Stage1/Stage2 dataset keys")
+missing = []
+for stage, source in requested:
+    matches = []
+    for key in available:
+        relative = Path(info[key]["file_name"])
+        if relative.parent.name == stage and relative.stem == source:
+            matches.append(key)
+    if len(matches) != 1:
+        missing.append(f"{stage}/{source}")
+    else:
+        names.append(matches[0])
+if missing:
+    raise SystemExit(
+        "Current Dataset Studio snapshot lacks required datasets: " + ", ".join(missing)
+    )
 print(",".join(names))
 PY
 )"
@@ -66,6 +127,7 @@ echo "============================================================"
 echo " ChatTS Chronos-2 all-data one-stage training"
 echo " Base model:    $MODEL_PATH"
 echo " Dataset dir:   $DATASET_DIR"
+echo " Selection:     $SELECT_DATASETS"
 echo " Datasets:      $ALL_DATASETS"
 echo " Output:        $OUTPUT_DIR"
 echo " Epochs:        1"
