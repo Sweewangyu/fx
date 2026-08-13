@@ -172,7 +172,23 @@ CONFIG_FILE=<studio-generated.yaml> bash ../ChatTS/scripts/run_train_then_eval.s
 当模型目录名含 `8B`、`4B`、`1.7B` 等参数量时，页面和服务端会同步替换
 `model_output_base` 与 `model_name_base` 中最后一个参数量标记。例如把基础模型从
 `ChatTS-Qwen3-8B` 改成 `ChatTS-Qwen3-4B`，会将输出从
-`ChatTS-msxf-8B-datav3` 自动改为 `ChatTS-msxf-4B-datav3`；数据版本和 seed 规则保持不变。
+`ChatTS-msxf-8B-datav3` 自动改为 `ChatTS-msxf-4B-datav3`。
+
+模型不会再仅按“数据版本 + seed”共用一个目录。Studio 会对数据快照、基础模型、Chronos-2、
+seed、GPU 拓扑以及 Stage1/Stage2 的全部训练参数计算稳定的 `training_recipe_hash`，输出结构为：
+
+```text
+ChatTS-msxf-8B-datav3/
+└── experiments/
+    └── recipe-0123456789abcdef/
+        ├── .stage1_seed42_s1lr_1e-5/
+        ├── best_seed42/
+        └── logs/
+```
+
+修改学习率、epoch、batch、混合策略等训练参数会生成新的 recipe 目录，不会覆盖旧权重；只改
+评测参数、勾选强制评测或强制重训不会改变 recipe 身份。相同训练配方默认复用已完成模型，
+“强制重训当前配方”只清理并重建当前 recipe 目录中的 Stage1/最终模型，不会触碰其他 recipe。
 
 每次真正启动训练（Preflight 不计）前，Studio 都会先在
 `<state_root>/pipeline/run-records/<job_id>/` 写入运行档案：

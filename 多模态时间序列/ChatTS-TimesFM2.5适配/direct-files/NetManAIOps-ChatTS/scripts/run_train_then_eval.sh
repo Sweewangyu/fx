@@ -66,6 +66,7 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"
 OFFLINE="${OFFLINE:-1}"
 DATA_VERSION="${DATA_VERSION:-}"
 DATASET_SNAPSHOT_HASH="${DATASET_SNAPSHOT_HASH:-}"
+TRAINING_RECIPE_HASH="${TRAINING_RECIPE_HASH:-}"
 TRIAL_ID="${TRIAL_ID:-}"
 TRIAL_CONFIG_HASH="${TRIAL_CONFIG_HASH:-}"
 
@@ -144,6 +145,10 @@ if [[ -n "$EVAL_PROTOCOL_HASH" && ! "$EVAL_PROTOCOL_HASH" =~ ^[0-9a-fA-F]{64}$ ]
 fi
 if [[ -n "$DATASET_SNAPSHOT_HASH" && ! "$DATASET_SNAPSHOT_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
     echo "DATASET_SNAPSHOT_HASH must be empty or a 64-character hexadecimal SHA256." >&2
+    exit 2
+fi
+if [[ -n "$TRAINING_RECIPE_HASH" && ! "$TRAINING_RECIPE_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "TRAINING_RECIPE_HASH must be empty or a 64-character hexadecimal SHA256." >&2
     exit 2
 fi
 if [[ -n "$DATA_VERSION" && ! "$DATA_VERSION" =~ ^datav[0-9]+$ ]]; then
@@ -286,6 +291,7 @@ run_training() {
         -e DATASET_DIR="$DATASET_DIR" \
         -e DATA_VERSION="$DATA_VERSION" \
         -e DATASET_SNAPSHOT_HASH="$DATASET_SNAPSHOT_HASH" \
+        -e TRAINING_RECIPE_HASH="$TRAINING_RECIPE_HASH" \
         -e TRIAL_ID="$TRIAL_ID" \
         -e TRIAL_CONFIG_HASH="$TRIAL_CONFIG_HASH" \
         -e KEEP_STAGE1="$KEEP_STAGE1" \

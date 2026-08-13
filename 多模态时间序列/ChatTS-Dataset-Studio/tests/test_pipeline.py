@@ -83,10 +83,22 @@ def test_resolve_pipeline_derives_versioned_paths_and_snapshot_datasets(
     assert training["stage1"]["datasets"] == (
         "datav3__stage1__alpha,datav3__stage1__beta"
     )
-    assert training["output_root"] == "/share/output/ChatTS-msxf-8B-datav3"
-    assert training["final_model_path"].endswith("ChatTS-msxf-8B-datav3/best_seed7")
-    assert evaluation["model_name"] == "chatts-msxf-8B-datav3-seed7"
-    assert evaluation["output_root"].endswith("/chatts-msxf-8B-datav3-seed7")
+    recipe_id = resolved["derived"]["training_recipe_id"]
+    recipe_hash = resolved["derived"]["training_recipe_hash"]
+    assert recipe_id == f"recipe-{recipe_hash[:16]}"
+    assert training["output_root"] == (
+        f"/share/output/ChatTS-msxf-8B-datav3/experiments/{recipe_id}"
+    )
+    assert training["final_model_path"].endswith(
+        f"ChatTS-msxf-8B-datav3/experiments/{recipe_id}/best_seed7"
+    )
+    assert evaluation["model_name"] == (
+        f"chatts-msxf-8B-datav3-seed7-{recipe_id}"
+    )
+    assert evaluation["output_root"].endswith(
+        f"/chatts-msxf-8B-datav3-seed7-{recipe_id}"
+    )
+    assert resolved["config"]["pipeline"]["training_recipe_hash"] == recipe_hash
     assert evaluation["benchmarks"] == "tsrbench,timeseriesexam"
     assert resolved["config_hash"]
 
@@ -144,9 +156,50 @@ def test_resolve_pipeline_syncs_output_scale_from_base_model(
         _integration(tmp_path),
     )
 
-    assert resolved["config"]["training"]["output_root"] == output
-    assert resolved["config"]["evaluation"]["model_name"] == model_name
+    recipe_id = resolved["derived"]["training_recipe_id"]
+    assert resolved["config"]["training"]["output_root"] == (
+        f"{output}/experiments/{recipe_id}"
+    )
+    assert resolved["config"]["evaluation"]["model_name"] == (
+        f"{model_name}-{recipe_id}"
+    )
     assert resolved["derived"]["model_scale"] == scale
+
+
+def test_training_recipe_hash_is_stable_for_retries_and_isolates_parameter_changes(
+    tmp_path: Path,
+) -> None:
+    baseline = resolve_pipeline_request({}, _version(tmp_path), _integration(tmp_path))
+    retry = resolve_pipeline_request(
+        {
+            "training": {"force_train": True},
+            "evaluation": {
+                "force_eval": True,
+                "benchmarks": ["tsrbench"],
+                "max_samples": 16,
+            },
+        },
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+    changed = resolve_pipeline_request(
+        {"training": {"stage2": {"learning_rate": "2e-5"}}},
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+
+    assert retry["derived"]["training_recipe_hash"] == baseline["derived"][
+        "training_recipe_hash"
+    ]
+    assert retry["derived"]["final_model_path"] == baseline["derived"][
+        "final_model_path"
+    ]
+    assert changed["derived"]["training_recipe_hash"] != baseline["derived"][
+        "training_recipe_hash"
+    ]
+    assert changed["derived"]["final_model_path"] != baseline["derived"][
+        "final_model_path"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -647,9 +700,9 @@ def test_training_run_exports_data_config_and_diff_from_previous(tmp_path: Path)
     assert second_job["diff_from_previous"]["change_count"] == second_diff["change_count"]
     changed = {item["path"]: item for item in second_diff["changes"]}
     assert changed["config.training.base_model_path"]["after"].endswith("Qwen3-4B")
-    assert changed["config.training.output_root"]["after"].endswith(
-        "ChatTS-msxf-4B-datav3"
-    )
+    assert "/ChatTS-msxf-4B-datav3/experiments/recipe-" in changed[
+        "config.training.output_root"
+    ]["after"]
     assert changed["config.training.stage2.learning_rate"] == {
         "path": "config.training.stage2.learning_rate",
         "before": "1e-05",

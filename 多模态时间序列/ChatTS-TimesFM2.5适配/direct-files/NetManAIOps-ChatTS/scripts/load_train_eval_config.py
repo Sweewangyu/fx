@@ -25,6 +25,7 @@ KEY_TO_ENV = {
     "pipeline.offline": "OFFLINE",
     "pipeline.data_version": "DATA_VERSION",
     "pipeline.dataset_snapshot_hash": "DATASET_SNAPSHOT_HASH",
+    "pipeline.training_recipe_hash": "TRAINING_RECIPE_HASH",
     "pipeline.trial_id": "TRIAL_ID",
     "pipeline.trial_config_hash": "TRIAL_CONFIG_HASH",
     "containers.training": "TRAIN_CONTAINER",

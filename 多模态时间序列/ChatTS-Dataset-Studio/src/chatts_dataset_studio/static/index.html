@@ -163,7 +163,7 @@
             <label class="field"><span>随机种子</span><input id="train-seed" type="number" min="0" step="1" value="42"></label>
             <label class="field"><span>GPU</span><input id="deepspeed-include" type="text" value="localhost:0,1,2,3,4,5,6,7" spellcheck="false"></label>
             <label class="field field-span-3"><span>基础模型地址</span><input id="base-model-path" type="text" spellcheck="false" autocomplete="off" placeholder="/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B"><small class="field-help" id="base-model-sync-hint">识别末尾参数量后，会同步更新模型输出目录。</small></label>
-            <label class="field field-span-3 readonly-field"><span>模型输出根目录（自动追加版本）</span><input id="train-output-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
+            <label class="field field-span-3 readonly-field"><span>模型输出根目录（自动追加版本与训练参数哈希）</span><input id="train-output-root" type="text" readonly aria-readonly="true" spellcheck="false"><small class="field-help">训练配方不同会进入不同的 recipe 目录；相同配方才会复用同一路径。</small></label>
           </div>
           <div class="path-preview"><span>最终输出</span><code id="final-model-preview">—</code></div>
         </section>
@@ -220,7 +220,7 @@
         <section class="card compact-card"><div class="form-grid form-grid-3">
           <label class="field"><span>Master port</span><input id="master-port" type="number" value="19901" min="1024" max="65535"></label>
           <label class="field check-field"><input id="keep-stage1" type="checkbox"><span>保留 Stage 1 模型</span></label>
-          <label class="field check-field"><input id="force-train" type="checkbox"><span>强制重新训练</span></label>
+          <label class="field check-field"><input id="force-train" type="checkbox"><span>强制重训当前配方</span></label>
         </div></section>
       </section>
 

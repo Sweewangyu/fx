@@ -37,6 +37,7 @@ def _clean_environment() -> dict[str, str]:
         *ADVANCED_EVAL_DEFAULTS,
         "DATA_VERSION",
         "DATASET_SNAPSHOT_HASH",
+        "TRAINING_RECIPE_HASH",
         "TRIAL_ID",
         "TRIAL_CONFIG_HASH",
         "CONFIG_FILE",
@@ -69,6 +70,7 @@ def test_loader_maps_dataset_identity_and_safe_advanced_evaluation(tmp_path: Pat
             pipeline:
               data_version: datav4
               dataset_snapshot_hash: {snapshot_hash}
+              training_recipe_hash: {"c" * 64}
               trial_id: studio-job-7
               trial_config_hash: {"b" * 64}
             evaluation:
@@ -98,6 +100,7 @@ def test_loader_maps_dataset_identity_and_safe_advanced_evaluation(tmp_path: Pat
     assert assignments == {
         "DATASET_SNAPSHOT_HASH": snapshot_hash,
         "DATA_VERSION": "datav4",
+        "TRAINING_RECIPE_HASH": "c" * 64,
         "TRIAL_CONFIG_HASH": "b" * 64,
         "TRIAL_ID": "studio-job-7",
         "EXAM_BATCH_SIZE": "4",
@@ -139,7 +142,7 @@ def _write_capture_script(path: Path, stage: str) -> None:
             import os
             import sys
 
-            keys = ["DATA_VERSION", "DATASET_SNAPSHOT_HASH"]
+            keys = ["DATA_VERSION", "DATASET_SNAPSHOT_HASH", "TRAINING_RECIPE_HASH"]
             if {stage!r} == "training":
                 keys.extend(["TRIAL_ID", "TRIAL_CONFIG_HASH"])
             else:
@@ -290,9 +293,11 @@ raise SystemExit(subprocess.run(command, env=environment, check=False).returncod
 
 def test_host_forwards_dataset_identity_and_advanced_evaluation(tmp_path: Path) -> None:
     snapshot_hash = "b" * 64
+    recipe_hash = "d" * 64
     events = _run_host_pipeline(
         tmp_path,
         f"data_version: datav4\ndataset_snapshot_hash: {snapshot_hash}\n"
+        f"training_recipe_hash: {recipe_hash}\n"
         f"trial_id: studio-job-7\ntrial_config_hash: {'c' * 64}",
         """
         tsr_prompt_mode: official
@@ -318,6 +323,7 @@ def test_host_forwards_dataset_identity_and_advanced_evaluation(tmp_path: Path) 
         "stage": "training",
         "DATA_VERSION": "datav4",
         "DATASET_SNAPSHOT_HASH": snapshot_hash,
+        "TRAINING_RECIPE_HASH": recipe_hash,
         "TRIAL_ID": "studio-job-7",
         "TRIAL_CONFIG_HASH": "c" * 64,
     }
@@ -325,6 +331,7 @@ def test_host_forwards_dataset_identity_and_advanced_evaluation(tmp_path: Path) 
         "stage": "evaluation",
         "DATA_VERSION": "datav4",
         "DATASET_SNAPSHOT_HASH": snapshot_hash,
+        "TRAINING_RECIPE_HASH": None,
         "TSR_PROMPT_MODE": "official",
         "TSR_MAX_MODEL_LEN": "13000",
         "TSR_MAX_NEW_TOKENS": "512",
@@ -349,11 +356,13 @@ def test_host_legacy_config_retains_advanced_evaluation_defaults(tmp_path: Path)
 
     assert events[0]["DATA_VERSION"] == ""
     assert events[0]["DATASET_SNAPSHOT_HASH"] == ""
+    assert events[0]["TRAINING_RECIPE_HASH"] == ""
     assert events[0]["TRIAL_ID"] == ""
     assert events[0]["TRIAL_CONFIG_HASH"] == ""
     assert events[1] == {
         "stage": "evaluation",
         "DATA_VERSION": "",
         "DATASET_SNAPSHOT_HASH": "",
+        "TRAINING_RECIPE_HASH": None,
         **ADVANCED_EVAL_DEFAULTS,
     }

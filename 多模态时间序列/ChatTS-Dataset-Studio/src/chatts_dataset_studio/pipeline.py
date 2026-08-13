@@ -702,11 +702,7 @@ def resolve_pipeline_request(
     if not isinstance(model_output_base, str) or not model_output_base:
         raise StudioError("Missing server integration setting: model_output_base")
     model_output_base = _with_model_scale(model_output_base, model_scale)
-    train_output_root = _versioned_name(model_output_base, version)
-    supplied_output = training_request.get("output_root")
-    if supplied_output not in (None, "", train_output_root):
-        raise StudioError("training.output_root is derived from data version and cannot be changed")
-    final_model_path = f"{train_output_root.rstrip('/')}/best_seed{seed}"
+    version_output_root = _versioned_name(model_output_base, version)
 
     train_script = integration.get("training_script")
     train_chronos = integration.get("train_chronos2_model_path")
@@ -723,11 +719,43 @@ def resolve_pipeline_request(
     )
     evaluation = _resolve_evaluation(evaluation_request, integration)
 
+    # A data version is not an experiment identity. Two runs over the same
+    # snapshot can still produce different weights when any training setting
+    # changes. Keep a stable, training-only hash (excluding force/retry and all
+    # evaluation controls) in every model path so one recipe cannot overwrite
+    # another recipe's checkpoints.
+    training_recipe = {
+        "schema_version": "chatts-training-recipe-v1",
+        "profile": "chronos2-full",
+        "data_version": version,
+        "dataset_snapshot_hash": snapshot_hash,
+        "base_model_path": base_model_path,
+        "time_series_encoder": {
+            "type": "chronos2",
+            "model_path": train_chronos,
+        },
+        "seed": seed,
+        "deepspeed_include": deepspeed_include,
+        "stage1": stage1,
+        "stage2": stage2,
+    }
+    training_recipe_hash = _hash(training_recipe)
+    training_recipe_id = f"recipe-{training_recipe_hash[:16]}"
+    train_output_root = f"{version_output_root.rstrip('/')}/experiments/{training_recipe_id}"
+    supplied_output = training_request.get("output_root")
+    if supplied_output not in (None, "", train_output_root, version_output_root):
+        raise StudioError(
+            "training.output_root is derived from data version and training recipe"
+        )
+    final_model_path = f"{train_output_root}/best_seed{seed}"
+
     model_name_base = integration.get("model_name_base", "chatts-msxf-8B")
     if not isinstance(model_name_base, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", model_name_base):
         raise StudioError("model_name_base must be a safe slug")
     model_name_base = _with_model_scale(model_name_base, model_scale)
-    model_name = f"{_versioned_name(model_name_base, version)}-seed{seed}"
+    model_name = (
+        f"{_versioned_name(model_name_base, version)}-seed{seed}-{training_recipe_id}"
+    )
     eval_output_base = integration.get("evaluation_output_base")
     if not isinstance(eval_output_base, str) or not eval_output_base:
         raise StudioError("Missing server integration setting: evaluation_output_base")
@@ -739,12 +767,13 @@ def resolve_pipeline_request(
     if supplied_model not in (None, "", final_model_path):
         raise StudioError("evaluation.model_path is derived from training output and cannot be changed")
 
-    run_id = f"chronos2-{version}-seed{seed}-full"
+    run_id = f"chronos2-{version}-seed{seed}-{training_recipe_id}-full"
     config = {
         "pipeline": {
             "seed": seed,
             "data_version": version,
             "dataset_snapshot_hash": snapshot_hash,
+            "training_recipe_hash": training_recipe_hash,
             "force_train": _as_bool(
                 training_request.get("force_train", False), "training.force_train"
             ),
@@ -793,8 +822,12 @@ def resolve_pipeline_request(
         "dataset_names": dataset_names,
         "config": config,
         "derived": {
+            "version_output_root": version_output_root,
             "train_output_root": train_output_root,
             "final_model_path": final_model_path,
+            "training_recipe_id": training_recipe_id,
+            "training_recipe_hash": training_recipe_hash,
+            "training_recipe": training_recipe,
             "model_name": model_name,
             "evaluation_output_root": eval_output_root,
             "run_id": run_id,

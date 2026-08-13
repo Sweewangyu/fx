@@ -705,6 +705,66 @@ PY
                 first_marker["completed_at_utc"], second_marker["completed_at_utc"]
             )
 
+    def test_training_recipe_hash_reuses_completed_model_across_job_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = self.make_fixture(root)
+            stage1 = root / "output" / "recipe-stage1"
+            final = root / "output" / "recipe-final"
+            recipe_hash = "c" * 64
+            env.update(
+                {
+                    "STAGE1_OUT": str(stage1),
+                    "FINAL_MODEL_PATH": str(final),
+                    "TRAINING_RECIPE_HASH": recipe_hash,
+                    "TRIAL_ID": "job-one",
+                    "TRIAL_CONFIG_HASH": "a" * 64,
+                }
+            )
+            subprocess.run(
+                ["bash", str(RUNNER)],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            retried = env.copy()
+            retried.update(
+                {
+                    "TRIAL_ID": "job-two",
+                    "TRIAL_CONFIG_HASH": "b" * 64,
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(RUNNER)],
+                env=retried,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("Training already completed; reusing", result.stdout)
+            marker = json.loads(
+                (final / "TRAINING_COMPLETE.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["training_recipe_hash"], recipe_hash)
+            self.assertEqual(marker["trial_id"], "job-one")
+
+            wrong_recipe = retried.copy()
+            wrong_recipe["TRAINING_RECIPE_HASH"] = "d" * 64
+            rejected = subprocess.run(
+                ["bash", str(RUNNER)],
+                env=wrong_recipe,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn(
+                "training_recipe_hash",
+                rejected.stderr + rejected.stdout,
+            )
+
     def test_completion_cache_rejects_changed_dataset_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

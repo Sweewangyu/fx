@@ -906,7 +906,9 @@ function updateDerivedPaths() {
   const root = $("#train-output-root").value.trim();
   const seed = $("#train-seed").value;
   const cleanRoot = root.replace(/\/$/, "").replace(/(?:[-_]?data-?v\d+)$/i, "");
-  $("#final-model-preview").textContent = cleanRoot && version ? `${cleanRoot}-${version}/best_seed${seed}` : "由服务端按版本生成";
+  $("#final-model-preview").textContent = cleanRoot && version
+    ? `${cleanRoot}-${version}/experiments/recipe-<训练参数哈希>/best_seed${seed}`
+    : "由服务端按版本与训练参数生成";
   $("#suite-count").textContent = `${$$("#benchmark-suites input:checked").length} 项`;
 }
 
