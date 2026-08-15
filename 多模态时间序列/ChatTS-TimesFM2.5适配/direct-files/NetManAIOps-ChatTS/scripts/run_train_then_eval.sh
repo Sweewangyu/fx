@@ -34,6 +34,7 @@ TRAIN_OUTPUT_ROOT="${TRAIN_OUTPUT_ROOT:-${SHARED_ROOT}/output/ChatTS-msxf-8B-dat
 SEED="${SEED:-42}"
 S1_LR="${S1_LR:-1e-5}"
 S2_LR="${S2_LR:-1e-5}"
+STAGE1_OUT="${STAGE1_OUT:-${TRAIN_OUTPUT_ROOT}/.stage1_seed${SEED}_s1lr_${S1_LR}}"
 FINAL_MODEL_PATH="${FINAL_MODEL_PATH:-${TRAIN_OUTPUT_ROOT}/best_seed${SEED}}"
 MODEL_NAME="${MODEL_NAME:-chatts-msxf-8B-datav1-seed${SEED}}"
 EVAL_OUTPUT_ROOT="${EVAL_OUTPUT_ROOT:-${SHARED_ROOT}/evaluation/all-benchmarks/${MODEL_NAME}}"
@@ -42,9 +43,8 @@ TRAIN_CHRONOS2_MODEL_PATH="${TRAIN_CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
 EVAL_CHRONOS2_MODEL_PATH="${EVAL_CHRONOS2_MODEL_PATH:-/workspace/chronos2}"
 DATASET_DIR="${DATASET_DIR:-${TRAIN_PROJECT_ROOT}/data}"
 KEEP_STAGE1="${KEEP_STAGE1:-0}"
-# A train-then-evaluate entrypoint can only use the full two-stage recipe.
-# Reject an accidental stage1/stage2-only override instead of evaluating the
-# wrong checkpoint.
+# Backward-compatible default. Stage1 mode finalizes and retains the Stage1
+# model, verifies its durable artifacts, and exits without touching evaluation.
 PIPELINE_MODE="${PIPELINE_MODE:-full}"
 
 TSRBENCH_ROOT="${TSRBENCH_ROOT:-${SHARED_ROOT}/TSRBench-dataset}"
@@ -116,7 +116,7 @@ for parameter_name in "${TRAIN_PARAMETER_NAMES[@]}"; do
     fi
 done
 
-for flag_name in FORCE_TRAIN FORCE_EVAL PREFLIGHT_ONLY OFFLINE KEEP_STAGE1; do
+for flag_name in FORCE_TRAIN PREFLIGHT_ONLY KEEP_STAGE1; do
     flag_value="${!flag_name}"
     [[ "$flag_value" == "0" || "$flag_value" == "1" ]] || {
         echo "$flag_name must be 0 or 1, got: $flag_value" >&2
@@ -124,25 +124,11 @@ for flag_name in FORCE_TRAIN FORCE_EVAL PREFLIGHT_ONLY OFFLINE KEEP_STAGE1; do
     }
 done
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer." >&2; exit 2; }
-[[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || { echo "MAX_SAMPLES must be non-negative." >&2; exit 2; }
-[[ "$TINY_PARTITION_SEED" =~ ^[0-9]+$ ]] || {
-    echo "TINY_PARTITION_SEED must be a non-negative integer." >&2
-    exit 2
-}
-[[ "$PIPELINE_MODE" == "full" ]] || {
-    echo "run_train_then_eval.sh requires PIPELINE_MODE=full, got: $PIPELINE_MODE" >&2
-    exit 2
-}
+case "$PIPELINE_MODE" in
+    full|stage1) ;;
+    *) echo "PIPELINE_MODE must be full or stage1, got: $PIPELINE_MODE" >&2; exit 2 ;;
+esac
 [[ -n "$DATASET_DIR" ]] || { echo "DATASET_DIR must not be empty." >&2; exit 2; }
-[[ -n "$BENCHMARKS" ]] || { echo "BENCHMARKS must not be empty." >&2; exit 2; }
-[[ "$RUN_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || {
-    echo "RUN_ID may contain only letters, digits, dot, underscore, and dash." >&2
-    exit 2
-}
-if [[ -n "$EVAL_PROTOCOL_HASH" && ! "$EVAL_PROTOCOL_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    echo "EVAL_PROTOCOL_HASH must be empty or a 64-character hexadecimal SHA256." >&2
-    exit 2
-fi
 if [[ -n "$DATASET_SNAPSHOT_HASH" && ! "$DATASET_SNAPSHOT_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
     echo "DATASET_SNAPSHOT_HASH must be empty or a 64-character hexadecimal SHA256." >&2
     exit 2
@@ -163,44 +149,66 @@ if [[ -n "$TRIAL_CONFIG_HASH" && ! "$TRIAL_CONFIG_HASH" =~ ^[0-9a-fA-F]{64}$ ]];
     echo "TRIAL_CONFIG_HASH must be empty or a 64-character hexadecimal SHA256." >&2
     exit 2
 fi
-case "$HAYSTACK_SPLIT" in
-    train|validation|test) ;;
-    *) echo "HAYSTACK_SPLIT must be train, validation, or test." >&2; exit 2 ;;
-esac
-case "$TINY_DATA_PARTITION" in
-    all|search-dev|final-test) ;;
-    *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
-esac
-case "$TSR_PROMPT_MODE" in
-    answer_only|official) ;;
-    *) echo "TSR_PROMPT_MODE must be answer_only or official." >&2; exit 2 ;;
-esac
-
-for parameter_name in \
-    TSR_MAX_MODEL_LEN TSR_MAX_NEW_TOKENS TSR_BATCH_SIZE TSR_REQUEST_CHUNK_SIZE \
-    TINY_MAX_MODEL_LEN TINY_REQUEST_CHUNK_SIZE \
-    HAYSTACK_MAX_MODEL_LEN HAYSTACK_MAX_NEW_TOKENS HAYSTACK_BATCH_SIZE \
-    HAYSTACK_REQUEST_CHUNK_SIZE EXAM_MAX_MODEL_LEN EXAM_MAX_NEW_TOKENS \
-    EXAM_BATCH_SIZE EXAM_REQUEST_CHUNK_SIZE; do
-    parameter_value="${!parameter_name}"
-    [[ "$parameter_value" =~ ^[1-9][0-9]*$ ]] || {
-        echo "$parameter_name must be a positive integer, got: $parameter_value" >&2
+if [[ "$PIPELINE_MODE" == "full" ]]; then
+    for flag_name in FORCE_EVAL OFFLINE; do
+        flag_value="${!flag_name}"
+        [[ "$flag_value" == "0" || "$flag_value" == "1" ]] || {
+            echo "$flag_name must be 0 or 1, got: $flag_value" >&2
+            exit 2
+        }
+    done
+    [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || { echo "MAX_SAMPLES must be non-negative." >&2; exit 2; }
+    [[ "$TINY_PARTITION_SEED" =~ ^[0-9]+$ ]] || {
+        echo "TINY_PARTITION_SEED must be a non-negative integer." >&2
         exit 2
     }
-done
-(( TSR_MAX_MODEL_LEN > TSR_MAX_NEW_TOKENS )) || {
-    echo "TSR_MAX_MODEL_LEN must be larger than TSR_MAX_NEW_TOKENS." >&2
-    exit 2
-}
-(( HAYSTACK_MAX_MODEL_LEN > HAYSTACK_MAX_NEW_TOKENS )) || {
-    echo "HAYSTACK_MAX_MODEL_LEN must be larger than HAYSTACK_MAX_NEW_TOKENS." >&2
-    exit 2
-}
-(( EXAM_MAX_MODEL_LEN > EXAM_MAX_NEW_TOKENS )) || {
-    echo "EXAM_MAX_MODEL_LEN must be larger than EXAM_MAX_NEW_TOKENS." >&2
-    exit 2
-}
-"$HOST_PYTHON_BIN" - "$TINY_GPU_MEMORY_UTILIZATION" <<'PY'
+    [[ -n "$BENCHMARKS" ]] || { echo "BENCHMARKS must not be empty." >&2; exit 2; }
+    [[ "$RUN_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+        echo "RUN_ID may contain only letters, digits, dot, underscore, and dash." >&2
+        exit 2
+    }
+    if [[ -n "$EVAL_PROTOCOL_HASH" && ! "$EVAL_PROTOCOL_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "EVAL_PROTOCOL_HASH must be empty or a 64-character hexadecimal SHA256." >&2
+        exit 2
+    fi
+    case "$HAYSTACK_SPLIT" in
+        train|validation|test) ;;
+        *) echo "HAYSTACK_SPLIT must be train, validation, or test." >&2; exit 2 ;;
+    esac
+    case "$TINY_DATA_PARTITION" in
+        all|search-dev|final-test) ;;
+        *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
+    esac
+    case "$TSR_PROMPT_MODE" in
+        answer_only|official) ;;
+        *) echo "TSR_PROMPT_MODE must be answer_only or official." >&2; exit 2 ;;
+    esac
+
+    for parameter_name in \
+        TSR_MAX_MODEL_LEN TSR_MAX_NEW_TOKENS TSR_BATCH_SIZE TSR_REQUEST_CHUNK_SIZE \
+        TINY_MAX_MODEL_LEN TINY_REQUEST_CHUNK_SIZE \
+        HAYSTACK_MAX_MODEL_LEN HAYSTACK_MAX_NEW_TOKENS HAYSTACK_BATCH_SIZE \
+        HAYSTACK_REQUEST_CHUNK_SIZE EXAM_MAX_MODEL_LEN EXAM_MAX_NEW_TOKENS \
+        EXAM_BATCH_SIZE EXAM_REQUEST_CHUNK_SIZE; do
+        parameter_value="${!parameter_name}"
+        [[ "$parameter_value" =~ ^[1-9][0-9]*$ ]] || {
+            echo "$parameter_name must be a positive integer, got: $parameter_value" >&2
+            exit 2
+        }
+    done
+    (( TSR_MAX_MODEL_LEN > TSR_MAX_NEW_TOKENS )) || {
+        echo "TSR_MAX_MODEL_LEN must be larger than TSR_MAX_NEW_TOKENS." >&2
+        exit 2
+    }
+    (( HAYSTACK_MAX_MODEL_LEN > HAYSTACK_MAX_NEW_TOKENS )) || {
+        echo "HAYSTACK_MAX_MODEL_LEN must be larger than HAYSTACK_MAX_NEW_TOKENS." >&2
+        exit 2
+    }
+    (( EXAM_MAX_MODEL_LEN > EXAM_MAX_NEW_TOKENS )) || {
+        echo "EXAM_MAX_MODEL_LEN must be larger than EXAM_MAX_NEW_TOKENS." >&2
+        exit 2
+    }
+    "$HOST_PYTHON_BIN" - "$TINY_GPU_MEMORY_UTILIZATION" <<'PY'
 import math
 import sys
 
@@ -211,6 +219,7 @@ except ValueError as exc:
 if not math.isfinite(value) or not 0.0 < value <= 1.0:
     raise SystemExit("TINY_GPU_MEMORY_UTILIZATION must be in (0, 1].")
 PY
+fi
 
 command -v docker >/dev/null 2>&1 || {
     echo "Docker CLI is unavailable to the ChatTS control plane." >&2
@@ -256,28 +265,64 @@ require_container_gpus() {
     echo "$container: PyTorch sees $count GPUs"
 }
 
+require_container_model_weights() {
+    local container="$1" model_path="$2"
+    docker exec "$container" python -c '
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+patterns = (
+    "pytorch_model*.bin",
+    "model*.safetensors",
+    "adapter_model*.bin",
+    "adapter_model*.safetensors",
+)
+weights = {
+    path
+    for pattern in patterns
+    for path in root.glob(pattern)
+    if path.is_file() and path.stat().st_size > 0
+}
+if not weights:
+    raise SystemExit(f"No non-empty model weights found in {root}")
+print(f"Validated {len(weights)} non-empty model weight file(s) in {root}")
+' "$model_path"
+}
+
 require_running_container "$TRAIN_CONTAINER"
-require_running_container "$EVAL_CONTAINER"
 require_container_path "$TRAIN_CONTAINER" dir "$SHARED_ROOT"
-require_container_path "$EVAL_CONTAINER" dir "$SHARED_ROOT"
 require_container_path "$TRAIN_CONTAINER" file "$TRAIN_SCRIPT"
-require_container_path "$EVAL_CONTAINER" file "$EVAL_SCRIPT"
 require_container_gpus "$TRAIN_CONTAINER"
-require_container_gpus "$EVAL_CONTAINER"
+if [[ "$PIPELINE_MODE" == "full" ]]; then
+    require_running_container "$EVAL_CONTAINER"
+    require_container_path "$EVAL_CONTAINER" dir "$SHARED_ROOT"
+    require_container_path "$EVAL_CONTAINER" file "$EVAL_SCRIPT"
+    require_container_gpus "$EVAL_CONTAINER"
+fi
 
 echo "============================================================"
-echo " ChatTS host pipeline: train -> evaluate"
+echo " ChatTS host pipeline: $([[ "$PIPELINE_MODE" == "stage1" ]] && echo 'Stage1 only' || echo 'train -> evaluate')"
 echo " Configuration:       $CONFIG_FILE"
 echo " Training container:  $TRAIN_CONTAINER"
-echo " Evaluation container:$EVAL_CONTAINER"
+if [[ "$PIPELINE_MODE" == "full" ]]; then
+    echo " Evaluation container:$EVAL_CONTAINER"
+fi
+echo " Pipeline mode:       $PIPELINE_MODE"
 echo " Seed:                $SEED"
 echo " Dataset directory:   $DATASET_DIR"
-echo " Final model:         $FINAL_MODEL_PATH"
-echo " Evaluation output:   $EVAL_OUTPUT_ROOT"
-echo " Benchmarks:          $BENCHMARKS"
-echo " Run ID:              $RUN_ID"
+if [[ "$PIPELINE_MODE" == "stage1" ]]; then
+    echo " Stage1 model:        $STAGE1_OUT"
+else
+    echo " Final model:         $FINAL_MODEL_PATH"
+    echo " Evaluation output:   $EVAL_OUTPUT_ROOT"
+    echo " Benchmarks:          $BENCHMARKS"
+    echo " Run ID:              $RUN_ID"
+fi
 echo " Trial ID:            ${TRIAL_ID:-<none>}"
-echo " Smoke sample limit:  $MAX_SAMPLES (0 means full evaluation)"
+if [[ "$PIPELINE_MODE" == "full" ]]; then
+    echo " Smoke sample limit:  $MAX_SAMPLES (0 means full evaluation)"
+fi
 echo "============================================================"
 
 run_training() {
@@ -286,6 +331,7 @@ run_training() {
         -e PROJECT_ROOT="$TRAIN_PROJECT_ROOT" \
         -e MODEL_PATH="$BASE_MODEL_PATH" \
         -e OUTPUT_ROOT="$TRAIN_OUTPUT_ROOT" \
+        -e STAGE1_OUT="$STAGE1_OUT" \
         -e FINAL_MODEL_PATH="$FINAL_MODEL_PATH" \
         -e CHRONOS2_MODEL_PATH="$TRAIN_CHRONOS2_MODEL_PATH" \
         -e DATASET_DIR="$DATASET_DIR" \
@@ -354,14 +400,33 @@ run_evaluation() {
 if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
     echo "Running training-container preflight..."
     run_training
-    echo "Running evaluation-container preflight..."
-    run_evaluation
-    echo "All host/container preflight checks passed. No training or evaluation was started."
+    if [[ "$PIPELINE_MODE" == "full" ]]; then
+        echo "Running evaluation-container preflight..."
+        run_evaluation
+        echo "All host/container preflight checks passed. No training or evaluation was started."
+    else
+        echo "Stage1 host/container preflight checks passed. No training was started."
+    fi
     exit 0
 fi
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') | Starting/reusing training"
 run_training
+
+if [[ "$PIPELINE_MODE" == "stage1" ]]; then
+    require_container_path "$TRAIN_CONTAINER" file "$STAGE1_OUT/STAGE1_COMPLETE.json"
+    require_container_path "$TRAIN_CONTAINER" file "$STAGE1_OUT/config.json"
+    require_container_path "$TRAIN_CONTAINER" file "$STAGE1_OUT/best_model_manifest.json"
+    require_container_model_weights "$TRAIN_CONTAINER" "$STAGE1_OUT"
+    echo "============================================================"
+    echo " Stage1 training completed successfully"
+    echo " Stage1 model:      $STAGE1_OUT"
+    echo " Completion marker:$STAGE1_OUT/STAGE1_COMPLETE.json"
+    echo " Best manifest:    $STAGE1_OUT/best_model_manifest.json"
+    echo " Evaluation:       skipped (PIPELINE_MODE=stage1)"
+    echo "============================================================"
+    exit 0
+fi
 
 READY_MARKER="$FINAL_MODEL_PATH/TRAINING_COMPLETE.json"
 require_container_path "$TRAIN_CONTAINER" file "$READY_MARKER"

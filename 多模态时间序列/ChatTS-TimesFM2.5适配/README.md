@@ -96,6 +96,10 @@ rsync -av direct-files/ /path/to/ChatTS-Training/
 - [TS encoder checkpoint 权重盘点脚本](./direct-files/NetManAIOps-ChatTS/scripts/inspect_chatts_ts_encoder_checkpoints.py)
 - [NetManAIOps/ChatTS 覆盖与评测说明](./direct-files/NetManAIOps-ChatTS/README.md)
 - [宿主机一键训练 + 四套评测入口](./direct-files/NetManAIOps-ChatTS/scripts/run_train_then_eval.sh)
+- [Dataset Studio 通用 Slurm 入口](./direct-files/slurm/run_chatts_studio_pipeline.sbatch)：
+  接收冻结配置并提交 Stage1-only 或两阶段 Chronos-2 训练；配套说明见
+  [`direct-files/slurm/README.md`](./direct-files/slurm/README.md)。
+- [Slurm 冻结配置加载器](./direct-files/scripts/slurm/load_studio_pipeline_config.py)
 
 其中 `timesfm2_5.py`、`chronos2.py`、`zeus.py`、`zeus_modeling.py` 和
 `timeseries_backbones.py` 是新增文件，其余 Python 文件包含基于 `bf30699` 的完整修改后内容。

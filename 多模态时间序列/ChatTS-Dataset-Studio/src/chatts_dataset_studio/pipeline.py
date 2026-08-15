@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 
 from .models import StudioError
+from .slurm import resolve_slurm_launcher, slurm_readiness
 
 BENCHMARKS = ("tsrbench", "tinybenchmarks", "ts_haystack", "timeseriesexam")
 SCHEDULERS = ("cosine", "linear", "constant", "constant_with_warmup")
@@ -107,6 +108,7 @@ _TRAINING_KEYS = frozenset(
         "output_root",
     }
 )
+_EXECUTION_KEYS = frozenset({"backend", "sbatch_path"})
 _EVALUATION_KEYS = frozenset(
     set(EVALUATION_DEFAULTS)
     | {
@@ -557,54 +559,116 @@ def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) ->
     return result
 
 
-def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
-    """Return safe UI defaults without exposing host-side executable paths."""
-    disabled_reasons: list[str] = []
-    execution_mode = integration.get("execution_mode", "docker_host")
-    if execution_mode != "docker_host":
-        disabled_reasons.append(
-            f"integration.execution_mode must be docker_host, got: {execution_mode}"
-        )
-    elif shutil.which("docker") is None:
-        disabled_reasons.append(
+def _docker_readiness(integration: dict[str, Any], *, include_evaluation: bool) -> list[str]:
+    reasons: list[str] = []
+    if shutil.which("docker") is None:
+        reasons.append(
             "Docker CLI is unavailable to Dataset Studio; run the Studio control plane "
             "on the Docker host, not inside the training/evaluation container"
         )
-    for key in ("pipeline_script", "training_root", "evaluation_root"):
+    path_keys = ["pipeline_script", "training_root"]
+    if include_evaluation:
+        path_keys.append("evaluation_root")
+    for key in path_keys:
         value = integration.get(key)
         if not isinstance(value, str) or not value:
-            disabled_reasons.append(f"integration.{key} is not configured")
+            reasons.append(f"integration.{key} is not configured")
             continue
         path = Path(value).expanduser()
         if key == "pipeline_script":
             if not path.is_file():
-                disabled_reasons.append(
+                reasons.append(
                     f"integration.pipeline_script does not exist or is not a file: {path}"
                 )
         elif not path.is_dir():
-            disabled_reasons.append(
-                f"integration.{key} does not exist or is not a directory: {path}"
-            )
-    required_container_settings = (
-        "train_project_root",
-        "eval_project_root",
-        "training_script",
-        "evaluation_script",
-        "model_output_base",
-        "evaluation_output_base",
-        "train_chronos2_model_path",
-        "eval_chronos2_model_path",
-        "tsrbench_root",
-        "tinybench_dataset_root",
-        "ts_haystack_root",
-        "timeseriesexam_root",
-        "timeseriesexam_data_file",
+            reasons.append(f"integration.{key} does not exist or is not a directory: {path}")
+    required = (
+        [
+            "train_project_root",
+            "eval_project_root",
+            "training_script",
+            "evaluation_script",
+            "model_output_base",
+            "evaluation_output_base",
+            "train_chronos2_model_path",
+            "eval_chronos2_model_path",
+            "tsrbench_root",
+            "tinybench_dataset_root",
+            "ts_haystack_root",
+            "timeseriesexam_root",
+            "timeseriesexam_data_file",
+        ]
+        if include_evaluation
+        else [
+            "train_project_root",
+            "training_script",
+            "model_output_base",
+            "train_chronos2_model_path",
+        ]
     )
-    for key in required_container_settings:
+    for key in required:
         value = integration.get(key)
         if not isinstance(value, str) or not value:
-            disabled_reasons.append(f"integration.{key} is not configured")
-    enabled = not disabled_reasons
+            reasons.append(f"integration.{key} is not configured")
+    return reasons
+
+
+def _slurm_profile_readiness(integration: dict[str, Any]) -> dict[str, Any]:
+    status = slurm_readiness(integration)
+    reasons = list(status["disabled_reasons"])
+    for key in (
+        "training_root",
+        "train_project_root",
+        "training_script",
+        "model_output_base",
+        "train_chronos2_model_path",
+    ):
+        value = integration.get(key)
+        if not isinstance(value, str) or not value:
+            reasons.append(f"integration.{key} is not configured")
+    return {**status, "enabled": not reasons, "disabled_reasons": reasons}
+
+
+def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
+    """Return safe UI defaults and per-backend readiness information."""
+    execution_mode = integration.get("execution_mode", "docker_host")
+    docker_full_reasons = _docker_readiness(integration, include_evaluation=True)
+    docker_stage1_reasons = _docker_readiness(integration, include_evaluation=False)
+    slurm_status = _slurm_profile_readiness(integration)
+    backend_status = {
+        "docker_host": {
+            "enabled": not docker_full_reasons,
+            "disabled_reasons": docker_full_reasons,
+            "profiles": {
+                "chronos2-full": {
+                    "enabled": not docker_full_reasons,
+                    "disabled_reasons": docker_full_reasons,
+                },
+                "chronos2-stage1": {
+                    "enabled": not docker_stage1_reasons,
+                    "disabled_reasons": docker_stage1_reasons,
+                },
+            },
+        },
+        "slurm": {
+            **slurm_status,
+            "profiles": {
+                profile: {
+                    "enabled": slurm_status["enabled"],
+                    "disabled_reasons": slurm_status["disabled_reasons"],
+                }
+                for profile in ("chronos2-full", "chronos2-stage1")
+            },
+        },
+    }
+    if execution_mode not in backend_status:
+        disabled_reasons = [
+            f"integration.execution_mode must be docker_host or slurm, got: {execution_mode}"
+        ]
+        enabled = False
+    else:
+        disabled_reasons = list(backend_status[execution_mode]["disabled_reasons"])
+        enabled = not disabled_reasons
     default_base_model = integration.get("base_model_path")
     default_scale = (
         _model_scale(default_base_model) if isinstance(default_base_model, str) else None
@@ -643,6 +707,7 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
             "enabled": enabled,
             "disabled_reasons": disabled_reasons,
             "execution_mode": execution_mode,
+            "backends": backend_status,
             "training_root": integration.get("training_root"),
             "evaluation_root": integration.get("evaluation_root"),
             "training_container": integration.get("training_container", "chatts"),
@@ -654,12 +719,10 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
 def resolve_pipeline_request(
     payload: dict[str, Any], version_record: dict[str, Any], integration: dict[str, Any]
 ) -> dict[str, Any]:
-    allowed_root = {"mode", "version", "training", "evaluation"}
+    allowed_root = {"mode", "version", "training", "evaluation", "execution"}
     unknown_root = sorted(set(payload) - allowed_root)
     if unknown_root:
         raise StudioError(f"Unknown pipeline fields: {unknown_root}")
-    if payload.get("mode", "train_eval") != "train_eval":
-        raise StudioError("The safe dashboard launcher currently supports mode=train_eval only")
 
     version = version_record.get("version")
     if not isinstance(version, str) or not re.fullmatch(r"datav[1-9][0-9]*", version):
@@ -670,9 +733,53 @@ def resolve_pipeline_request(
 
     training_request = _mapping(payload.get("training"), "training")
     evaluation_request = _mapping(payload.get("evaluation"), "evaluation")
+    execution_request = _mapping(payload.get("execution"), "execution")
     _reject_unknown(training_request, _TRAINING_KEYS, "training")
-    if training_request.get("profile", "chronos2-full") != "chronos2-full":
-        raise StudioError("Only the fixed chronos2-full training profile is supported")
+    _reject_unknown(evaluation_request, _EVALUATION_KEYS, "evaluation")
+    _reject_unknown(execution_request, _EXECUTION_KEYS, "execution")
+
+    profile = training_request.get("profile", "chronos2-full")
+    if profile not in {"chronos2-full", "chronos2-stage1"}:
+        raise StudioError(
+            "training.profile must be chronos2-full or chronos2-stage1"
+        )
+    pipeline_mode = "stage1" if profile == "chronos2-stage1" else "full"
+    backend = execution_request.get(
+        "backend", integration.get("execution_mode", "docker_host")
+    )
+    if backend not in {"docker_host", "slurm"}:
+        raise StudioError("execution.backend must be docker_host or slurm")
+    evaluates = backend == "docker_host" and pipeline_mode == "full"
+    expected_mode = "train_eval" if evaluates else "train"
+    requested_mode = payload.get("mode", expected_mode)
+    accepted_modes = {expected_mode}
+    if pipeline_mode == "stage1":
+        accepted_modes.add("train_stage1")
+    elif not evaluates:
+        accepted_modes.add("train_full")
+    if requested_mode not in accepted_modes:
+        raise StudioError(
+            f"mode={requested_mode!r} is incompatible with profile={profile!r} "
+            f"and execution backend={backend!r}; use mode={expected_mode}"
+        )
+
+    execution: dict[str, Any] = {"backend": backend}
+    if backend == "slurm":
+        launcher = resolve_slurm_launcher(
+            integration, execution_request.get("sbatch_path")
+        )
+        execution.update(
+            {
+                "sbatch_path": launcher["path"],
+                "sbatch_relative_path": launcher["relative_path"],
+                "sbatch_sha256": launcher["sha256"],
+                "training_root": str(
+                    Path(str(integration.get("training_root", "")))
+                    .expanduser()
+                    .resolve()
+                ),
+            }
+        )
 
     seed = _as_int(training_request.get("seed", 42), "training.seed")
     master_port = _as_int(
@@ -714,19 +821,33 @@ def resolve_pipeline_request(
     stage1 = _resolve_stage(
         "stage1", _mapping(training_request.get("stage1"), "training.stage1"), dataset_names["stage1"]
     )
-    stage2 = _resolve_stage(
-        "stage2", _mapping(training_request.get("stage2"), "training.stage2"), dataset_names["stage2"]
-    )
-    evaluation = _resolve_evaluation(evaluation_request, integration)
+    stage2: dict[str, Any]
+    if pipeline_mode == "full":
+        stage2 = _resolve_stage(
+            "stage2",
+            _mapping(training_request.get("stage2"), "training.stage2"),
+            dataset_names["stage2"],
+        )
+    else:
+        # Stage2 is deliberately not part of a Stage1-only experiment identity.
+        # Validate only its shape/keys so stale hidden UI fields cannot alter the
+        # output path or accidentally become executable configuration.
+        stage2_request = _mapping(training_request.get("stage2"), "training.stage2")
+        _reject_unknown(stage2_request, _STAGE_KEYS, "training.stage2")
+        stage2 = _resolve_stage("stage2", {}, dataset_names["stage2"])
+
+    evaluation: dict[str, Any] | None = None
+    if evaluates:
+        evaluation = _resolve_evaluation(evaluation_request, integration)
 
     # A data version is not an experiment identity. Two runs over the same
     # snapshot can still produce different weights when any training setting
     # changes. Keep a stable, training-only hash (excluding force/retry and all
     # evaluation controls) in every model path so one recipe cannot overwrite
     # another recipe's checkpoints.
-    training_recipe = {
+    training_recipe: dict[str, Any] = {
         "schema_version": "chatts-training-recipe-v1",
-        "profile": "chronos2-full",
+        "profile": profile,
         "data_version": version,
         "dataset_snapshot_hash": snapshot_hash,
         "base_model_path": base_model_path,
@@ -737,8 +858,9 @@ def resolve_pipeline_request(
         "seed": seed,
         "deepspeed_include": deepspeed_include,
         "stage1": stage1,
-        "stage2": stage2,
     }
+    if pipeline_mode == "full":
+        training_recipe["stage2"] = stage2
     training_recipe_hash = _hash(training_recipe)
     training_recipe_id = f"recipe-{training_recipe_hash[:16]}"
     train_output_root = f"{version_output_root.rstrip('/')}/experiments/{training_recipe_id}"
@@ -747,79 +869,114 @@ def resolve_pipeline_request(
         raise StudioError(
             "training.output_root is derived from data version and training recipe"
         )
-    final_model_path = f"{train_output_root}/best_seed{seed}"
-
-    model_name_base = integration.get("model_name_base", "chatts-msxf-8B")
-    if not isinstance(model_name_base, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", model_name_base):
-        raise StudioError("model_name_base must be a safe slug")
-    model_name_base = _with_model_scale(model_name_base, model_scale)
-    model_name = (
-        f"{_versioned_name(model_name_base, version)}-seed{seed}-{training_recipe_id}"
+    final_model_path = (
+        f"{train_output_root}/best_stage1_seed{seed}"
+        if pipeline_mode == "stage1"
+        else f"{train_output_root}/best_seed{seed}"
     )
-    eval_output_base = integration.get("evaluation_output_base")
-    if not isinstance(eval_output_base, str) or not eval_output_base:
-        raise StudioError("Missing server integration setting: evaluation_output_base")
-    eval_output_root = f"{eval_output_base.rstrip('/')}/{model_name}"
-    supplied_eval_output = evaluation_request.get("output_root")
-    if supplied_eval_output not in (None, "", eval_output_root):
-        raise StudioError("evaluation.output_root is derived from data version and cannot be changed")
-    supplied_model = evaluation_request.get("model_path")
-    if supplied_model not in (None, "", final_model_path):
-        raise StudioError("evaluation.model_path is derived from training output and cannot be changed")
 
-    run_id = f"chronos2-{version}-seed{seed}-{training_recipe_id}-full"
-    config = {
-        "pipeline": {
-            "seed": seed,
-            "data_version": version,
-            "dataset_snapshot_hash": snapshot_hash,
-            "training_recipe_hash": training_recipe_hash,
-            "force_train": _as_bool(
-                training_request.get("force_train", False), "training.force_train"
-            ),
-            "force_eval": _as_bool(
-                evaluation_request.get("force_eval", False), "evaluation.force_eval"
-            ),
-            "preflight_only": False,
-            "max_samples": _as_int(
-                evaluation_request.get("max_samples", 0), "evaluation.max_samples"
-            ),
-            "offline": _as_bool(
-                evaluation_request.get("offline", True), "evaluation.offline"
-            ),
-        },
+    pipeline_config: dict[str, Any] = {
+        "pipeline_mode": pipeline_mode,
+        "seed": seed,
+        "data_version": version,
+        "dataset_snapshot_hash": snapshot_hash,
+        "training_recipe_hash": training_recipe_hash,
+        "force_train": _as_bool(
+            training_request.get("force_train", False), "training.force_train"
+        ),
+        "preflight_only": False,
+    }
+    if evaluates:
+        pipeline_config.update(
+            {
+                "force_eval": _as_bool(
+                    evaluation_request.get("force_eval", False),
+                    "evaluation.force_eval",
+                ),
+                "max_samples": _as_int(
+                    evaluation_request.get("max_samples", 0),
+                    "evaluation.max_samples",
+                ),
+                "offline": _as_bool(
+                    evaluation_request.get("offline", True), "evaluation.offline"
+                ),
+            }
+        )
+    training_config: dict[str, Any] = {
+        "project_root": train_project_root,
+        "script": train_script,
+        "base_model_path": base_model_path,
+        "output_root": train_output_root,
+        "final_model_path": final_model_path,
+        "chronos2_model_path": train_chronos,
+        "dataset_dir": snapshot_dir,
+        "keep_stage1": (
+            True
+            if pipeline_mode == "stage1"
+            else _as_bool(
+                training_request.get("keep_stage1", False), "training.keep_stage1"
+            )
+        ),
+        "deepspeed_include": deepspeed_include,
+        "master_port": master_port,
+        "stage1": stage1,
+    }
+    if pipeline_mode == "stage1":
+        training_config["stage1_model_path"] = final_model_path
+    training_config["stage2"] = stage2
+
+    config: dict[str, Any] = {
+        "pipeline": pipeline_config,
         "containers": {
             "training": integration.get("training_container", "chatts"),
             "evaluation": integration.get("evaluation_container", "ragas"),
         },
-        "training": {
-            "project_root": train_project_root,
-            "script": train_script,
-            "base_model_path": base_model_path,
-            "output_root": train_output_root,
-            "final_model_path": final_model_path,
-            "chronos2_model_path": train_chronos,
-            "dataset_dir": snapshot_dir,
-            "keep_stage1": _as_bool(
-                training_request.get("keep_stage1", False), "training.keep_stage1"
-            ),
-            "deepspeed_include": deepspeed_include,
-            "master_port": master_port,
-            "stage1": stage1,
-            "stage2": stage2,
-        },
-        "evaluation": {
+        "training": training_config,
+    }
+
+    model_name: str | None = None
+    eval_output_root: str | None = None
+    run_id: str | None = None
+    if evaluates and evaluation is not None:
+        model_name_base = integration.get("model_name_base", "chatts-msxf-8B")
+        if not isinstance(model_name_base, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+", model_name_base
+        ):
+            raise StudioError("model_name_base must be a safe slug")
+        model_name_base = _with_model_scale(model_name_base, model_scale)
+        model_name = (
+            f"{_versioned_name(model_name_base, version)}-seed{seed}-{training_recipe_id}"
+        )
+        eval_output_base = integration.get("evaluation_output_base")
+        if not isinstance(eval_output_base, str) or not eval_output_base:
+            raise StudioError("Missing server integration setting: evaluation_output_base")
+        eval_output_root = f"{eval_output_base.rstrip('/')}/{model_name}"
+        supplied_eval_output = evaluation_request.get("output_root")
+        if supplied_eval_output not in (None, "", eval_output_root):
+            raise StudioError(
+                "evaluation.output_root is derived from data version and cannot be changed"
+            )
+        supplied_model = evaluation_request.get("model_path")
+        if supplied_model not in (None, "", final_model_path):
+            raise StudioError(
+                "evaluation.model_path is derived from training output and cannot be changed"
+            )
+        run_id = f"chronos2-{version}-seed{seed}-{training_recipe_id}-full"
+        config["evaluation"] = {
             **evaluation,
             "model_name": model_name,
             "output_root": eval_output_root,
             "run_id": run_id,
-        },
-    }
+        }
     result = {
         "schema_version": "chatts-dataset-studio-pipeline-v1",
         "version": version,
         "dataset_snapshot_hash": snapshot_hash,
         "dataset_names": dataset_names,
+        "mode": expected_mode,
+        "profile": profile,
+        "pipeline_mode": pipeline_mode,
+        "execution": execution,
         "config": config,
         "derived": {
             "version_output_root": version_output_root,
@@ -839,9 +996,14 @@ def resolve_pipeline_request(
 
 
 class PipelineJobs:
-    """Persistent FIFO scheduler for the fixed host training/evaluation pipeline."""
+    """Persistent FIFO scheduler for Docker-host and trusted Slurm launchers."""
 
-    def __init__(self, state_root: str | Path, pipeline_script: str | Path | None):
+    def __init__(
+        self,
+        state_root: str | Path,
+        pipeline_script: str | Path | None,
+        integration: dict[str, Any] | None = None,
+    ):
         self.state_root = Path(state_root).expanduser().resolve()
         self.jobs_root = self.state_root / "jobs"
         self.config_root = self.state_root / "configs"
@@ -852,6 +1014,7 @@ class PipelineJobs:
         self.pipeline_script = (
             Path(pipeline_script).expanduser().resolve() if pipeline_script else None
         )
+        self.integration = dict(integration or {})
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes]] = {}
         self._recover()
@@ -928,7 +1091,37 @@ class PipelineJobs:
         return decorated
 
     def list(self) -> list[dict[str, Any]]:
-        jobs = self._decorate_queue_positions(self._list_raw())
+        jobs = self._list_raw()
+        for job in jobs:
+            job_id = job.get("job_id")
+            if not isinstance(job_id, str):
+                continue
+            worker_status = self._read_worker_status(job_id)
+            if not worker_status:
+                continue
+            # A worker publishes its terminal status immediately before it
+            # exits.  Keep the durable job record authoritative for terminal
+            # transitions so callers never observe "completed" before the
+            # watcher has committed that state to jobs/<id>.json.
+            if worker_status.get("status") in {"completed", "failed", "canceled"} and job.get(
+                "status"
+            ) not in {"completed", "failed", "canceled"}:
+                continue
+            for key in (
+                "status",
+                "pid",
+                "started_at",
+                "finished_at",
+                "duration_seconds",
+                "exit_code",
+                "error",
+                "execution_backend",
+                "scheduler_job_id",
+                "scheduler_state",
+            ):
+                if key in worker_status:
+                    job[key] = worker_status[key]
+        jobs = self._decorate_queue_positions(jobs)
         return sorted(jobs, key=lambda item: item.get("created_at", ""), reverse=True)
 
     def get(self, job_id: str, *, include_log: bool = True) -> dict[str, Any]:
@@ -952,6 +1145,28 @@ class PipelineJobs:
                 job["queue_position"] = position
         else:
             job.pop("queue_position", None)
+        worker_status = self._read_worker_status(job_id)
+        if worker_status:
+            terminal_before_commit = worker_status.get("status") in {
+                "completed",
+                "failed",
+                "canceled",
+            } and job.get("status") not in {"completed", "failed", "canceled"}
+            if not terminal_before_commit:
+                for key in (
+                    "status",
+                    "pid",
+                    "started_at",
+                    "finished_at",
+                    "duration_seconds",
+                    "exit_code",
+                    "error",
+                    "execution_backend",
+                    "scheduler_job_id",
+                    "scheduler_state",
+                ):
+                    if key in worker_status:
+                        job[key] = worker_status[key]
         if include_log:
             log_path = Path(job["log_path"])
             if log_path.is_file():
@@ -960,6 +1175,24 @@ class PipelineJobs:
                     job["log_tail"] = stream.read().decode("utf-8", errors="replace")
             else:
                 job["log_tail"] = ""
+            for label, key in (
+                ("Slurm stdout", "scheduler_stdout_path"),
+                ("Slurm stderr", "scheduler_stderr_path"),
+            ):
+                value = job.get(key)
+                if not isinstance(value, str):
+                    continue
+                scheduler_id = job.get("scheduler_job_id")
+                if isinstance(scheduler_id, str):
+                    value = value.replace("%j", scheduler_id)
+                scheduler_log = Path(value)
+                if not scheduler_log.is_file():
+                    continue
+                with scheduler_log.open("rb") as stream:
+                    stream.seek(max(0, scheduler_log.stat().st_size - 100_000))
+                    tail = stream.read().decode("utf-8", errors="replace")
+                if tail:
+                    job["log_tail"] += f"\n===== {label} =====\n{tail}"
         return job
 
     def _status_path(self, job_id: str) -> Path:
@@ -1001,6 +1234,9 @@ class PipelineJobs:
             "duration_seconds",
             "exit_code",
             "error",
+            "execution_backend",
+            "scheduler_job_id",
+            "scheduler_state",
         ):
             if key in status:
                 job[key] = status[key]
@@ -1023,9 +1259,14 @@ class PipelineJobs:
         self.processes.pop(job_id, None)
 
     def _worker_command(self, job: dict[str, Any]) -> list[str]:
-        if self.pipeline_script is None:
-            raise StudioError("One-click pipeline is disabled")
-        return [
+        backend = job.get("execution_backend", "docker_host")
+        execution_cwd = job.get("execution_cwd")
+        if not isinstance(execution_cwd, str) or not execution_cwd:
+            if backend == "docker_host" and self.pipeline_script is not None:
+                execution_cwd = str(self.pipeline_script.parent.parent)
+            else:
+                raise StudioError("Queued job has no execution working directory")
+        command = [
             sys.executable,
             str(Path(__file__).with_name("pipeline_worker.py")),
             "--job-id",
@@ -1034,17 +1275,49 @@ class PipelineJobs:
             str(self.run_lock_path),
             "--status-path",
             str(self._status_path(str(job["job_id"]))),
-            "--script",
-            str(self.pipeline_script),
+            "--backend",
+            str(backend),
             "--config",
             str(job["config_path"]),
             "--cwd",
-            str(self.pipeline_script.parent.parent),
+            execution_cwd,
         ]
+        if backend == "docker_host":
+            if self.pipeline_script is None:
+                raise StudioError("One-click Docker pipeline is disabled")
+            command.extend(["--script", str(self.pipeline_script)])
+        elif backend == "slurm":
+            command.extend(
+                [
+                    "--sbatch-path",
+                    str(job["sbatch_path"]),
+                    "--sbatch-sha256",
+                    str(job["sbatch_sha256"]),
+                    "--scheduler-stdout",
+                    str(job["scheduler_stdout_path"]),
+                    "--scheduler-stderr",
+                    str(job["scheduler_stderr_path"]),
+                    "--poll-seconds",
+                    str(self.integration.get("slurm_poll_seconds", 5.0)),
+                    "--accounting-grace-seconds",
+                    str(self.integration.get("slurm_accounting_grace_seconds", 120.0)),
+                ]
+            )
+            scheduler_job_id = job.get("scheduler_job_id")
+            if isinstance(scheduler_job_id, str):
+                command.extend(["--scheduler-job-id", scheduler_job_id])
+            if job.get("kind") == "preflight":
+                command.append("--slurm-preflight")
+        else:
+            raise StudioError(f"Unknown execution backend in queued job: {backend}")
+        return command
 
     def _launch_locked(self, job: dict[str, Any]) -> bool:
         job_id = str(job["job_id"])
-        if self.pipeline_script is None or not self.pipeline_script.is_file():
+        backend = job.get("execution_backend", "docker_host")
+        if backend == "docker_host" and (
+            self.pipeline_script is None or not self.pipeline_script.is_file()
+        ):
             job.update(
                 {
                     "status": "failed",
@@ -1054,6 +1327,44 @@ class PipelineJobs:
                         "Could not start fixed pipeline script: pipeline_script "
                         "is missing on the host"
                     ),
+                }
+            )
+            self._write(job)
+            return False
+        if backend == "slurm":
+            sbatch_path = Path(str(job.get("sbatch_path", "")))
+            expected_hash = job.get("sbatch_sha256")
+            try:
+                actual_hash = hashlib.sha256(sbatch_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                actual_hash = None
+                job.update(
+                    {
+                        "status": "failed",
+                        "finished_at": _utc_now(),
+                        "exit_code": 126,
+                        "error": f"Could not read frozen Slurm launcher: {exc}",
+                    }
+                )
+            if actual_hash is None or actual_hash != expected_hash:
+                if actual_hash is not None:
+                    job.update(
+                        {
+                            "status": "failed",
+                            "finished_at": _utc_now(),
+                            "exit_code": 126,
+                            "error": "Slurm launcher changed after this job was frozen",
+                        }
+                    )
+                self._write(job)
+                return False
+        elif backend != "docker_host":
+            job.update(
+                {
+                    "status": "failed",
+                    "finished_at": _utc_now(),
+                    "exit_code": 126,
+                    "error": f"Unknown execution backend: {backend}",
                 }
             )
             self._write(job)
@@ -1075,10 +1386,17 @@ class PipelineJobs:
         try:
             status_path.unlink(missing_ok=True)
             self.logs_root.mkdir(parents=True, exist_ok=True)
+            execution_cwd = job.get("execution_cwd")
+            if not isinstance(execution_cwd, str) or not execution_cwd:
+                execution_cwd = (
+                    str(self.pipeline_script.parent.parent)
+                    if self.pipeline_script is not None
+                    else str(self.state_root)
+                )
             with Path(str(job["log_path"])).open("wb") as log_stream:
                 process = subprocess.Popen(  # noqa: S603 - configured executable only.
                     self._worker_command(job),
-                    cwd=self.pipeline_script.parent.parent,
+                    cwd=Path(execution_cwd),
                     env=dict(os.environ),
                     stdout=log_stream,
                     stderr=subprocess.STDOUT,
@@ -1118,11 +1436,6 @@ class PipelineJobs:
         jobs = self._list_raw()
         if any(job.get("status") == "running" for job in jobs):
             return
-        # Keep pending work durable if the host is restarted with an incomplete
-        # integration mount/config. A later correctly configured restart will
-        # dispatch it; submitting new work is already rejected by start().
-        if self.pipeline_script is None or not self.pipeline_script.is_file():
-            return
         queued = sorted(
             (job for job in jobs if job.get("status") == "queued"),
             key=self._fifo_key,
@@ -1131,6 +1444,10 @@ class PipelineJobs:
         # launcher disappeared, fail it explicitly and continue draining the
         # queue instead of blocking every later experiment forever.
         for job in queued:
+            if job.get("execution_backend", "docker_host") == "docker_host" and (
+                self.pipeline_script is None or not self.pipeline_script.is_file()
+            ):
+                continue
             if self._launch_locked(job):
                 return
 
@@ -1140,7 +1457,7 @@ class PipelineJobs:
         else:
             while True:
                 status = self._read_worker_status(job_id)
-                if status and status.get("status") in {"completed", "failed"}:
+                if status and status.get("status") in {"completed", "failed", "canceled"}:
                     break
                 job = self.get(job_id, include_log=False)
                 pid = (status or {}).get("pid", job.get("pid"))
@@ -1152,7 +1469,7 @@ class PipelineJobs:
         # tiny retry also covers slow network filesystems used by the HPC setup.
         for _ in range(20):
             status = self._read_worker_status(job_id)
-            if status and status.get("status") in {"completed", "failed"}:
+            if status and status.get("status") in {"completed", "failed", "canceled"}:
                 with self.lock:
                     self._apply_worker_status_locked(job_id, status)
                     self._dispatch_next_locked()
@@ -1172,9 +1489,18 @@ class PipelineJobs:
                 if not isinstance(job_id, str):
                     continue
                 status = self._read_worker_status(job_id)
-                if status and status.get("status") in {"completed", "failed"}:
+                if status and status.get("status") in {"completed", "failed", "canceled"}:
                     self._apply_worker_status_locked(job_id, status)
                     continue
+                if (
+                    job.get("execution_backend") == "slurm"
+                    and status
+                    and isinstance(status.get("scheduler_job_id"), str)
+                ):
+                    job["scheduler_job_id"] = status["scheduler_job_id"]
+                    if "scheduler_state" in status:
+                        job["scheduler_state"] = status["scheduler_state"]
+                    self._write(job)
                 pid = (status or {}).get("pid", job.get("pid"))
                 if self._pid_alive(pid):
                     # Covers a service crash after Popen but before the queued
@@ -1196,8 +1522,24 @@ class PipelineJobs:
                     if final_status and final_status.get("status") in {
                         "completed",
                         "failed",
+                        "canceled",
                     }:
                         self._apply_worker_status_locked(job_id, final_status)
+                    elif (
+                        job.get("execution_backend") == "slurm"
+                        and status
+                        and isinstance(status.get("scheduler_job_id"), str)
+                    ):
+                        # The local tracker may die while the scheduler job keeps
+                        # running (for example after a control-plane reboot).
+                        # Requeue a tracker for the existing immutable Slurm id;
+                        # never submit a second training job.
+                        job["status"] = "queued"
+                        job["scheduler_job_id"] = status["scheduler_job_id"]
+                        if "scheduler_state" in status:
+                            job["scheduler_state"] = status["scheduler_state"]
+                        job.pop("pid", None)
+                        self._write(job)
                     else:
                         self._mark_interrupted_locked(job_id)
                 # A genuine queued item has no worker yet and remains queued.
@@ -1235,6 +1577,13 @@ class PipelineJobs:
         if isinstance(pipeline, dict):
             for key in ("trial_id", "trial_config_hash", "preflight_only"):
                 pipeline.pop(key, None)
+            if pipeline.get("pipeline_mode") == "stage1":
+                training = comparable.get("training")
+                if isinstance(training, dict):
+                    # The Slurm verifier receives a canonical Stage2 block for
+                    # snapshot compatibility, but Stage1-only never executes it.
+                    # Do not report that inert block as an experiment change.
+                    training.pop("stage2", None)
         return comparable
 
     @staticmethod
@@ -1247,7 +1596,7 @@ class PipelineJobs:
 
     def _previous_training_comparison(self) -> tuple[str | None, dict[str, Any] | None]:
         for job in self.list():
-            if job.get("kind") != "train_eval":
+            if job.get("kind") not in {"train_eval", "train_stage1", "train_full"}:
                 continue
             comparison_path = job.get("comparison_path")
             if isinstance(comparison_path, str):
@@ -1282,7 +1631,7 @@ class PipelineJobs:
     ) -> dict[str, Any]:
         record_root = self.run_records_root / job_id
         record_root.mkdir(parents=True, exist_ok=False)
-        exported_config = record_root / "training_eval_config.resolved.yaml"
+        exported_config = record_root / "pipeline_config.resolved.yaml"
         exported_config.write_text(config_path.read_text(encoding="utf-8"), encoding="utf-8")
 
         snapshot_dir = Path(str(config["training"]["dataset_dir"]))
@@ -1303,9 +1652,15 @@ class PipelineJobs:
             json.dumps(data_export, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
 
+        resolved_execution = resolved.get("execution", {"backend": "docker_host"})
         comparison = {
             "data": {key: value for key, value in data_export.items() if key != "exported_at"},
             "config": self._comparison_config(config),
+            "execution": {
+                key: resolved_execution.get(key)
+                for key in ("backend", "sbatch_relative_path", "sbatch_sha256")
+                if resolved_execution.get(key) is not None
+            },
         }
         comparison_path = record_root / "comparison.json"
         comparison_path.write_text(
@@ -1351,6 +1706,17 @@ class PipelineJobs:
                 )
         diff_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+        record_artifacts = {
+            "训练参数配置": str(exported_config),
+            "训练数据清单": str(data_path),
+            "与上次差异 JSON": str(diff_json_path),
+            "与上次差异报告": str(diff_md_path),
+            "不可变数据快照": str(snapshot_dir),
+        }
+        if resolved_execution.get("backend") == "slurm":
+            record_artifacts["Slurm 提交脚本"] = str(
+                resolved_execution.get("sbatch_path")
+            )
         record = {
             "schema_version": "chatts-dataset-studio-run-record-v1",
             "job_id": job_id,
@@ -1358,14 +1724,9 @@ class PipelineJobs:
             "version": resolved["version"],
             "dataset_snapshot_hash": resolved["dataset_snapshot_hash"],
             "config_hash": config["pipeline"]["trial_config_hash"],
+            "execution": resolved_execution,
             "previous_job_id": previous_job_id,
-            "artifacts": {
-                "训练参数配置": str(exported_config),
-                "训练数据清单": str(data_path),
-                "与上次差异 JSON": str(diff_json_path),
-                "与上次差异报告": str(diff_md_path),
-                "不可变数据快照": str(snapshot_dir),
-            },
+            "artifacts": record_artifacts,
         }
         record_path = record_root / "run_record.json"
         record_path.write_text(
@@ -1384,10 +1745,32 @@ class PipelineJobs:
         }
 
     def start(self, resolved: dict[str, Any], *, preflight: bool = False) -> dict[str, Any]:
-        if self.pipeline_script is None or not self.pipeline_script.is_file():
-            raise StudioError(
-                "One-click pipeline is disabled or pipeline_script does not exist on the host"
-            )
+        execution = _mapping(resolved.get("execution"), "resolved.execution")
+        backend = execution.get("backend", "docker_host")
+        if backend == "docker_host":
+            if self.pipeline_script is None or not self.pipeline_script.is_file():
+                raise StudioError(
+                    "One-click pipeline is disabled or pipeline_script does not exist on the host"
+                )
+            execution_cwd = self.pipeline_script.parent.parent
+        elif backend == "slurm":
+            if shutil.which("sbatch") is None:
+                raise StudioError("Slurm backend is disabled because sbatch is unavailable")
+            sbatch_path = Path(str(execution.get("sbatch_path", "")))
+            sbatch_sha256 = execution.get("sbatch_sha256")
+            try:
+                current_sha256 = hashlib.sha256(sbatch_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise StudioError(f"Cannot read trusted Slurm launcher: {exc}") from exc
+            if current_sha256 != sbatch_sha256:
+                raise StudioError("Trusted Slurm launcher changed after request resolution")
+            execution_cwd = Path(str(execution.get("training_root", "")))
+            if not execution_cwd.is_dir():
+                raise StudioError(
+                    f"Slurm training root is unavailable: {execution_cwd}"
+                )
+        else:
+            raise StudioError(f"Unknown execution backend: {backend}")
         with self.lock:
             job_id = uuid.uuid4().hex
             self.config_root.mkdir(parents=True, exist_ok=True)
@@ -1409,10 +1792,32 @@ class PipelineJobs:
                 artifacts = self._write_run_record(job_id, resolved, config, config_path)
                 comparison_path = artifacts.pop("comparison")
                 diff_summary = artifacts.pop("diff_summary")
+            scheduler_stdout_path = (
+                self.logs_root / f"{job_id}-slurm-%j.out"
+                if backend == "slurm"
+                else None
+            )
+            scheduler_stderr_path = (
+                self.logs_root / f"{job_id}-slurm-%j.err"
+                if backend == "slurm"
+                else None
+            )
+            if backend == "slurm":
+                artifacts["Slurm 提交脚本"] = str(execution["sbatch_path"])
+                artifacts["Slurm 标准输出"] = str(scheduler_stdout_path)
+                artifacts["Slurm 标准错误"] = str(scheduler_stderr_path)
+            if preflight:
+                kind = "preflight"
+            elif resolved.get("pipeline_mode") == "stage1":
+                kind = "train_stage1"
+            elif backend == "slurm":
+                kind = "train_full"
+            else:
+                kind = "train_eval"
             job = {
                 "schema_version": "chatts-dataset-studio-job-v1",
                 "job_id": job_id,
-                "kind": "preflight" if preflight else "train_eval",
+                "kind": kind,
                 "status": "queued",
                 "created_at": _utc_now(),
                 "queue_sequence": self._next_queue_sequence_locked(),
@@ -1423,9 +1828,21 @@ class PipelineJobs:
                 "comparison_path": comparison_path,
                 "diff_from_previous": diff_summary,
                 "log_path": str(log_path),
+                "execution_backend": backend,
+                "execution_cwd": str(execution_cwd),
                 "derived": resolved["derived"],
                 "artifacts": artifacts,
             }
+            if backend == "slurm":
+                job.update(
+                    {
+                        "sbatch_path": str(execution["sbatch_path"]),
+                        "sbatch_relative_path": execution.get("sbatch_relative_path"),
+                        "sbatch_sha256": execution["sbatch_sha256"],
+                        "scheduler_stdout_path": str(scheduler_stdout_path),
+                        "scheduler_stderr_path": str(scheduler_stderr_path),
+                    }
+                )
             self._write(job)
             self._dispatch_next_locked()
             return self.get(job_id, include_log=False)

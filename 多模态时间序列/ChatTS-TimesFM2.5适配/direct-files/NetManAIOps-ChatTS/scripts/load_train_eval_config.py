@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 KEY_TO_ENV = {
+    "pipeline.pipeline_mode": "PIPELINE_MODE",
     "pipeline.seed": "SEED",
     "pipeline.force_train": "FORCE_TRAIN",
     "pipeline.force_eval": "FORCE_EVAL",
@@ -34,6 +35,7 @@ KEY_TO_ENV = {
     "training.script": "TRAIN_SCRIPT",
     "training.base_model_path": "BASE_MODEL_PATH",
     "training.output_root": "TRAIN_OUTPUT_ROOT",
+    "training.stage1_model_path": "STAGE1_OUT",
     "training.final_model_path": "FINAL_MODEL_PATH",
     "training.chronos2_model_path": "TRAIN_CHRONOS2_MODEL_PATH",
     "training.dataset_dir": "DATASET_DIR",

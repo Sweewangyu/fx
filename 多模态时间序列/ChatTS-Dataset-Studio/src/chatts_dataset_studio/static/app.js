@@ -14,8 +14,8 @@ const state = {
   activeJobId: null,
   busy: new Set(),
   stages: {
-    stage1: { sources: new Set(), qualities: new Set(), difficulties: new Set(), abilities: new Set() },
-    stage2: { sources: new Set(), qualities: new Set(), difficulties: new Set(), abilities: new Set() },
+    stage1: { sources: new Set(), sourceRules: new Map() },
+    stage2: { sources: new Set(), sourceRules: new Map() },
   },
 };
 
@@ -83,17 +83,22 @@ function pathPayload() {
 
 function stagePayload(stageName) {
   const stage = state.stages[stageName];
-  const available = (state.catalog?.sources || [])
-    .filter((source) => source.available)
-    .map((source) => source.name);
-  const selectedAll = available.length > 0
-    && available.every((name) => stage.sources.has(name))
-    && stage.sources.size === available.length;
+  const preset = stagePreset(stageName);
+  const sourceRules = {};
+  for (const sourceName of [...stage.sources].sort()) {
+    const rule = ensureSourceRule(stageName, sourceName);
+    sourceRules[sourceName] = {
+      qualities: [...rule.qualities].sort(),
+      difficulties: [...rule.difficulties].sort(),
+      abilities: [...rule.abilities].sort(),
+    };
+  }
   return {
-    sources: selectedAll ? ["*"] : [...stage.sources].sort(),
-    qualities: [...stage.qualities].sort(),
-    difficulties: [...stage.difficulties].sort(),
-    abilities: [...stage.abilities].sort(),
+    sources: [...stage.sources].sort(),
+    qualities: [...preset.qualities].sort(),
+    difficulties: [...preset.difficulties].sort(),
+    abilities: [],
+    source_rules: sourceRules,
   };
 }
 
@@ -160,7 +165,8 @@ function renderActionState() {
   const scanned = Boolean(state.catalog);
   const previewReady = Boolean(state.preview && state.previewFingerprint === selectionFingerprint());
   const hasVersion = Boolean(versionName(state.activeVersion));
-  const canRun = hasVersion && state.pipelineEnabled && $("#base-model-path").value.trim().startsWith("/");
+  const slurmReady = $("#execution-backend").value !== "slurm" || Boolean($("#slurm-sbatch-path").value);
+  const canRun = hasVersion && state.pipelineEnabled && slurmReady && $("#base-model-path").value.trim().startsWith("/");
   $("#scan-button").disabled = !state.defaults || state.busy.has("scan-button");
   $("#rebuild-sources").disabled = !state.defaults || state.busy.has("rebuild-sources");
   $("#preview-button").disabled = !scanned || state.busy.has("preview-button");
@@ -209,16 +215,59 @@ function openSettings(open) {
 }
 
 function initializeRules() {
+  for (const stageName of ["stage1", "stage2"]) {
+    state.stages[stageName].sources = new Set();
+    state.stages[stageName].sourceRules = new Map();
+  }
+}
+
+function stagePreset(stageName) {
   const fallback = {
     stage1: { qualities: ["weak", "acceptable", "good", "excellent"], difficulties: ["very_easy", "easy", "moderate"] },
     stage2: { qualities: ["weak", "acceptable", "good", "excellent"], difficulties: ["moderate", "hard", "very_hard"] },
   };
-  for (const stageName of ["stage1", "stage2"]) {
-    const preset = state.defaults.presets?.[stageName] || fallback[stageName];
-    state.stages[stageName].qualities = new Set(preset.qualities || []);
-    state.stages[stageName].difficulties = new Set(preset.difficulties || []);
-    state.stages[stageName].abilities = new Set();
+  const value = state.defaults?.presets?.[stageName] || fallback[stageName];
+  return {
+    qualities: new Set(value.qualities || []),
+    difficulties: new Set(value.difficulties || []),
+  };
+}
+
+function catalogSource(sourceName) {
+  return (state.catalog?.sources || []).find((source) => source.name === sourceName) || null;
+}
+
+function orderedDimension(source, type) {
+  const values = Object.keys(source?.[type] || {});
+  if (type === "quality") {
+    return (state.defaults?.quality_levels || []).filter((value) => values.includes(value));
   }
+  if (type === "difficulty") {
+    return (state.defaults?.difficulty_levels || []).filter((value) => values.includes(value));
+  }
+  return values.sort((left, right) => Number(source.ability[right] || 0) - Number(source.ability[left] || 0) || left.localeCompare(right));
+}
+
+function defaultSourceRule(stageName, sourceName) {
+  const source = catalogSource(sourceName);
+  const preset = stagePreset(stageName);
+  const availableQualities = orderedDimension(source, "quality");
+  const availableDifficulties = orderedDimension(source, "difficulty");
+  const presetQualities = availableQualities.filter((value) => preset.qualities.has(value));
+  const presetDifficulties = availableDifficulties.filter((value) => preset.difficulties.has(value));
+  return {
+    qualities: new Set(presetQualities.length ? presetQualities : availableQualities),
+    difficulties: new Set(presetDifficulties.length ? presetDifficulties : availableDifficulties),
+    abilities: new Set(),
+  };
+}
+
+function ensureSourceRule(stageName, sourceName) {
+  const stage = state.stages[stageName];
+  if (!stage.sourceRules.has(sourceName)) {
+    stage.sourceRules.set(sourceName, defaultSourceRule(stageName, sourceName));
+  }
+  return stage.sourceRules.get(sourceName);
 }
 
 function markRecipeDirty() {
@@ -232,7 +281,7 @@ function markRecipeDirty() {
   renderActionState();
 }
 
-function ruleGroup(stageName, type, title, values, labels, selected) {
+function ruleGroup(stageName, sourceName, type, title, values, labels, selected, counts) {
   const fieldset = element("fieldset", "rule-group");
   fieldset.append(element("legend", "", title));
   const chips = element("div", "chips");
@@ -242,17 +291,18 @@ function ruleGroup(stageName, type, title, values, labels, selected) {
     input.type = "checkbox";
     input.checked = selected.has(value);
     input.dataset.stage = stageName;
+    input.dataset.sourceRule = sourceName;
     input.dataset.type = type;
     input.value = value;
-    label.append(input, element("span", "", labels?.[value] || value));
+    const text = `${labels?.[value] || value} · ${formatCount(counts?.[value])}`;
+    label.append(input, element("span", "", text));
     chips.append(label);
   }
   fieldset.append(chips);
   return fieldset;
 }
 
-function abilityGroup(stageName) {
-  const selected = state.stages[stageName].abilities;
+function abilityGroup(stageName, sourceName, source, selected) {
   const fieldset = element("fieldset", "rule-group");
   fieldset.append(element("legend", "", "能力"));
   const chips = element("div", "chips");
@@ -261,18 +311,20 @@ function abilityGroup(stageName) {
   allInput.type = "checkbox";
   allInput.checked = selected.size === 0;
   allInput.dataset.stage = stageName;
+  allInput.dataset.sourceRule = sourceName;
   allInput.dataset.type = "abilities-all";
   all.append(allInput, element("span", "", "全部"));
   chips.append(all);
-  for (const ability of state.catalog?.abilities || []) {
+  for (const ability of orderedDimension(source, "ability")) {
     const label = element("label", "chip");
     const input = element("input");
     input.type = "checkbox";
     input.checked = selected.has(ability);
     input.dataset.stage = stageName;
+    input.dataset.sourceRule = sourceName;
     input.dataset.type = "abilities";
     input.value = ability;
-    label.append(input, element("span", "", ability));
+    label.append(input, element("span", "", `${ability} · ${formatCount(source.ability?.[ability])}`));
     chips.append(label);
   }
   fieldset.append(chips);
@@ -283,11 +335,29 @@ function renderRules() {
   if (!state.catalog) return;
   for (const stageName of ["stage1", "stage2"]) {
     const stage = state.stages[stageName];
-    $(`#${stageName}-rules`).replaceChildren(
-      ruleGroup(stageName, "qualities", "质量", state.defaults.quality_levels, state.defaults.quality_labels_zh, stage.qualities),
-      ruleGroup(stageName, "difficulties", "难度", state.defaults.difficulty_levels, state.defaults.difficulty_labels_zh, stage.difficulties),
-      abilityGroup(stageName),
-    );
+    const root = $(`#${stageName}-rules`);
+    root.replaceChildren();
+    for (const sourceName of [...stage.sources].sort()) {
+      const source = catalogSource(sourceName);
+      if (!source) continue;
+      const rule = ensureSourceRule(stageName, sourceName);
+      const details = element("details", "source-rule-card");
+      if (stage.sources.size <= 6) details.open = true;
+      const summary = element("summary", "source-rule-summary");
+      const identity = element("span");
+      identity.append(element("strong", "", sourceName), element("small", "", `${formatCount(source.rows)} 条 · 逐数据集规则`));
+      const abilitySummary = rule.abilities.size ? `${rule.abilities.size} 能力` : "全部能力";
+      summary.append(identity, element("b", "", `${rule.qualities.size} 质量 · ${rule.difficulties.size} 难度 · ${abilitySummary}`));
+      const groups = element("div", "source-rule-groups");
+      groups.append(
+        ruleGroup(stageName, sourceName, "qualities", "质量", orderedDimension(source, "quality"), state.defaults.quality_labels_zh, rule.qualities, source.quality),
+        ruleGroup(stageName, sourceName, "difficulties", "难度", orderedDimension(source, "difficulty"), state.defaults.difficulty_labels_zh, rule.difficulties, source.difficulty),
+        abilityGroup(stageName, sourceName, source, rule.abilities),
+      );
+      details.append(summary, groups);
+      root.append(details);
+    }
+    if (!root.childElementCount) root.append(element("div", "list-empty", "请先为该阶段选择数据集"));
   }
 }
 
@@ -352,8 +422,14 @@ function chooseSources(mode) {
   if (!state.catalog) return;
   const available = state.catalog.sources.filter((source) => source.available).map((source) => source.name);
   const names = mode === "all" ? available : [];
-  for (const stageName of ["stage1", "stage2"]) state.stages[stageName].sources = new Set(names);
+  for (const stageName of ["stage1", "stage2"]) {
+    state.stages[stageName].sources = new Set(names);
+    state.stages[stageName].sourceRules = new Map(
+      names.map((name) => [name, defaultSourceRule(stageName, name)]),
+    );
+  }
   renderSources();
+  renderRules();
   markRecipeDirty();
   showToast(mode === "clear" ? "已清空" : `已选择 ${names.length} 个数据源`, "success");
 }
@@ -378,7 +454,12 @@ async function scanCatalog() {
       state.catalog = await api("/api/catalog", { method: "POST", body: JSON.stringify(pathPayload()) });
       initializeRules();
       const available = state.catalog.sources.filter((source) => source.available).map((source) => source.name);
-      for (const stageName of ["stage1", "stage2"]) state.stages[stageName].sources = new Set(available);
+      for (const stageName of ["stage1", "stage2"]) {
+        state.stages[stageName].sources = new Set(available);
+        state.stages[stageName].sourceRules = new Map(
+          available.map((name) => [name, defaultSourceRule(stageName, name)]),
+        );
+      }
       state.preview = null;
       state.previewFingerprint = null;
       renderSources();
@@ -419,8 +500,11 @@ function validateRecipe() {
     const label = stageName === "stage1" ? "Stage 1" : "Stage 2";
     const stage = state.stages[stageName];
     if (!stage.sources.size) throw new Error(`${label} 至少选择一个数据源`);
-    if (!stage.qualities.size) throw new Error(`${label} 至少选择一个质量等级`);
-    if (!stage.difficulties.size) throw new Error(`${label} 至少选择一个难度等级`);
+    for (const sourceName of stage.sources) {
+      const rule = ensureSourceRule(stageName, sourceName);
+      if (!rule.qualities.size) throw new Error(`${label} 的 ${sourceName} 至少选择一个质量等级`);
+      if (!rule.difficulties.size) throw new Error(`${label} 的 ${sourceName} 至少选择一个难度等级`);
+    }
   }
 }
 
@@ -715,10 +799,17 @@ function evaluationPayload() {
 }
 
 function runPayload(mode) {
-  return {
+  const profile = $("#train-profile").value;
+  const backend = $("#execution-backend").value;
+  const payload = {
     mode,
     version: versionName(state.activeVersion),
+    execution: {
+      backend,
+      sbatch_path: backend === "slurm" ? $("#slurm-sbatch-path").value : null,
+    },
     training: {
+      profile,
       base_model_path: $("#base-model-path").value.trim(),
       seed: Number($("#train-seed").value),
       deepspeed_include: $("#deepspeed-include").value.trim(),
@@ -728,19 +819,29 @@ function runPayload(mode) {
       stage1: trainingStagePayload("stage1"),
       stage2: trainingStagePayload("stage2"),
     },
-    evaluation: evaluationPayload(),
   };
+  if (shouldEvaluate()) payload.evaluation = evaluationPayload();
+  return payload;
+}
+
+function shouldEvaluate() {
+  return $("#train-profile").value === "chronos2-full" && $("#execution-backend").value === "docker_host";
+}
+
+function effectiveRunMode() {
+  return shouldEvaluate() ? "train_eval" : "train";
 }
 
 function validateRun(mode) {
   if (!versionName(state.activeVersion)) throw new Error("请先选择已注册的数据版本");
   const baseModelPath = $("#base-model-path").value.trim();
   if (!baseModelPath.startsWith("/")) throw new Error("请填写训练容器内可见的基础模型绝对路径");
-  if (["eval", "train_eval"].includes(mode) && !evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
+  if (mode === "train_eval" && !evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
+  if ($("#execution-backend").value === "slurm" && !$("#slurm-sbatch-path").value) throw new Error("请选择可信的 Slurm sbatch 脚本");
 }
 
 async function startRun(mode, button) {
-  const effectiveMode = mode === "preflight" ? "train_eval" : mode;
+  const effectiveMode = effectiveRunMode();
   try { validateRun(effectiveMode); } catch (error) { showToast(error.message, "error"); return; }
   const endpoint = mode === "preflight" ? "/api/runs/preflight" : "/api/runs";
   await withBusy(button, mode === "preflight" ? "预检中…" : "启动中…", async () => {
@@ -750,7 +851,7 @@ async function startRun(mode, button) {
       const submittedStatus = result.status === "queued"
         ? `已加入队列，当前第 ${result.queue_position || 1} 位。`
         : "已经开始运行。";
-      $("#run-status").textContent = mode === "preflight" ? `预检任务${submittedStatus}` : `训练评测任务${submittedStatus}`;
+      $("#run-status").textContent = mode === "preflight" ? `预检任务${submittedStatus}` : `${shouldEvaluate() ? "训练评测" : "训练"}任务${submittedStatus}`;
       if (id) {
         state.activeJobId = id;
         state.jobs.unshift(result);
@@ -768,11 +869,12 @@ async function startRun(mode, button) {
 }
 
 function jobStatusLabel(status) {
-  return ({ queued: "排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
+  return ({ queued: "本地排队", scheduled: "Slurm 排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
 }
 
 function jobType(job) {
-  return job.type || job.kind || job.mode || job.phase || "任务";
+  const value = job.type || job.kind || job.mode || job.phase || "任务";
+  return ({ train_eval: "两阶段训练 + 评测", train_stage1: "Stage 1 训练", train_full: "两阶段训练", preflight: "Preflight", publish: "发布版本" })[value] || value;
 }
 
 function formatDate(value) {
@@ -843,8 +945,9 @@ function renderJobDialog(job) {
   const diffPanel = $("#job-diff");
   const diffList = $("#job-diff-list");
   diffList.replaceChildren();
-  diffPanel.hidden = !diff || job.kind !== "train_eval";
-  if (diff && job.kind === "train_eval") {
+  const trainingKinds = new Set(["train_eval", "train_stage1", "train_full"]);
+  diffPanel.hidden = !diff || !trainingKinds.has(job.kind);
+  if (diff && trainingKinds.has(job.kind)) {
     if (!diff.has_previous_run) {
       $("#job-diff-summary").textContent = "这是第一条训练记录，没有可比较的上一次训练。";
     } else if (!diff.change_count) {
@@ -906,8 +1009,9 @@ function updateDerivedPaths() {
   const root = $("#train-output-root").value.trim();
   const seed = $("#train-seed").value;
   const cleanRoot = root.replace(/\/$/, "").replace(/(?:[-_]?data-?v\d+)$/i, "");
+  const finalName = $("#train-profile").value === "chronos2-stage1" ? `best_stage1_seed${seed}` : `best_seed${seed}`;
   $("#final-model-preview").textContent = cleanRoot && version
-    ? `${cleanRoot}-${version}/experiments/recipe-<训练参数哈希>/best_seed${seed}`
+    ? `${cleanRoot}-${version}/experiments/recipe-<训练参数哈希>/${finalName}`
     : "由服务端按版本与训练参数生成";
   $("#suite-count").textContent = `${$$("#benchmark-suites input:checked").length} 项`;
 }
@@ -958,11 +1062,63 @@ function integrationMissingItems(pipeline, integration) {
   return required.filter(([, value]) => value === null || value === undefined || value === "").map(([name]) => name);
 }
 
+function selectedBackendStatus(integration) {
+  const backend = $("#execution-backend").value || integration.execution_mode || "docker_host";
+  const profile = $("#train-profile").value || "chronos2-full";
+  const backendStatus = integration.backends?.[backend];
+  return backendStatus?.profiles?.[profile] || backendStatus || {
+    enabled: integration.enabled,
+    disabled_reasons: integration.disabled_reasons || integration.missing || [],
+  };
+}
+
+function refreshTrainingModeUI() {
+  const profile = $("#train-profile").value;
+  const backend = $("#execution-backend").value;
+  const stage1Only = profile === "chronos2-stage1";
+  const slurm = backend === "slurm";
+  $("#slurm-sbatch-field").hidden = !slurm;
+  $("#stage2-training-card").hidden = stage1Only;
+  $("#evaluation-config-card").hidden = !shouldEvaluate();
+  $("#keep-stage1").disabled = stage1Only;
+  if (stage1Only) $("#keep-stage1").checked = true;
+
+  const primaryLabel = stage1Only
+    ? "只训练并保存 Stage 1"
+    : slurm
+      ? "提交两阶段 Slurm 训练"
+      : "训练 + 评测";
+  $("#primary-run-button").textContent = primaryLabel;
+  $("#primary-run-button").dataset.defaultLabel = primaryLabel;
+  const overview = $("#overview-run");
+  $("strong", overview).textContent = primaryLabel;
+  $("small", overview).textContent = slurm ? "提交到 Slurm，任务配置会被冻结" : "启动或加入 FIFO 队列";
+  const launchTitle = $("#launch-step-run strong");
+  const launchHelp = $("#launch-step-run small");
+  $("#launch-step-training small").textContent = stage1Only
+    ? "在“训练”页确认基础模型、GPU 和 Stage 1 参数。"
+    : "在“训练”页确认基础模型、GPU 和两阶段参数。";
+  $("#launch-guide-title + p").textContent = shouldEvaluate()
+    ? "训练与评测按同一数据版本连续执行。"
+    : "当前方案只训练并保存权重，不自动启动 benchmark。";
+  launchTitle.textContent = primaryLabel;
+  launchHelp.textContent = slurm
+    ? "提交可信 sbatch；训练参数和数据快照来自本次冻结配置。"
+    : stage1Only
+      ? "只保存 Stage 1 最终权重，不启动评测容器。"
+      : "有任务运行时自动排队，完成后按提交顺序启动。";
+
+  const pipeline = state.defaults?.pipeline || {};
+  renderIntegrationStatus(pipeline, pipeline.integration || state.defaults?.integration || {});
+  updateDerivedPaths();
+  renderActionState();
+}
+
 function renderLaunchSteps() {
   const version = versionName(state.activeVersion);
   const sameVersion = (job) => !job.version || !version || job.version === version;
   const preflightDone = state.jobs.some((job) => job.kind === "preflight" && job.status === "completed" && sameVersion(job));
-  const pipelineDone = state.jobs.some((job) => ["train_eval", "pipeline"].includes(job.kind) && job.status === "completed" && sameVersion(job));
+  const pipelineDone = state.jobs.some((job) => ["train_eval", "train_stage1", "train_full", "pipeline"].includes(job.kind) && job.status === "completed" && sameVersion(job));
   $("#launch-step-version").classList.toggle("complete", Boolean(version));
   $("#launch-step-training").classList.toggle("complete", Boolean($("#base-model-path").value.trim()));
   $("#launch-step-preflight").classList.toggle("complete", preflightDone);
@@ -970,25 +1126,28 @@ function renderLaunchSteps() {
 }
 
 function renderIntegrationStatus(pipeline, integration) {
-  const enabled = Boolean(integration.enabled);
-  const missing = Array.isArray(integration.disabled_reasons)
-    ? integration.disabled_reasons
+  const status = selectedBackendStatus(integration);
+  const enabled = Boolean(status.enabled);
+  const missing = Array.isArray(status.disabled_reasons)
+    ? status.disabled_reasons
     : (Array.isArray(integration.missing) ? integration.missing : integrationMissingItems(pipeline, integration));
+  state.pipelineEnabled = enabled;
   $("#integration-state").textContent = enabled ? "服务已就绪" : "需要配置";
   $("#integration-state").className = `status-chip ${enabled ? "active" : "error"}`;
   $("#integration-diagnostic").hidden = enabled;
-  $("#integration-summary").textContent = enabled
-    ? ""
-    : "服务端未启用完整流水线。以下配置缺失、不可访问，或 pipeline_script 文件不存在：";
+  $("#integration-summary").textContent = enabled ? "" : "当前训练方案与执行后端尚未就绪：";
   const list = $("#integration-missing");
   list.replaceChildren();
   const items = missing.length ? missing : ["integration.pipeline_script（路径未配置或文件不存在）"];
   for (const item of items) list.append(element("li", "", item));
   const trainingContainer = integration.training_container || "chatts";
   const evaluationContainer = integration.evaluation_container || "ragas";
-  $("#execution-topology").textContent = integration.execution_mode === "docker_host"
-    ? `宿主机 Dataset Studio → ${trainingContainer}（训练）→ ${evaluationContainer}（评测）`
-    : `执行模式：${integration.execution_mode || "未配置"}`;
+  const backend = $("#execution-backend").value || integration.execution_mode;
+  $("#execution-topology").textContent = backend === "docker_host"
+    ? (shouldEvaluate()
+      ? `宿主机 Dataset Studio → ${trainingContainer}（训练）→ ${evaluationContainer}（评测）`
+      : `宿主机 Dataset Studio → ${trainingContainer}（只训练 Stage 1）`)
+    : `宿主机 Dataset Studio → Slurm sbatch → Singularity（${$("#train-profile").value === "chronos2-stage1" ? "Stage 1" : "两阶段"}训练）`;
   renderLaunchSteps();
 }
 
@@ -998,12 +1157,21 @@ function applyDefaults(defaults) {
   const pipeline = defaults.pipeline || {};
   const training = pipeline.training || defaults.training || {};
   const integration = pipeline.integration || defaults.integration || {};
-  state.pipelineEnabled = Boolean(integration.enabled);
   $("#training-root").value = integration.training_root || defaults.training_root || "由服务端配置";
   $("#base-model-path").value = training.base_model_path || defaults.base_model_path || "";
   state.modelOutputBaseTemplate = training.output_root || defaults.train_output_root || "";
   $("#train-output-root").value = state.modelOutputBaseTemplate;
   $("#train-profile").value = training.profile || "chronos2-full";
+  $("#execution-backend").value = integration.execution_mode || "docker_host";
+  const launchers = integration.backends?.slurm?.launchers || [];
+  const sbatchSelect = $("#slurm-sbatch-path");
+  sbatchSelect.replaceChildren();
+  for (const launcher of launchers) {
+    sbatchSelect.append(new Option(launcher.relative_path, launcher.relative_path));
+  }
+  if (!launchers.length) sbatchSelect.append(new Option("没有可用的 Studio sbatch", ""));
+  const defaultSbatch = integration.backends?.slurm?.default_sbatch;
+  if (defaultSbatch && [...sbatchSelect.options].some((option) => option.value === defaultSbatch)) sbatchSelect.value = defaultSbatch;
   $("#train-seed").value = training.seed ?? 42;
   $("#deepspeed-include").value = training.deepspeed_include || "localhost:0,1,2,3,4,5,6,7";
   $("#master-port").value = training.master_port ?? 19901;
@@ -1050,24 +1218,32 @@ function applyDefaults(defaults) {
   $("#haystack-root").value = evaluation.ts_haystack_root || "由服务端配置";
   $("#timeseriesexam-root").value = evaluation.timeseriesexam_root || "由服务端配置";
   $("#timeseriesexam-file").value = evaluation.timeseriesexam_data_file || "由服务端配置";
-  renderIntegrationStatus(pipeline, integration);
+  refreshTrainingModeUI();
   $("#run-status").textContent = state.pipelineEnabled
-    ? "先运行 Preflight；通过后点击“训练 + 评测”。"
-    : "请先按上方提示补齐服务端 integration 配置。";
-  updateDerivedPaths();
+    ? "先运行 Preflight；通过后启动当前训练方案。"
+    : "请先按上方提示补齐当前执行后端配置。";
 }
 
 function handleRuleChange(event) {
-  const input = event.target.closest("input[data-stage][data-type]");
+  const input = event.target.closest("input[data-stage][data-source-rule][data-type]");
   if (!input) return;
-  const stage = state.stages[input.dataset.stage];
+  const rule = ensureSourceRule(input.dataset.stage, input.dataset.sourceRule);
   if (input.dataset.type === "abilities-all") {
-    stage.abilities.clear();
-    renderRules();
+    rule.abilities.clear();
+    $$('input[data-type="abilities"]', input.closest(".source-rule-card")).forEach((item) => { item.checked = false; });
+    input.checked = true;
   } else {
-    const values = stage[input.dataset.type];
+    const values = rule[input.dataset.type];
     if (input.checked) values.add(input.value); else values.delete(input.value);
-    if (input.dataset.type === "abilities") renderRules();
+    if (input.dataset.type === "abilities") {
+      const all = $('input[data-type="abilities-all"]', input.closest(".source-rule-card"));
+      if (all) all.checked = values.size === 0;
+    }
+  }
+  const summary = $(".source-rule-summary b", input.closest(".source-rule-card"));
+  if (summary) {
+    const abilitySummary = rule.abilities.size ? `${rule.abilities.size} 能力` : "全部能力";
+    summary.textContent = `${rule.qualities.size} 质量 · ${rule.difficulties.size} 难度 · ${abilitySummary}`;
   }
   markRecipeDirty();
 }
@@ -1075,9 +1251,16 @@ function handleRuleChange(event) {
 function handleSourceChange(event) {
   const input = event.target.closest("input[data-source][data-stage]");
   if (!input) return;
-  const values = state.stages[input.dataset.stage].sources;
-  if (input.checked) values.add(input.dataset.source); else values.delete(input.dataset.source);
+  const stage = state.stages[input.dataset.stage];
+  if (input.checked) {
+    stage.sources.add(input.dataset.source);
+    ensureSourceRule(input.dataset.stage, input.dataset.source);
+  } else {
+    stage.sources.delete(input.dataset.source);
+    stage.sourceRules.delete(input.dataset.source);
+  }
   renderSources();
+  renderRules();
   markRecipeDirty();
 }
 
@@ -1103,6 +1286,9 @@ function bindEvents() {
   $("#version-list").addEventListener("click", (event) => { const button = event.target.closest("button[data-version-action]"); if (button) versionAction(button); });
   $("#version-name").addEventListener("input", updateDerivedPaths);
   $("#train-seed").addEventListener("input", updateDerivedPaths);
+  $("#train-profile").addEventListener("change", refreshTrainingModeUI);
+  $("#execution-backend").addEventListener("change", refreshTrainingModeUI);
+  $("#slurm-sbatch-path").addEventListener("change", renderActionState);
   $("#base-model-path").addEventListener("input", () => {
     syncModelOutputScale();
     const pipeline = state.defaults?.pipeline || {};
@@ -1112,7 +1298,7 @@ function bindEvents() {
   $("#benchmark-suites").addEventListener("change", updateDerivedPaths);
   $$(".run-button").forEach((button) => button.addEventListener("click", () => startRun(button.dataset.runMode, button)));
   $("#overview-preflight").addEventListener("click", () => startRun("preflight", $("#overview-preflight")));
-  $("#overview-run").addEventListener("click", () => startRun("train_eval", $("#overview-run")));
+  $("#overview-run").addEventListener("click", () => startRun(effectiveRunMode(), $("#overview-run")));
   $("#refresh-jobs").addEventListener("click", () => refreshJobs());
   for (const root of [$("#job-list"), $("#recent-jobs")]) root.addEventListener("click", (event) => { const row = event.target.closest("[data-job-id]"); if (row) openJob(row.dataset.jobId); });
   $("#close-job-dialog").addEventListener("click", () => $("#job-dialog").close());

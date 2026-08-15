@@ -134,6 +134,21 @@ def parse_rules(
             and item["name"] in available
         }
 
+    source_dimensions: dict[str, dict[str, set[str]]] | None = None
+    if catalog is not None:
+        source_dimensions = {
+            item["name"]: {
+                "qualities": set(item.get("quality", {})),
+                "difficulties": set(item.get("difficulty", {})),
+                "abilities": set(item.get("ability", {})),
+            }
+            for item in catalog.get("sources", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and item.get("available") is True
+            and item["name"] in available
+        }
+
     def expand_all(value: Any) -> Any:
         if not isinstance(value, dict) or "*" not in value.get("sources", []):
             return value
@@ -142,9 +157,19 @@ def parse_rules(
         return {**value, "sources": sorted(wildcard_sources)}
 
     return (
-        StageRule.from_mapping(expand_all(payload.get("stage1")), available),
-        StageRule.from_mapping(expand_all(payload.get("stage2")), available),
+        StageRule.from_mapping(
+            expand_all(payload.get("stage1")), available, source_dimensions
+        ),
+        StageRule.from_mapping(
+            expand_all(payload.get("stage2")), available, source_dimensions
+        ),
     )
+
+
+def canonical_selection(stage1: StageRule, stage2: StageRule) -> dict[str, Any]:
+    """Return the single canonical selection representation used by every manifest."""
+
+    return {"stage1": stage1.to_mapping(), "stage2": stage2.to_mapping()}
 
 
 def preview_selection(
@@ -192,10 +217,17 @@ def preview_selection(
             stage_totals[key] += counts[key]
         if name in selected:
             rows.append({"source": name, "source_rows": summary["rows"], **counts})
-    if stage1.sources and stage_totals["stage1"] == 0:
-        raise StudioError("Stage1 filters select zero rows")
-    if stage2.sources and stage_totals["stage2"] == 0:
-        raise StudioError("Stage2 filters select zero rows")
+    for stage_name, rule in (("stage1", stage1), ("stage2", stage2)):
+        empty_sources = sorted(
+            row["source"]
+            for row in rows
+            if row["source"] in rule.sources and row[stage_name] == 0
+        )
+        if empty_sources:
+            raise StudioError(
+                f"{stage_name.capitalize()} filters select zero rows for selected datasets: "
+                f"{empty_sources}"
+            )
     return {
         "counts": stage_totals,
         "by_source": rows,
@@ -424,20 +456,7 @@ def export_selection(
         # actually read during export, even after the equality check above.
         preview = actual_preview
 
-        selection = {
-            "stage1": {
-                "sources": sorted(stage1.sources),
-                "qualities": sorted(stage1.qualities),
-                "difficulties": sorted(stage1.difficulties),
-                "abilities": sorted(stage1.abilities),
-            },
-            "stage2": {
-                "sources": sorted(stage2.sources),
-                "qualities": sorted(stage2.qualities),
-                "difficulties": sorted(stage2.difficulties),
-                "abilities": sorted(stage2.abilities),
-            },
-        }
+        selection = canonical_selection(stage1, stage2)
         selection_hash = _hash_object(selection)
         content_identities = {
             name: {

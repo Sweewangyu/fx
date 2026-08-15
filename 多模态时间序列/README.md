@@ -12,9 +12,11 @@ Chronos-2 两阶段训练入口。
 
 ## ChatTS Dataset Studio
 
-独立的数据版本、两阶段训练和四套 benchmark 评测控制台。它会动态扫描
-`merged_labels/annotated/*.jsonl`，为所有校验通过的数据集创建 source，不再限定原始 6 个。
-可将配方发布为不可变 `datavN` 快照，并通过固定脚本串联 ChatTS-Training 与 ChatTS 评测。
+独立的数据版本、训练和四套 benchmark 评测控制台。它会动态扫描
+`merged_labels/annotated/*.jsonl`，为所有校验通过的数据集创建 source，不再限定原始 6 个；
+每个 source 可以分别选择质量、难度与能力标签。训练支持两阶段或仅 Stage1，既可走宿主机
+Docker，也可从可信目录选择通用 `.sbatch` 提交到 Slurm。每份训练配方使用独立的
+`recipe-<hash>` 模型目录，修改实际训练参数不会覆盖旧权重。
 
 - [全量 source、数据版本及一键训练评测说明](./ChatTS-Dataset-Studio/README.md)
 

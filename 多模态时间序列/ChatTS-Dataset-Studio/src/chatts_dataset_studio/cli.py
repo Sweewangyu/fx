@@ -49,8 +49,20 @@ def _load_config(path: Path | None) -> dict[str, Any]:
         return str(candidate if candidate.is_absolute() else (resolved.parent / candidate).resolve())
 
     integration_result = dict(integration)
-    for name in ("training_root", "evaluation_root", "pipeline_script"):
+    for name in (
+        "training_root",
+        "evaluation_root",
+        "pipeline_script",
+        "slurm_root",
+        "slurm_sbatch",
+    ):
         if name in integration_result:
+            # A simple sbatch filename is resolved relative to slurm_root by the
+            # trusted launcher validator, not relative to this YAML file.
+            if name == "slurm_sbatch" and isinstance(
+                integration_result[name], str
+            ) and "/" not in integration_result[name]:
+                continue
             integration_result[name] = resolve(integration_result[name])
 
     output_root = resolve(paths.get("output_root"))

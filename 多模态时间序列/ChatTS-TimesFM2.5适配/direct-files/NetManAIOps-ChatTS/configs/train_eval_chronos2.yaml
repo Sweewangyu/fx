@@ -1,7 +1,10 @@
-# ChatTS Chronos-2 two-stage training -> four-suite evaluation.
+# ChatTS Chronos-2 full two-stage/evaluation or Stage1-only training.
 # Inline environment variables still override values in this file.
 
 pipeline:
+  # full = Stage1 -> Stage2 -> evaluation (backward-compatible default)
+  # stage1 = finalize and retain Stage1, then stop without touching evaluation
+  pipeline_mode: full
   seed: 42
   force_train: false
   force_eval: false
@@ -22,6 +25,9 @@ training:
   script: /workspace/ChatTS-Training/scripts/full/run_chronos2_best_two_stage.sh
   base_model_path: /share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B
   output_root: /share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1
+  # Stage1-only mode can set a durable, recipe-specific destination here.
+  # When omitted, it defaults to output_root/.stage1_seed<seed>_s1lr_<lr>.
+  # stage1_model_path: /share/airesearch/data/finiverse/output/ChatTS-msxf-8B-datav1/best_stage1_seed42
   # Omit final_model_path to derive output_root/best_seed<seed> automatically.
   chronos2_model_path: /workspace/chronos2
   dataset_dir: /workspace/ChatTS-Training/data

@@ -169,6 +169,15 @@ code, pre { font-family: var(--mono); }
 .stage-one { border-top: 3px solid var(--teal); }
 .stage-two { border-top: 3px solid var(--blue); }
 .rule-groups { display: grid; gap: 14px; }
+.source-rule-card { margin: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.source-rule-card + .source-rule-card { margin-top: 0; }
+.source-rule-card > .source-rule-summary { min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 13px; color: var(--ink); list-style-position: inside; }
+.source-rule-summary > span { min-width: 0; flex: 1; }
+.source-rule-summary strong, .source-rule-summary small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-rule-summary strong { font: 700 15px var(--mono); }
+.source-rule-summary small { margin: 3px 0 0 20px; color: var(--muted); font-size: 15px; font-weight: 500; }
+.source-rule-summary b { color: var(--muted); font-size: 15px; font-weight: 650; white-space: nowrap; }
+.source-rule-groups { display: grid; gap: 13px; padding: 13px; border-top: 1px solid var(--line); background: #fbfcfb; }
 .rule-group { min-width: 0; margin: 0; padding: 0; border: 0; }
 .rule-group legend { margin-bottom: 7px; color: var(--muted); font-size: 16px; font-weight: 750; }
 .chips { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -257,7 +266,7 @@ td { font-family: var(--mono); }
 .job-row { width: 100%; min-height: 52px; padding: 0; border: 0; border-top: 1px solid var(--line); background: transparent; cursor: pointer; text-align: left; font-size: 16px; }
 .job-row:hover { color: var(--teal); }
 .job-status { width: max-content; padding: 3px 7px; border-radius: 10px; background: var(--surface-muted); }
-.job-status.queued { background: #fff1cd; color: #7a5700; }
+.job-status.queued, .job-status.scheduled { background: #fff1cd; color: #7a5700; }
 .job-status.running, .job-status.training, .job-status.evaluating, .job-status.exporting { background: var(--blue-soft); color: var(--blue); }
 .job-status.completed { background: var(--teal-soft); color: var(--teal-dark); }
 .job-status.failed { background: var(--danger-soft); color: var(--danger); }

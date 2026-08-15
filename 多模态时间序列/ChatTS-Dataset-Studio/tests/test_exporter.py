@@ -139,6 +139,76 @@ def test_versioned_export_namespaces_every_source_without_six_source_aliases(
     assert manifest["data_version"] == "datav3"
 
 
+def test_export_applies_and_records_per_dataset_source_rules(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    source_a, source_b = labeled_corpus["sources"][:2]
+    selection = json.loads(json.dumps(default_selection))
+    selection["stage1"]["sources"] = [source_a, source_b]
+    selection["stage1"]["source_rules"] = {
+        source_a: {
+            "qualities": ["good"],
+            "difficulties": ["hard"],
+            "abilities": ["anomaly_detection"],
+        },
+        source_b: {
+            "qualities": ["excellent"],
+            "difficulties": ["very_hard"],
+            "abilities": ["forecasting"],
+        },
+    }
+
+    result, output_dir = _export(labeled_corpus, selection, "per-dataset-rules")
+
+    assert result["counts"] == {"stage1": 2, "stage2": 18, "overlap": 2}
+    labels_a = read_jsonl(output_dir / "stage1_annotations" / f"{source_a}.jsonl")
+    labels_b = read_jsonl(output_dir / "stage1_annotations" / f"{source_b}.jsonl")
+    assert [(row["quality"], row["difficulty"]) for row in labels_a] == [("good", "hard")]
+    assert [(row["quality"], row["difficulty"]) for row in labels_b] == [
+        ("excellent", "very_hard")
+    ]
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    stage_manifest = json.loads(
+        (output_dir / "stage1" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["selection"]["stage1"]["source_rules"] == selection["stage1"][
+        "source_rules"
+    ]
+    assert stage_manifest["rule"] == manifest["selection"]["stage1"]
+    _, baseline_root = _export(labeled_corpus, default_selection, "per-dataset-baseline")
+    baseline_manifest = json.loads(
+        (baseline_root / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["selection_hash"] != baseline_manifest["selection_hash"]
+    assert manifest["dataset_snapshot_hash"] != baseline_manifest["dataset_snapshot_hash"]
+
+
+def test_redundant_source_rule_preserves_legacy_selection_and_snapshot_hash(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    _, legacy_root = _export(labeled_corpus, default_selection, "legacy-selection")
+    equivalent = json.loads(json.dumps(default_selection))
+    source = labeled_corpus["sources"][0]
+    equivalent["stage1"]["source_rules"] = {
+        source: {
+            "qualities": equivalent["stage1"]["qualities"],
+            "difficulties": equivalent["stage1"]["difficulties"],
+            "abilities": equivalent["stage1"]["abilities"],
+        }
+    }
+    _, equivalent_root = _export(labeled_corpus, equivalent, "equivalent-selection")
+    legacy_manifest = json.loads((legacy_root / "manifest.json").read_text(encoding="utf-8"))
+    equivalent_manifest = json.loads(
+        (equivalent_root / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert equivalent_manifest["selection"] == legacy_manifest["selection"]
+    assert equivalent_manifest["selection_hash"] == legacy_manifest["selection_hash"]
+    assert equivalent_manifest["dataset_snapshot_hash"] == legacy_manifest[
+        "dataset_snapshot_hash"
+    ]
+
+
 def test_snapshot_hash_is_stable_across_different_absolute_workspace_paths(
     labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
 ) -> None:

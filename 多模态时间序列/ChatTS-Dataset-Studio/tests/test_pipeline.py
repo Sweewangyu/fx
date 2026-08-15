@@ -57,6 +57,28 @@ def _version(tmp_path: Path) -> dict[str, object]:
     }
 
 
+def _trusted_slurm_integration(tmp_path: Path) -> dict[str, object]:
+    integration = _integration(tmp_path)
+    training_root = Path(str(integration["training_root"]))
+    slurm_root = training_root / "slurm"
+    slurm_root.mkdir(parents=True, exist_ok=True)
+    launcher = slurm_root / "run_chatts_studio_pipeline.sbatch"
+    launcher.write_text(
+        "#!/usr/bin/env bash\n# CHATTS_STUDIO_SBATCH_API=1\nexit 0\n",
+        encoding="utf-8",
+    )
+    integration.update(
+        {
+            "execution_mode": "slurm",
+            "slurm_root": str(slurm_root),
+            "slurm_sbatch": launcher.name,
+            "slurm_poll_seconds": 0.01,
+            "slurm_accounting_grace_seconds": 0.2,
+        }
+    )
+    return integration
+
+
 def test_resolve_pipeline_derives_versioned_paths_and_snapshot_datasets(
     tmp_path: Path,
 ) -> None:
@@ -202,6 +224,78 @@ def test_training_recipe_hash_is_stable_for_retries_and_isolates_parameter_chang
     ]
 
 
+def test_stage1_only_saves_a_final_recipe_model_and_ignores_stage2_and_eval(
+    tmp_path: Path,
+) -> None:
+    base_payload = {
+        "mode": "train",
+        "training": {
+            "profile": "chronos2-stage1",
+            "stage1": {"learning_rate": "5e-6"},
+        },
+    }
+    baseline = resolve_pipeline_request(
+        base_payload, _version(tmp_path), _integration(tmp_path)
+    )
+    changed_hidden_fields = resolve_pipeline_request(
+        {
+            **base_payload,
+            "training": {
+                **base_payload["training"],
+                "stage2": {"learning_rate": "9e-5", "num_train_epochs": 9},
+            },
+            "evaluation": {"benchmarks": ["timeseriesexam"], "max_samples": 99},
+        },
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+
+    assert baseline["pipeline_mode"] == "stage1"
+    assert baseline["mode"] == "train"
+    assert baseline["config"]["pipeline"]["pipeline_mode"] == "stage1"
+    assert baseline["config"]["training"]["keep_stage1"] is True
+    assert baseline["config"]["training"]["stage1_model_path"] == baseline["derived"][
+        "final_model_path"
+    ]
+    assert baseline["derived"]["final_model_path"].endswith("/best_stage1_seed42")
+    assert "evaluation" not in baseline["config"]
+    assert "stage2" not in baseline["derived"]["training_recipe"]
+    assert changed_hidden_fields["derived"]["training_recipe_hash"] == baseline[
+        "derived"
+    ]["training_recipe_hash"]
+    assert changed_hidden_fields["derived"]["final_model_path"] == baseline["derived"][
+        "final_model_path"
+    ]
+
+
+def test_stage1_recipe_path_changes_when_an_executed_parameter_changes(
+    tmp_path: Path,
+) -> None:
+    baseline = resolve_pipeline_request(
+        {"mode": "train", "training": {"profile": "chronos2-stage1"}},
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+    changed = resolve_pipeline_request(
+        {
+            "mode": "train",
+            "training": {
+                "profile": "chronos2-stage1",
+                "stage1": {"warmup_ratio": 0.05},
+            },
+        },
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+
+    assert changed["derived"]["training_recipe_hash"] != baseline["derived"][
+        "training_recipe_hash"
+    ]
+    assert changed["derived"]["final_model_path"] != baseline["derived"][
+        "final_model_path"
+    ]
+
+
 @pytest.mark.parametrize(
     "value, message",
     [
@@ -319,6 +413,159 @@ def test_public_pipeline_defaults_uses_optional_base_model_default(
     )
     del integration["base_model_path"]
     assert public_pipeline_defaults(integration)["training"]["base_model_path"] is None
+
+
+def test_slurm_readiness_does_not_require_docker_or_evaluation_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    integration.pop("evaluation_root")
+    monkeypatch.setattr(
+        "chatts_dataset_studio.slurm.shutil.which",
+        lambda command: f"/mock/bin/{command}",
+    )
+    monkeypatch.setattr(
+        "chatts_dataset_studio.pipeline.shutil.which",
+        lambda command: None if command == "docker" else f"/mock/bin/{command}",
+    )
+
+    defaults = public_pipeline_defaults(integration)
+
+    assert defaults["integration"]["execution_mode"] == "slurm"
+    assert defaults["integration"]["enabled"] is True
+    assert defaults["integration"]["backends"]["slurm"]["default_sbatch"] == (
+        "run_chatts_studio_pipeline.sbatch"
+    )
+    assert defaults["integration"]["backends"]["docker_host"]["enabled"] is False
+
+
+def test_resolve_slurm_rejects_launcher_outside_trusted_root(tmp_path: Path) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    outside = tmp_path / "outside.sbatch"
+    outside.write_text(
+        "#!/usr/bin/env bash\n# CHATTS_STUDIO_SBATCH_API=1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(StudioError, match="trusted root"):
+        resolve_pipeline_request(
+            {
+                "mode": "train",
+                "execution": {"backend": "slurm", "sbatch_path": str(outside)},
+                "training": {"profile": "chronos2-stage1"},
+            },
+            _version(tmp_path),
+            integration,
+        )
+
+
+def test_slurm_job_submits_frozen_config_and_tracks_scheduler_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    mock_bin = tmp_path / "mock-bin"
+    mock_bin.mkdir()
+    submitted_args = tmp_path / "sbatch-args.txt"
+    scripts = {
+        "sbatch": (
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$@\" > \"$MOCK_SBATCH_ARGS\"\n"
+            "printf '12345\\n'\n"
+        ),
+        "squeue": "#!/bin/sh\nexit 0\n",
+        "sacct": (
+            "#!/bin/sh\n"
+            "printf '12345|COMPLETED|0:0|2026-01-01|2026-01-01|1|\\n'\n"
+        ),
+    }
+    for name, text in scripts.items():
+        path = mock_bin / name
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{mock_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("MOCK_SBATCH_ARGS", str(submitted_args))
+
+    resolved = resolve_pipeline_request(
+        {
+            "mode": "train",
+            "execution": {"backend": "slurm"},
+            "training": {"profile": "chronos2-stage1"},
+        },
+        _version(tmp_path),
+        integration,
+    )
+    jobs = PipelineJobs(tmp_path / "state", None, integration)
+    started = jobs.start(resolved)
+    deadline = time.monotonic() + 5
+    while True:
+        job = jobs.get(started["job_id"])
+        if job["status"] in {"completed", "failed", "canceled"}:
+            break
+        assert time.monotonic() < deadline, job
+        time.sleep(0.01)
+
+    assert job["status"] == "completed"
+    assert job["kind"] == "train_stage1"
+    assert job["execution_backend"] == "slurm"
+    assert job["scheduler_job_id"] == "12345"
+    assert len(job["sbatch_sha256"]) == 64
+    argv = submitted_args.read_text(encoding="utf-8").splitlines()
+    assert "--parsable" in argv
+    assert str(Path(job["config_path"])) in argv
+    assert job["job_id"] in argv
+    assert job["sbatch_path"] in argv
+
+
+def test_stage1_resolved_yaml_is_accepted_by_training_slurm_contract(
+    tmp_path: Path,
+) -> None:
+    loader = (
+        Path(__file__).resolve().parents[2]
+        / "ChatTS-Training"
+        / "scripts"
+        / "slurm"
+        / "load_studio_pipeline_config.py"
+    )
+    if not loader.is_file():
+        pytest.skip("sibling ChatTS-Training checkout is not available")
+    integration = _trusted_slurm_integration(tmp_path)
+    resolved = resolve_pipeline_request(
+        {
+            "mode": "train",
+            "execution": {"backend": "slurm"},
+            "training": {"profile": "chronos2-stage1"},
+        },
+        _version(tmp_path),
+        integration,
+    )
+    job_id = "7" * 32
+    config = json.loads(json.dumps(resolved["config"]))
+    config["pipeline"]["trial_id"] = job_id
+    config["pipeline"]["preflight_only"] = False
+    config["pipeline"]["trial_config_hash"] = hashlib.sha256(
+        json.dumps(
+            config,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+    path = tmp_path / "studio-stage1.resolved.yaml"
+    path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(loader), str(path), "--expected-job-id", job_id],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    environment = dict(line.split("=", 1) for line in completed.stdout.splitlines())
+    assert environment["PIPELINE_MODE"] == "stage1"
+    assert environment["STAGE1_OUT"] == resolved["derived"]["final_model_path"]
+    assert environment["KEEP_STAGE1"] == "1"
 
 
 def test_resolve_pipeline_rejects_path_override_and_invalid_stage_mix(

@@ -37,6 +37,8 @@ def _clean_environment() -> dict[str, str]:
         *ADVANCED_EVAL_DEFAULTS,
         "DATA_VERSION",
         "DATASET_SNAPSHOT_HASH",
+        "PIPELINE_MODE",
+        "STAGE1_OUT",
         "TRAINING_RECIPE_HASH",
         "TRIAL_ID",
         "TRIAL_CONFIG_HASH",
@@ -68,11 +70,14 @@ def test_loader_maps_dataset_identity_and_safe_advanced_evaluation(tmp_path: Pat
         textwrap.dedent(
             f"""
             pipeline:
+              pipeline_mode: stage1
               data_version: datav4
               dataset_snapshot_hash: {snapshot_hash}
               training_recipe_hash: {"c" * 64}
               trial_id: studio-job-7
               trial_config_hash: {"b" * 64}
+            training:
+              stage1_model_path: /share/models/datav4/stage1-best
             evaluation:
               tsr_prompt_mode: official
               tsr_max_model_len: 13000
@@ -98,6 +103,8 @@ def test_loader_maps_dataset_identity_and_safe_advanced_evaluation(tmp_path: Pat
     assignments = _loader_assignments(config)
 
     assert assignments == {
+        "PIPELINE_MODE": "stage1",
+        "STAGE1_OUT": "/share/models/datav4/stage1-best",
         "DATASET_SNAPSHOT_HASH": snapshot_hash,
         "DATA_VERSION": "datav4",
         "TRAINING_RECIPE_HASH": "c" * 64,
@@ -158,9 +165,21 @@ def _write_capture_script(path: Path, stage: str) -> None:
     if stage == "training":
         with path.open("a", encoding="utf-8") as stream:
             stream.write(
-                'mkdir -p "$FINAL_MODEL_PATH"\n'
-                'printf \'%s\\n\' \'{}\' > "$FINAL_MODEL_PATH/config.json"\n'
-                'printf \'%s\\n\' \'{"status":"complete"}\' > "$FINAL_MODEL_PATH/TRAINING_COMPLETE.json"\n'
+                'if [[ "${PIPELINE_MODE:-full}" == "stage1" ]]; then\n'
+                '  mkdir -p "$STAGE1_OUT"\n'
+                '  printf \'%s\\n\' \'{}\' > "$STAGE1_OUT/config.json"\n'
+                '  printf \'%s\\n\' \'{"stage":"stage1"}\' > "$STAGE1_OUT/best_model_manifest.json"\n'
+                '  printf \'%s\\n\' \'{"status":"complete","kind":"stage1"}\' > "$STAGE1_OUT/STAGE1_COMPLETE.json"\n'
+                '  if [[ "${EMPTY_STAGE1_WEIGHTS:-0}" == "1" ]]; then\n'
+                '    : > "$STAGE1_OUT/pytorch_model.bin"\n'
+                '  else\n'
+                '    printf \'stage1-weights\\n\' > "$STAGE1_OUT/pytorch_model.bin"\n'
+                '  fi\n'
+                'else\n'
+                '  mkdir -p "$FINAL_MODEL_PATH"\n'
+                '  printf \'%s\\n\' \'{}\' > "$FINAL_MODEL_PATH/config.json"\n'
+                '  printf \'%s\\n\' \'{"status":"complete"}\' > "$FINAL_MODEL_PATH/TRAINING_COMPLETE.json"\n'
+                'fi\n'
             )
     else:
         with path.open("a", encoding="utf-8") as stream:
@@ -173,7 +192,16 @@ def _write_capture_script(path: Path, stage: str) -> None:
     path.chmod(0o755)
 
 
-def _run_host_pipeline(tmp_path: Path, pipeline_fields: str, evaluation_fields: str) -> list[dict[str, str | None]]:
+def _run_host_pipeline(
+    tmp_path: Path,
+    pipeline_fields: str,
+    evaluation_fields: str,
+    *,
+    fail_on_evaluation_container: bool = False,
+    empty_stage1_weights: bool = False,
+    expected_returncode: int = 0,
+    stage1_model_path: Path | None = None,
+) -> list[dict[str, str | None]]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     docker = fake_bin / "docker"
@@ -185,6 +213,8 @@ import sys
 
 arguments = sys.argv[1:]
 if arguments[:1] == ["inspect"]:
+    if os.environ.get("FAIL_ON_EVALUATION_CONTAINER") == "1" and arguments[-1] == "evaluation":
+        raise SystemExit("stage1-only must not inspect the evaluation container")
     print("true")
     raise SystemExit(0)
 if arguments[:1] != ["exec"]:
@@ -195,6 +225,9 @@ while cursor < len(arguments) and arguments[cursor] == "-e":
     key, value = arguments[cursor + 1].split("=", 1)
     environment[key] = value
     cursor += 2
+container = arguments[cursor]
+if os.environ.get("FAIL_ON_EVALUATION_CONTAINER") == "1" and container == "evaluation":
+    raise SystemExit("stage1-only must not execute in the evaluation container")
 cursor += 1  # container name
 command = arguments[cursor:]
 if command[:2] == ["python", "-c"] and "torch.cuda.device_count" in command[2]:
@@ -248,6 +281,12 @@ raise SystemExit(subprocess.run(command, env=environment, check=False).returncod
             f"  final_model_path: {final_model}",
             f"  chronos2_model_path: {chronos}",
             f"  dataset_dir: {dataset}",
+        ]
+    )
+    if stage1_model_path is not None:
+        config_lines.append(f"  stage1_model_path: {stage1_model_path}")
+    config_lines.extend(
+        [
             "evaluation:",
             f"  project_root: {eval_project}",
             f"  script: {eval_script}",
@@ -279,6 +318,10 @@ raise SystemExit(subprocess.run(command, env=environment, check=False).returncod
             "CAPTURE_PYTHON": sys.executable,
         }
     )
+    if fail_on_evaluation_container:
+        environment["FAIL_ON_EVALUATION_CONTAINER"] = "1"
+    if empty_stage1_weights:
+        environment["EMPTY_STAGE1_WEIGHTS"] = "1"
     completed = subprocess.run(
         ["bash", str(HOST_RUNNER)],
         env=environment,
@@ -287,7 +330,7 @@ raise SystemExit(subprocess.run(command, env=environment, check=False).returncod
         text=True,
         timeout=20,
     )
-    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert completed.returncode == expected_returncode, completed.stderr + completed.stdout
     return [json.loads(line) for line in capture.read_text(encoding="utf-8").splitlines()]
 
 
@@ -366,3 +409,36 @@ def test_host_legacy_config_retains_advanced_evaluation_defaults(tmp_path: Path)
         "TRAINING_RECIPE_HASH": None,
         **ADVANCED_EVAL_DEFAULTS,
     }
+
+
+def test_host_stage1_mode_saves_weights_and_never_touches_evaluation(
+    tmp_path: Path,
+) -> None:
+    stage1 = tmp_path / "shared" / "models" / "stage1-best"
+    events = _run_host_pipeline(
+        tmp_path,
+        "pipeline_mode: stage1",
+        "",
+        fail_on_evaluation_container=True,
+        stage1_model_path=stage1,
+    )
+
+    assert [event["stage"] for event in events] == ["training"]
+    assert (stage1 / "STAGE1_COMPLETE.json").is_file()
+    assert (stage1 / "config.json").is_file()
+    assert (stage1 / "best_model_manifest.json").is_file()
+    assert (stage1 / "pytorch_model.bin").stat().st_size > 0
+    assert not (tmp_path / "shared" / "evaluation").exists()
+
+
+def test_host_stage1_mode_rejects_empty_model_weights(tmp_path: Path) -> None:
+    events = _run_host_pipeline(
+        tmp_path,
+        "pipeline_mode: stage1",
+        "",
+        fail_on_evaluation_container=True,
+        empty_stage1_weights=True,
+        expected_returncode=1,
+    )
+
+    assert [event["stage"] for event in events] == ["training"]

@@ -588,6 +588,21 @@ save/eval steps、`dataset_dir`、是否保留 Stage1、benchmark 子集、评�
 CONFIG_FILE=/path/to/my_experiment.yaml bash scripts/run_train_then_eval.sh
 ```
 
+只训练 Stage1 并直接保留验证集 `eval_loss` 最优权重时，将配置改为：
+
+```yaml
+pipeline:
+  pipeline_mode: stage1
+training:
+  # 必须位于 training.output_root 内；建议使用配方独立目录。
+  stage1_model_path: /share/airesearch/data/finiverse/output/my-run/best_stage1_seed42
+```
+
+`stage1` 模式只检查并调用训练容器，不检查或启动评测容器。训练成功后，宿主入口会确认
+`STAGE1_COMPLETE.json`、`config.json`、`best_model_manifest.json` 和至少一个非空权重
+文件都位于 `stage1_model_path`，随后直接退出，不运行四套 benchmark。省略
+`pipeline.pipeline_mode` 时仍默认为原来的 `full` 两阶段训练加评测流程。
+
 命令行环境变量的优先级高于 YAML，例如临时做每套 2 条的冒烟评测：
 
 ```bash

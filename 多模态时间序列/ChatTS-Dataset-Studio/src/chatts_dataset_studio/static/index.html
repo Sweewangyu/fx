@@ -108,9 +108,9 @@
           </div>
         </section>
 
-        <div class="stage-grid" id="rules-section" aria-label="两阶段筛选规则">
-          <article class="card stage-card stage-one"><div class="card-heading"><h2>Stage 1</h2><span id="stage1-source-count">0 源</span></div><div class="rule-groups" id="stage1-rules"></div></article>
-          <article class="card stage-card stage-two"><div class="card-heading"><h2>Stage 2</h2><span id="stage2-source-count">0 源</span></div><div class="rule-groups" id="stage2-rules"></div></article>
+        <div class="stage-grid" id="rules-section" aria-label="两阶段逐数据集筛选规则">
+          <article class="card stage-card stage-one"><div class="card-heading"><div><h2>Stage 1 · 逐数据集规则</h2><p>每个选中数据集独立设置质量、难度和能力。</p></div><span id="stage1-source-count">0 源</span></div><div class="rule-groups" id="stage1-rules"></div></article>
+          <article class="card stage-card stage-two"><div class="card-heading"><div><h2>Stage 2 · 逐数据集规则</h2><p>规则只显示该数据集真实存在的标签。</p></div><span id="stage2-source-count">0 源</span></div><div class="rule-groups" id="stage2-rules"></div></article>
         </div>
 
         <section class="card" id="preview-section" aria-labelledby="preview-title">
@@ -159,9 +159,11 @@
         <div class="page-heading"><div><p class="eyebrow">ChatTS-Training</p><h1>训练参数</h1></div><span class="status-chip" id="training-version">未选择版本</span></div>
         <section class="card">
           <div class="form-grid form-grid-3">
-            <label class="field readonly-field"><span>训练方案</span><select id="train-profile" disabled aria-disabled="true"><option value="chronos2-full">Chronos-2 两阶段</option></select></label>
+            <label class="field"><span>训练方案</span><select id="train-profile"><option value="chronos2-full">Chronos-2 两阶段</option><option value="chronos2-stage1">只训练并保存 Stage 1</option></select></label>
+            <label class="field"><span>执行后端</span><select id="execution-backend"><option value="docker_host">Docker 宿主流水线</option><option value="slurm">Slurm sbatch</option></select></label>
+            <label class="field" id="slurm-sbatch-field" hidden><span>Slurm 脚本</span><select id="slurm-sbatch-path"></select><small class="field-help">只能选择服务端可信 slurm 目录中的 Studio 通用脚本。</small></label>
             <label class="field"><span>随机种子</span><input id="train-seed" type="number" min="0" step="1" value="42"></label>
-            <label class="field"><span>GPU</span><input id="deepspeed-include" type="text" value="localhost:0,1,2,3,4,5,6,7" spellcheck="false"></label>
+            <label class="field field-span-2"><span>GPU</span><input id="deepspeed-include" type="text" value="localhost:0,1,2,3,4,5,6,7" spellcheck="false"></label>
             <label class="field field-span-3"><span>基础模型地址</span><input id="base-model-path" type="text" spellcheck="false" autocomplete="off" placeholder="/share/airesearch/data/finiverse/model/ChatTS-Qwen3-8B"><small class="field-help" id="base-model-sync-hint">识别末尾参数量后，会同步更新模型输出目录。</small></label>
             <label class="field field-span-3 readonly-field"><span>模型输出根目录（自动追加版本与训练参数哈希）</span><input id="train-output-root" type="text" readonly aria-readonly="true" spellcheck="false"><small class="field-help">训练配方不同会进入不同的 recipe 目录；相同配方才会复用同一路径。</small></label>
           </div>
@@ -192,7 +194,7 @@
               <label class="field"><span>预处理进程</span><input data-train-param="preprocessing_num_workers" type="number" value="96" min="1"></label>
             </div></details>
           </article>
-          <article class="card stage-card stage-two" data-train-stage="stage2">
+          <article class="card stage-card stage-two" id="stage2-training-card" data-train-stage="stage2">
             <div class="card-heading"><div><h2>Stage 2</h2><p id="stage2-datasets">由数据版本生成</p></div></div>
             <div class="form-grid form-grid-2">
               <label class="field"><span>学习率</span><input data-train-param="learning_rate" type="text" value="1e-5" inputmode="decimal"></label>
@@ -241,10 +243,10 @@
             <strong>一键启动暂不可用</strong>
             <p id="integration-summary"></p>
             <ul id="integration-missing"></ul>
-            <p>请在 Dataset Studio 的服务端 YAML 中补齐 <code>integration</code> 配置并重启服务；同时确认训练/评测脚本及 Chronos-2 路径可访问。</p>
+            <p>请在服务端 YAML 中补齐当前后端的 <code>integration</code> 配置并重启；Docker 需容器与训练/评测脚本，Slurm 需控制命令和带 Studio marker 的可信 sbatch。</p>
           </div>
         </section>
-        <section class="card">
+        <section class="card" id="evaluation-config-card">
           <div class="card-heading"><h2>评测套件</h2><span id="suite-count">4 项</span></div>
           <fieldset class="suite-grid" id="benchmark-suites"><legend class="sr-only">选择评测套件</legend>
             <label><input type="checkbox" value="tsrbench" checked><span><strong>TSRBench</strong><small>时序推理</small></span></label>
@@ -290,7 +292,7 @@
         </section>
         <section class="card run-bar" aria-labelledby="run-title">
           <div><h2 id="run-title">启动 / 排队</h2><p id="run-status" aria-live="polite">先发布并注册数据版本；运行期间可继续提交下一版本。</p></div>
-          <div class="button-row"><button class="button secondary run-button" data-run-mode="preflight" type="button">预检</button><button class="button primary run-button" data-run-mode="train_eval" type="button">训练 + 评测</button></div>
+          <div class="button-row"><button class="button secondary run-button" data-run-mode="preflight" type="button">预检</button><button class="button primary run-button" id="primary-run-button" data-run-mode="train_eval" type="button">训练 + 评测</button></div>
         </section>
       </section>
 

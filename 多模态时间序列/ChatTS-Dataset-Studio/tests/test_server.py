@@ -156,7 +156,16 @@ def test_public_defaults_returns_empty_legacy_sources_when_catalog_is_unavailabl
 def test_publish_adopts_matching_verified_orphan_idempotently(
     labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
 ) -> None:
-    orphan = _versioned_orphan(labeled_corpus, default_selection)
+    recipe = json.loads(json.dumps(default_selection))
+    source = labeled_corpus["sources"][0]
+    recipe["stage1"]["source_rules"] = {
+        source: {
+            "qualities": ["good"],
+            "difficulties": ["hard"],
+            "abilities": ["anomaly_detection"],
+        }
+    }
+    orphan = _versioned_orphan(labeled_corpus, recipe)
     manifest_before = (orphan / "manifest.json").read_bytes()
     service = StudioService(
         {
@@ -171,7 +180,7 @@ def test_publish_adopts_matching_verified_orphan_idempotently(
     started = service.start_publish(
         {
             "version": "datav3",
-            "recipe": default_selection,
+            "recipe": recipe,
             "register": False,
             "activate": False,
         }
@@ -187,7 +196,7 @@ def test_publish_adopts_matching_verified_orphan_idempotently(
     repeated = service.start_publish(
         {
             "version": "datav3",
-            "recipe": default_selection,
+            "recipe": recipe,
             "register": False,
             "activate": False,
         }

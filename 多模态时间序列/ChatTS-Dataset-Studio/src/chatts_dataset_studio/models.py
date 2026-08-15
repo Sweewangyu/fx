@@ -80,43 +80,41 @@ class Source:
 
 
 @dataclass(frozen=True)
-class StageRule:
-    sources: frozenset[str]
+class FilterRule:
     qualities: frozenset[str]
     difficulties: frozenset[str]
     abilities: frozenset[str]
 
     @classmethod
-    def from_mapping(cls, value: dict[str, Any], available_sources: set[str]) -> StageRule:
+    def from_mapping(
+        cls,
+        value: dict[str, Any],
+        *,
+        field: str,
+        required: bool,
+    ) -> FilterRule:
         if not isinstance(value, dict):
-            raise StudioError("Each stage rule must be one JSON/YAML object")
-        sources = _string_set(value.get("sources"), "sources")
-        unknown_sources = sources - available_sources
-        if unknown_sources:
-            raise StudioError(f"Unknown selected datasets: {sorted(unknown_sources)}")
-        qualities = _string_set(value.get("qualities"), "qualities")
-        difficulties = _string_set(value.get("difficulties"), "difficulties")
-        abilities = _string_set(value.get("abilities", []), "abilities")
+            raise StudioError(f"{field} must be one JSON/YAML object")
+        qualities = _string_set(value.get("qualities"), f"{field}.qualities")
+        difficulties = _string_set(value.get("difficulties"), f"{field}.difficulties")
+        abilities = _string_set(value.get("abilities", []), f"{field}.abilities")
         invalid_quality = qualities - set(QUALITY_LEVELS)
         invalid_difficulty = difficulties - set(DIFFICULTY_LEVELS)
         if invalid_quality:
-            raise StudioError(f"Unknown quality levels: {sorted(invalid_quality)}")
+            raise StudioError(f"Unknown quality levels in {field}: {sorted(invalid_quality)}")
         if invalid_difficulty:
-            raise StudioError(f"Unknown difficulty levels: {sorted(invalid_difficulty)}")
-        if sources and not qualities:
-            raise StudioError("A stage with selected datasets must select at least one quality")
-        if sources and not difficulties:
-            raise StudioError("A stage with selected datasets must select at least one difficulty")
+            raise StudioError(f"Unknown difficulty levels in {field}: {sorted(invalid_difficulty)}")
+        if required and not qualities:
+            raise StudioError(f"{field} must select at least one quality")
+        if required and not difficulties:
+            raise StudioError(f"{field} must select at least one difficulty")
         return cls(
-            sources=frozenset(sources),
             qualities=frozenset(qualities),
             difficulties=frozenset(difficulties),
             abilities=frozenset(abilities),
         )
 
-    def matches(self, source: str, annotation: dict[str, Any]) -> bool:
-        if source not in self.sources:
-            return False
+    def matches(self, annotation: dict[str, Any]) -> bool:
         quality = annotation.get("quality")
         difficulty = annotation.get("difficulty")
         ability = annotation.get("ability_bucket") or annotation.get("ability_label") or "UNMAPPED"
@@ -125,6 +123,126 @@ class StageRule:
             and difficulty in self.difficulties
             and (not self.abilities or ability in self.abilities)
         )
+
+    def to_mapping(self) -> dict[str, list[str]]:
+        return {
+            "qualities": sorted(self.qualities),
+            "difficulties": sorted(self.difficulties),
+            "abilities": sorted(self.abilities),
+        }
+
+
+@dataclass(frozen=True)
+class StageRule:
+    sources: frozenset[str]
+    qualities: frozenset[str]
+    difficulties: frozenset[str]
+    abilities: frozenset[str]
+    source_rules: dict[str, FilterRule]
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: dict[str, Any],
+        available_sources: set[str],
+        source_dimensions: dict[str, dict[str, set[str]]] | None = None,
+    ) -> StageRule:
+        if not isinstance(value, dict):
+            raise StudioError("Each stage rule must be one JSON/YAML object")
+        sources = _string_set(value.get("sources"), "sources")
+        unknown_sources = sources - available_sources
+        if unknown_sources:
+            raise StudioError(f"Unknown selected datasets: {sorted(unknown_sources)}")
+        fallback = FilterRule.from_mapping(value, field="stage rule", required=bool(sources))
+
+        raw_source_rules = value.get("source_rules", {})
+        if not isinstance(raw_source_rules, dict) or any(
+            not isinstance(name, str) for name in raw_source_rules
+        ):
+            raise StudioError("source_rules must be an object keyed by dataset name")
+        override_names = set(raw_source_rules)
+        unknown_overrides = override_names - available_sources
+        if unknown_overrides:
+            raise StudioError(f"Unknown source_rules datasets: {sorted(unknown_overrides)}")
+        unselected_overrides = override_names - sources
+        if unselected_overrides:
+            raise StudioError(
+                f"source_rules contains unselected datasets: {sorted(unselected_overrides)}"
+            )
+
+        source_rules: dict[str, FilterRule] = {}
+        for source_name in sorted(override_names):
+            source_rule = FilterRule.from_mapping(
+                raw_source_rules[source_name],
+                field=f"source_rules[{source_name!r}]",
+                required=True,
+            )
+            if source_dimensions is not None:
+                dimensions = source_dimensions.get(source_name)
+                if dimensions is None:
+                    raise StudioError(f"No catalog dimensions are available for {source_name}")
+                unavailable_quality = source_rule.qualities - dimensions["qualities"]
+                unavailable_difficulty = source_rule.difficulties - dimensions["difficulties"]
+                unavailable_ability = source_rule.abilities - dimensions["abilities"]
+                if unavailable_quality:
+                    raise StudioError(
+                        f"Unavailable quality levels for {source_name}: "
+                        f"{sorted(unavailable_quality)}"
+                    )
+                if unavailable_difficulty:
+                    raise StudioError(
+                        f"Unavailable difficulty levels for {source_name}: "
+                        f"{sorted(unavailable_difficulty)}"
+                    )
+                if unavailable_ability:
+                    raise StudioError(
+                        f"Unavailable abilities for {source_name}: {sorted(unavailable_ability)}"
+                    )
+            # An override identical to the legacy fallback has no semantic
+            # effect. Dropping it preserves the exact legacy selection/hash.
+            if source_rule != fallback:
+                source_rules[source_name] = source_rule
+
+        return cls(
+            sources=frozenset(sources),
+            qualities=fallback.qualities,
+            difficulties=fallback.difficulties,
+            abilities=fallback.abilities,
+            source_rules=source_rules,
+        )
+
+    def fallback_rule(self) -> FilterRule:
+        return FilterRule(self.qualities, self.difficulties, self.abilities)
+
+    def effective_rule(self, source: str) -> FilterRule:
+        source_rule = self.source_rules.get(source)
+        return source_rule if source_rule is not None else self.fallback_rule()
+
+    def matches(self, source: str, annotation: dict[str, Any]) -> bool:
+        if source not in self.sources:
+            return False
+        source_rule = self.source_rules.get(source)
+        if source_rule is not None:
+            return source_rule.matches(annotation)
+        quality = annotation.get("quality")
+        difficulty = annotation.get("difficulty")
+        ability = annotation.get("ability_bucket") or annotation.get("ability_label") or "UNMAPPED"
+        return (
+            quality in self.qualities
+            and difficulty in self.difficulties
+            and (not self.abilities or ability in self.abilities)
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "sources": sorted(self.sources),
+            **self.fallback_rule().to_mapping(),
+        }
+        if self.source_rules:
+            result["source_rules"] = {
+                name: self.source_rules[name].to_mapping() for name in sorted(self.source_rules)
+            }
+        return result
 
 
 def _string_set(value: Any, field: str) -> set[str]:

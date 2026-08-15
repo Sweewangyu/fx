@@ -10,7 +10,7 @@ checkpoint 兼容：
 - `scripts/inspect_chatts_ts_encoder_checkpoints.py`：只读扫描权重并盘点真实编码器。
 - `scripts/run_chatts_timeseriesexam.sh`：用原始数值时序评测 TimeSeriesExam。
 - `scripts/run_all_chatts_benchmarks.sh`：四套 benchmark 串行执行，每套独占全部 8 张卡。
-- `scripts/run_train_then_eval.sh`：宿主机一键执行 `chatts` 训练，再执行 `ragas` 评测。
+- `scripts/run_train_then_eval.sh`：宿主机一键完整训练评测，也支持只训练并保留 Stage1 权重。
 - `configs/train_eval_chronos2.yaml`：两阶段训练、模型、数据和评测路径的集中配置。
 - `scripts/load_train_eval_config.py`：将 YAML 安全展开为流水线环境变量。
 
@@ -584,6 +584,18 @@ save/eval steps 以及四套评测数据路径均可在该 YAML 中修改。使�
 ```bash
 CONFIG_FILE=/path/to/my_experiment.yaml bash scripts/run_train_then_eval.sh
 ```
+
+如果只训练 Stage1 并直接保存最优权重，在 YAML 中设置：
+
+```yaml
+pipeline:
+  pipeline_mode: stage1
+training:
+  stage1_model_path: /share/airesearch/data/finiverse/output/my-run/best_stage1_seed42
+```
+
+该模式以 `STAGE1_COMPLETE.json` 和非空权重为完成标志，不访问评测容器；
+不写 `pipeline_mode` 仍默认执行原来的 `full` 两阶段训练加评测。
 
 Dataset Studio 启动的任务会另外写入 `DATA_VERSION`、
 `DATASET_SNAPSHOT_HASH`、`TRIAL_ID` 和 `TRIAL_CONFIG_HASH`。训练容器会在写任何

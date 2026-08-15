@@ -32,12 +32,19 @@ selection:
 
 # 浏览器不能覆盖以下脚本和运行路径。相对 host 路径以本 YAML 所在目录为基准。
 integration:
-  # 推荐拓扑：Dataset Studio 在 Docker 宿主机运行，通过 docker exec 顺序调用
-  # chatts 训练容器和 ragas 评测容器。不要把 Docker Socket 挂进训练容器。
+  # 默认后端。页面可在 docker_host 与 slurm 之间切换；默认值只决定首次选择。
+  # docker_host 可连续训练+评测；slurm 运行训练（Stage1-only 或两阶段），不自动评测。
   execution_mode: docker_host
   training_root: ../../ChatTS-Training
   evaluation_root: ../../ChatTS
   pipeline_script: ../../ChatTS/scripts/run_train_then_eval.sh
+
+  # Slurm 只允许选择这个可信目录内、带 CHATTS_STUDIO_SBATCH_API=1 marker 的脚本。
+  # state_root 与数据/模型输出必须是计算节点可见的共享文件系统路径。
+  slurm_root: ../../ChatTS-Training/slurm
+  slurm_sbatch: run_chatts_studio_pipeline.sbatch
+  slurm_poll_seconds: 5
+  slurm_accounting_grace_seconds: 120
 
   training_container: chatts
   evaluation_container: ragas

@@ -1,22 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Run Dataset Studio on the Docker host. The Studio is only a lightweight
-# control plane; training and evaluation continue to run in their own containers.
+# Run Dataset Studio on the cluster login/control host. The selected backend is
+# checked by the service: Docker can train+evaluate, while Slurm submits a
+# trusted sbatch that runs training in Singularity.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_FILE="${1:-${PROJECT_ROOT}/configs/server.yaml}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-command -v docker >/dev/null 2>&1 || {
-    echo "Docker CLI is unavailable. Run this script on the Docker host." >&2
-    exit 1
-}
-docker info >/dev/null 2>&1 || {
-    echo "Docker daemon is unavailable to the current host user." >&2
-    exit 1
-}
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
     echo "Python is unavailable: $PYTHON_BIN" >&2
     exit 1
@@ -27,10 +20,19 @@ command -v "$PYTHON_BIN" >/dev/null 2>&1 || {
     exit 1
 }
 
-echo "Starting ChatTS Dataset Studio on the Docker host"
+echo "Starting ChatTS Dataset Studio control plane"
 echo "Configuration: $CONFIG_FILE"
-echo "Containers visible to Docker:"
-docker ps --format '  {{.Names}}\t{{.Status}}'
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "Docker backend is available; visible containers:"
+    docker ps --format '  {{.Names}}\t{{.Status}}'
+else
+    echo "Docker backend is unavailable (Slurm can still be used if configured)."
+fi
+if command -v sbatch >/dev/null 2>&1; then
+    echo "Slurm backend is available: $(command -v sbatch)"
+else
+    echo "Slurm backend is unavailable (Docker can still be used if configured)."
+fi
 
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 exec "$PYTHON_BIN" -m chatts_dataset_studio serve -c "$CONFIG_FILE"

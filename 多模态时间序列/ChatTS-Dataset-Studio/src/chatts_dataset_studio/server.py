@@ -14,7 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .catalog import CatalogCache
-from .exporter import export_selection, parse_rules, preview_selection
+from .exporter import canonical_selection, export_selection, parse_rules, preview_selection
 from .models import (
     DIFFICULTY_LABELS_ZH,
     DIFFICULTY_LEVELS,
@@ -59,7 +59,9 @@ class StudioService:
         integration = defaults.get("integration")
         self.integration = integration if isinstance(integration, dict) else {}
         self.pipeline_jobs = PipelineJobs(
-            self.state_root / "pipeline", self.integration.get("pipeline_script")
+            self.state_root / "pipeline",
+            self.integration.get("pipeline_script"),
+            self.integration,
         )
         if defaults.get("registry_auto_build") is True:
             self.rebuild_registry()
@@ -225,20 +227,7 @@ class StudioService:
         sources, catalog = self.cache.get(registry, annotations, data_root)
         stage1, stage2 = parse_rules(effective, sources, catalog)
         preview_selection(catalog, stage1, stage2)
-        expected_selection = {
-            "stage1": {
-                "sources": sorted(stage1.sources),
-                "qualities": sorted(stage1.qualities),
-                "difficulties": sorted(stage1.difficulties),
-                "abilities": sorted(stage1.abilities),
-            },
-            "stage2": {
-                "sources": sorted(stage2.sources),
-                "qualities": sorted(stage2.qualities),
-                "difficulties": sorted(stage2.difficulties),
-                "abilities": sorted(stage2.abilities),
-            },
-        }
+        expected_selection = canonical_selection(stage1, stage2)
 
         requested = payload.get("version")
         automatic = requested in (None, "", "auto")
