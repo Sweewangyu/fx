@@ -2,6 +2,14 @@
 
 本目录收录时间序列与大语言模型、多模态问答及跨模态编码相关的调研与设计材料。
 
+## ChatTS × Qwen3-4B-Instruct-2507
+
+将官方 Qwen3-4B-Instruct-2507 转换为 ChatTS-compatible 的语言模型主干，保留原始
+4B 权重，补齐 `Qwen3TSForCausalLM`、Processor 和 `<ts>/<ts/>` token，并提供
+Chronos-2 两阶段训练入口。
+
+- [下载、无张量转换、内网训练和验证说明](./ChatTS-Qwen3-4B-Instruct-2507适配/README.md)
+
 ## ChatTS Dataset Studio
 
 独立的数据版本、两阶段训练和四套 benchmark 评测控制台。它会动态扫描
