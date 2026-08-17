@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -213,7 +214,9 @@ def test_sbatch_passes_validated_contract_to_standard_singularity_runner(
     env.update(
         {
             "SLURM_JOB_ID": "12345",
-            "CHATTS_TRAINING_DIR": str(PROJECT_ROOT),
+            # Slurm executes a spool copy rather than the repository file.
+            # The launcher must locate Training through SLURM_SUBMIT_DIR.
+            "SLURM_SUBMIT_DIR": str(PROJECT_ROOT),
             "CHATTS_SIF_IMAGE": str(image),
             "CHATTS_HOST_CHRONOS2_PATH": str(chronos),
             "CHATTS_SHARED_HOST_PATH": str(shared),
@@ -225,8 +228,11 @@ def test_sbatch_passes_validated_contract_to_standard_singularity_runner(
             "MOCK_SRUN_LOG": str(invocation_log),
         }
     )
+    spooled_sbatch = tmp_path / "slurm-spool" / "run_chatts_studio_pipeline.sbatch"
+    spooled_sbatch.parent.mkdir()
+    shutil.copyfile(SBATCH, spooled_sbatch)
     completed = subprocess.run(
-        ["bash", str(SBATCH), str(config), job_id],
+        ["bash", str(spooled_sbatch), str(config), job_id],
         env=env,
         check=False,
         capture_output=True,

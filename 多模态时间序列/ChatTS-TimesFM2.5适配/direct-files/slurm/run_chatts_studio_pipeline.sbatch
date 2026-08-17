@@ -39,8 +39,11 @@ SLURM_JOB_ID="${SLURM_JOB_ID:?SLURM_JOB_ID is required; submit this file with sb
     exit 2
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_TRAINING_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Slurm normally executes a private copy from /var/spool/slurmd, so
+# BASH_SOURCE does not identify the repository. Dataset Studio submits with
+# cwd/--chdir set to the trusted ChatTS-Training root; Slurm records that
+# location in SLURM_SUBMIT_DIR.
+DEFAULT_TRAINING_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 CHATTS_HOST_ROOT="${CHATTS_HOST_ROOT:-$HOME}"
 CHATTS_TRAINING_DIR="${CHATTS_TRAINING_DIR:-$DEFAULT_TRAINING_DIR}"
 CHATTS_SIF_IMAGE="${CHATTS_SIF_IMAGE:-$CHATTS_HOST_ROOT/chatts_v1.sif}"
