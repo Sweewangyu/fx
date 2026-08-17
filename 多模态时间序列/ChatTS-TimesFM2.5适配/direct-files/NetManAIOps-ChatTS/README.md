@@ -510,7 +510,8 @@ tinyBenchmarks 五个 MCQ 任务、TS-Haystack 全域和 TimeSeriesExam 全量�
 每套任务运行期间独占 `0,1,2,3,4,5,6,7`。三个时序评测各启动 4 个双卡
 vLLM worker；tinyBenchmarks 使用单个 8 卡 tensor-parallel 引擎。某套失败不会
 阻止后续评测继续执行；全部结束后统一生成
-`benchmark_status.tsv`、`run_manifest.json` 和 `all_benchmarks_summary.md`，只要
+`benchmark_status.tsv`、`run_manifest.json`、`metrics.json` 和
+`all_benchmarks_summary.md`，只要
 存在失败任务，总脚本就返回非零状态。
 
 这个总控脚本固定使用 Chronos-2，不再自动判断或切换其他 encoder；四个子评测
@@ -546,8 +547,12 @@ PREFLIGHT_ONLY=1 bash scripts/run_all_chatts_benchmarks.sh
 FORCE_EVAL=1 bash scripts/run_all_chatts_benchmarks.sh
 ```
 
-tinyBenchmarks 在这个总控流程中只评测 Stage2 最佳模型，不加载训练前底座。
+tinyBenchmarks 在这个总控流程中只评测本次流水线选择的最终模型，不加载训练前底座。
 冒烟测试可设置 `MAX_SAMPLES=2`，全量评测保持默认 `MAX_SAMPLES=0`。
+
+总控脚本会把影响结果的采样、提示词、离线模式和各 benchmark 参数纳入协议指纹，
+并显式覆盖父进程中可能残留的同名环境变量。不同协议应写入不同的
+`protocol-<hash前16位>` 输出目录，避免错误复用缓存或覆盖其他评测结果。
 
 ## 宿主机一键训练再评测
 
@@ -585,7 +590,7 @@ save/eval steps 以及四套评测数据路径均可在该 YAML 中修改。使�
 CONFIG_FILE=/path/to/my_experiment.yaml bash scripts/run_train_then_eval.sh
 ```
 
-如果只训练 Stage1 并直接保存最优权重，在 YAML 中设置：
+如果只训练 Stage1、保存最优权重并直接评测，在 YAML 中设置：
 
 ```yaml
 pipeline:
@@ -594,8 +599,9 @@ training:
   stage1_model_path: /share/airesearch/data/finiverse/output/my-run/best_stage1_seed42
 ```
 
-该模式以 `STAGE1_COMPLETE.json` 和非空权重为完成标志，不访问评测容器；
-不写 `pipeline_mode` 仍默认执行原来的 `full` 两阶段训练加评测。
+该模式以 `STAGE1_COMPLETE.json`、`best_model_manifest.json` 和非空权重为完成标志，
+随后把这个 Stage1 最优目录作为 `MODEL_PATH` 运行同一套评测；不写
+`pipeline_mode` 仍默认执行原来的 `full` 两阶段训练加评测。
 
 Dataset Studio 启动的任务会另外写入 `DATA_VERSION`、
 `DATASET_SNAPSHOT_HASH`、`TRIAL_ID` 和 `TRIAL_CONFIG_HASH`。训练容器会在写任何

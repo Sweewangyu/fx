@@ -33,7 +33,7 @@ selection:
 # 浏览器不能覆盖以下脚本和运行路径。相对 host 路径以本 YAML 所在目录为基准。
 integration:
   # 默认后端。页面可在 docker_host 与 slurm 之间切换；默认值只决定首次选择。
-  # docker_host 可连续训练+评测；slurm 运行训练（Stage1-only 或两阶段），不自动评测。
+  # docker_host 与 slurm 都在训练完成后继续四套评测。
   execution_mode: docker_host
   training_root: ../../ChatTS-Training
   evaluation_root: ../../ChatTS
@@ -45,6 +45,15 @@ integration:
   slurm_sbatch: run_chatts_studio_pipeline.sbatch
   slurm_poll_seconds: 5
   slurm_accounting_grace_seconds: 120
+  # Slurm 计算节点上的宿主机路径；评测项目默认复用 evaluation_root。
+  # 如果评测使用另一个 Singularity 镜像或 benchmark 不在 /share，可显式设置。
+  # slurm_evaluation_root: /data/hpc/home/yu.wang17/ChatTS
+  # slurm_evaluation_sif_image: /data/hpc/home/yu.wang17/chatts_eval.sif
+  # slurm_chronos2_host_root: /data/hpc/home/yu.wang17/chronos2
+  # slurm_tsrbench_host_root: /share/airesearch/data/finiverse/TSRBench-dataset
+  # slurm_tinybench_host_root: /share/airesearch/data/finiverse/tyb
+  # slurm_ts_haystack_host_root: /data/hpc/home/yu.wang17/TS-Haystack
+  # slurm_timeseriesexam_host_root: /data/hpc/home/yu.wang17/TimeSeriesExam
 
   training_container: chatts
   evaluation_container: ragas

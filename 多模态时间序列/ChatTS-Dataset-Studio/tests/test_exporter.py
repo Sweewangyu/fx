@@ -3,14 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import TARGET_SOURCES, read_jsonl, write_jsonl
 
+import chatts_dataset_studio.exporter as exporter_module
 from chatts_dataset_studio.catalog import CatalogCache
-from chatts_dataset_studio.exporter import export_selection
+from chatts_dataset_studio.exporter import (
+    _OnlineNestedSampler,
+    export_selection,
+    parse_rules,
+    preview_selection,
+)
 from chatts_dataset_studio.models import DEFAULT_ALIASES, StudioError
 
 
@@ -29,6 +36,92 @@ def _export(
     }
     result = export_selection(payload, sources, catalog)
     return result, Path(result["output_dir"])
+
+
+def _rewrite_balanced_source(
+    labeled_corpus: dict[str, Any], source: str, *, row_count: int = 20
+) -> None:
+    raw_rows = []
+    annotation_rows = []
+    for row_index in range(row_count):
+        ability = "trend_analysis" if row_index % 2 == 0 else "forecasting"
+        raw_rows.append(
+            {
+                "input": f"{source} balanced question {row_index}",
+                "timeseries": [[row_index, row_index + 0.5]],
+                "output": f"balanced answer {row_index}",
+            }
+        )
+        annotation_rows.append(
+            {
+                "annotation_id": f"{source}:{row_index + 1}",
+                "annotation_source": source,
+                "source_index": row_index,
+                "line_number": row_index + 1,
+                "ability_label": ability,
+                "ability_bucket": ability,
+                "quality": "good",
+                "difficulty": "hard",
+                "quality_reason": "balanced-sampling-fixture",
+            }
+        )
+    raw_path = (
+        labeled_corpus["data_root"]
+        / "data"
+        / "versions"
+        / "datav2"
+        / "files"
+        / f"{source}.jsonl"
+    )
+    annotation_path = labeled_corpus["annotations_root"] / "annotations" / f"{source}.jsonl"
+    write_jsonl(raw_path, raw_rows)
+    write_jsonl(annotation_path, annotation_rows)
+
+
+def test_online_nested_sampler_is_exact_reproducible_and_constant_per_bucket() -> None:
+    bucket = "good\u001fhard\u001ftrend_analysis"
+    plan = {
+        "stage1": {
+            "source_a": {
+                "filtered": {bucket: 100},
+                "selected": {bucket: 70},
+                "sample_percent": 70,
+            }
+        },
+        "stage2": {
+            "source_a": {
+                "filtered": {bucket: 100},
+                "selected": {bucket: 30},
+                "sample_percent": 30,
+            }
+        },
+    }
+
+    def run_once() -> tuple[set[int], set[int], _OnlineNestedSampler]:
+        sampler = _OnlineNestedSampler("source_a", plan)
+        selected = {"stage1": set(), "stage2": set()}
+        for line_number in range(1, 101):
+            stage1, stage2 = sampler.choose(bucket, line_number)
+            if stage1:
+                selected["stage1"].add(line_number)
+            if stage2:
+                selected["stage2"].add(line_number)
+            assert sampler.state_size == 1
+        sampler.finalize()
+        return selected["stage1"], selected["stage2"], sampler
+
+    first_stage1, first_stage2, sampler = run_once()
+    second_stage1, second_stage2, _ = run_once()
+
+    assert len(first_stage1) == 70
+    assert len(first_stage2) == 30
+    assert first_stage2 < first_stage1
+    assert (first_stage1, first_stage2) == (second_stage1, second_stage2)
+    assert not hasattr(exporter_module, "_sampled_line_numbers")
+    bucket_state = next(iter(sampler.bucket_states.values()))
+    for chooser in (bucket_state.primary, bucket_state.secondary):
+        assert chooser is not None
+        assert not any(isinstance(value, (list, set, dict)) for value in vars(chooser).values())
 
 
 def test_export_writes_clean_training_data_and_audit_sidecars(
@@ -207,6 +300,236 @@ def test_redundant_source_rule_preserves_legacy_selection_and_snapshot_hash(
     assert equivalent_manifest["dataset_snapshot_hash"] == legacy_manifest[
         "dataset_snapshot_hash"
     ]
+
+
+def test_explicit_one_hundred_percent_preserves_legacy_bytes_and_hashes(
+    labeled_corpus: dict[str, Any], default_selection: dict[str, Any]
+) -> None:
+    _, legacy_root = _export(labeled_corpus, default_selection, "sample-legacy")
+    explicit = json.loads(json.dumps(default_selection))
+    for stage in ("stage1", "stage2"):
+        explicit[stage]["sample_percent"] = 100
+    source = labeled_corpus["sources"][0]
+    explicit["stage1"]["source_rules"] = {
+        source: {
+            "qualities": explicit["stage1"]["qualities"],
+            "difficulties": explicit["stage1"]["difficulties"],
+            "abilities": explicit["stage1"]["abilities"],
+            "sample_percent": 100,
+        }
+    }
+    _, explicit_root = _export(labeled_corpus, explicit, "sample-explicit-100")
+    legacy_manifest = json.loads((legacy_root / "manifest.json").read_text(encoding="utf-8"))
+    explicit_manifest = json.loads(
+        (explicit_root / "manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert "sample_percent" not in explicit_manifest["selection"]["stage1"]
+    assert explicit_manifest["selection"] == legacy_manifest["selection"]
+    assert explicit_manifest["selection_hash"] == legacy_manifest["selection_hash"]
+    assert explicit_manifest["dataset_snapshot_hash"] == legacy_manifest[
+        "dataset_snapshot_hash"
+    ]
+    for stage in ("stage1", "stage2"):
+        for source_name in labeled_corpus["sources"]:
+            assert (explicit_root / stage / f"{source_name}.jsonl").read_bytes() == (
+                legacy_root / stage / f"{source_name}.jsonl"
+            ).read_bytes()
+            assert (
+                explicit_root / f"{stage}_annotations" / f"{source_name}.jsonl"
+            ).read_bytes() == (
+                legacy_root / f"{stage}_annotations" / f"{source_name}.jsonl"
+            ).read_bytes()
+
+
+def test_sampled_preview_export_distribution_overlap_and_bytes_are_exact(
+    labeled_corpus: dict[str, Any],
+) -> None:
+    source = labeled_corpus["sources"][0]
+    _rewrite_balanced_source(labeled_corpus, source)
+    sources, catalog = CatalogCache().get(
+        labeled_corpus["registry_path"],
+        labeled_corpus["annotations_root"],
+        labeled_corpus["data_root"],
+    )
+    stage_base = {
+        "sources": [source],
+        "qualities": ["good"],
+        "difficulties": ["hard"],
+        "abilities": [],
+    }
+    selection = {
+        "stage1": {
+            **stage_base,
+            "source_rules": {
+                source: {
+                    "qualities": ["good"],
+                    "difficulties": ["hard"],
+                    "abilities": [],
+                    "sample_percent": 50,
+                }
+            },
+        },
+        "stage2": {
+            **stage_base,
+            "source_rules": {
+                source: {
+                    "qualities": ["good"],
+                    "difficulties": ["hard"],
+                    "abilities": [],
+                    "sample_percent": 25,
+                }
+            },
+        },
+    }
+    stage1, stage2 = parse_rules(selection, sources, catalog)
+    preview = preview_selection(catalog, stage1, stage2)
+
+    assert preview["filtered_counts"] == {"stage1": 20, "stage2": 20}
+    assert preview["counts"] == {"stage1": 10, "stage2": 5, "overlap": 5}
+    assert preview["by_source"] == [
+        {
+            "source": source,
+            "source_rows": 20,
+            "stage1_filtered": 20,
+            "stage2_filtered": 20,
+            "stage1": 10,
+            "stage2": 5,
+            "overlap": 5,
+        }
+    ]
+    assert preview["distributions"]["stage1"]["ability"] == {
+        "trend_analysis": 5,
+        "forecasting": 5,
+    }
+    assert preview["distributions"]["stage1"]["ability_percentages"] == {
+        "forecasting": 50.0,
+        "trend_analysis": 50.0,
+    }
+    assert sum(
+        preview["distributions"]["stage2"]["ability_percentages"].values()
+    ) == pytest.approx(100.0)
+
+    roots = []
+    manifests = []
+    for run_name in ("sampled-first", "sampled-second"):
+        result = export_selection(
+            {
+                **selection,
+                "run_name": run_name,
+                "output_root": str(labeled_corpus["output_root"]),
+            },
+            sources,
+            catalog,
+        )
+        root = Path(result["output_dir"])
+        manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+        roots.append(root)
+        manifests.append(manifest)
+        assert manifest["preview"] == preview
+        assert manifest["selection"]["stage1"]["source_rules"][source][
+            "sample_percent"
+        ] == 50
+        assert manifest["selection"]["stage2"]["source_rules"][source][
+            "sample_percent"
+        ] == 25
+        selected_inputs: dict[str, set[str]] = {}
+        for stage, expected_rows in (("stage1", 10), ("stage2", 5)):
+            labels = read_jsonl(root / f"{stage}_annotations" / f"{source}.jsonl")
+            rows = read_jsonl(root / stage / f"{source}.jsonl")
+            actual_abilities = Counter(row["ability_bucket"] for row in labels)
+            assert len(labels) == expected_rows
+            assert len(rows) == expected_rows
+            selected_inputs[stage] = {row["input"] for row in rows}
+            assert dict(actual_abilities) == preview["distributions"][stage]["ability"]
+            assert {
+                ability: round(count * 100 / expected_rows, 6)
+                for ability, count in sorted(actual_abilities.items())
+            } == preview["distributions"][stage]["ability_percentages"]
+            actual_cube = Counter(
+                f"{row['quality']}\u001f{row['difficulty']}\u001f{row['ability_bucket']}"
+                for row in labels
+            )
+            stage_manifest = json.loads(
+                (root / stage / "manifest.json").read_text(encoding="utf-8")
+            )
+            assert dict(actual_cube) == stage_manifest["sources"][source]["cube"]
+            assert stage_manifest["rule"]["source_rules"][source][
+                "sample_percent"
+            ] == (50 if stage == "stage1" else 25)
+        assert len(selected_inputs["stage1"] & selected_inputs["stage2"]) == preview[
+            "counts"
+        ]["overlap"]
+        assert selected_inputs["stage2"] < selected_inputs["stage1"]
+
+    assert manifests[0]["dataset_snapshot_hash"] == manifests[1]["dataset_snapshot_hash"]
+    for stage in ("stage1", "stage2"):
+        assert (roots[0] / stage / f"{source}.jsonl").read_bytes() == (
+            roots[1] / stage / f"{source}.jsonl"
+        ).read_bytes()
+        assert (roots[0] / f"{stage}_annotations" / f"{source}.jsonl").read_bytes() == (
+            roots[1] / f"{stage}_annotations" / f"{source}.jsonl"
+        ).read_bytes()
+
+
+def test_sample_percent_is_independent_for_each_stage_and_source(
+    labeled_corpus: dict[str, Any],
+) -> None:
+    source_a, source_b = labeled_corpus["sources"][:2]
+    sources, catalog = CatalogCache().get(
+        labeled_corpus["registry_path"],
+        labeled_corpus["annotations_root"],
+        labeled_corpus["data_root"],
+    )
+    fallback = {
+        "sources": [source_a, source_b],
+        "qualities": ["unusable", "weak", "acceptable", "good", "excellent"],
+        "difficulties": ["very_easy", "easy", "moderate", "hard", "very_hard"],
+        "abilities": [],
+    }
+
+    def source_rule(percent: int) -> dict[str, Any]:
+        return {
+            "qualities": fallback["qualities"],
+            "difficulties": fallback["difficulties"],
+            "abilities": [],
+            "sample_percent": percent,
+        }
+
+    selection = {
+        "stage1": {
+            **fallback,
+            "source_rules": {source_a: source_rule(40), source_b: source_rule(80)},
+        },
+        "stage2": {
+            **fallback,
+            "source_rules": {source_a: source_rule(80), source_b: source_rule(40)},
+        },
+    }
+    stage1, stage2 = parse_rules(selection, sources, catalog)
+    preview = preview_selection(catalog, stage1, stage2)
+    by_source = {row["source"]: row for row in preview["by_source"]}
+
+    assert by_source[source_a]["stage1"] == 2
+    assert by_source[source_a]["stage2"] == 4
+    assert by_source[source_b]["stage1"] == 4
+    assert by_source[source_b]["stage2"] == 2
+    assert preview["counts"]["stage1"] == preview["counts"]["stage2"] == 6
+
+    result = export_selection(
+        {
+            **selection,
+            "run_name": "independent-stage-source-percentages",
+            "output_root": str(labeled_corpus["output_root"]),
+        },
+        sources,
+        catalog,
+    )
+    root = Path(result["output_dir"])
+    assert len(read_jsonl(root / "stage1" / f"{source_a}.jsonl")) == 2
+    assert len(read_jsonl(root / "stage2" / f"{source_a}.jsonl")) == 4
+    assert len(read_jsonl(root / "stage1" / f"{source_b}.jsonl")) == 4
+    assert len(read_jsonl(root / "stage2" / f"{source_b}.jsonl")) == 2
 
 
 def test_snapshot_hash_is_stable_across_different_absolute_workspace_paths(

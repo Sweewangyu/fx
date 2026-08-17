@@ -80,7 +80,7 @@
             <button class="quick-action" type="button" data-tab-link="recipe"><span>1</span><strong>选择数据</strong><small>数据源与筛选规则</small></button>
             <button class="quick-action" type="button" data-tab-link="versions"><span>2</span><strong>发布版本</strong><small>记录组成并注册</small></button>
             <button class="quick-action" id="overview-preflight" type="button"><span>3</span><strong>环境预检</strong><small>检查路径、容器和 GPU</small></button>
-            <button class="quick-action featured" id="overview-run" type="button"><span>4</span><strong>训练 + 评测</strong><small>Docker FIFO / Slurm 集群调度</small></button>
+            <button class="quick-action featured" id="overview-run" type="button"><span>4</span><strong>训练 + 评测</strong><small>启动或加入 FIFO 队列</small></button>
           </div>
         </section>
 
@@ -109,8 +109,8 @@
         </section>
 
         <div class="stage-grid" id="rules-section" aria-label="两阶段逐数据集筛选规则">
-          <article class="card stage-card stage-one"><div class="card-heading"><div><h2>Stage 1 · 逐数据集规则</h2><p>每个选中数据集独立设置质量、难度和能力。</p></div><span id="stage1-source-count">0 源</span></div><div class="rule-groups" id="stage1-rules"></div></article>
-          <article class="card stage-card stage-two"><div class="card-heading"><div><h2>Stage 2 · 逐数据集规则</h2><p>规则只显示该数据集真实存在的标签。</p></div><span id="stage2-source-count">0 源</span></div><div class="rule-groups" id="stage2-rules"></div></article>
+          <article class="card stage-card stage-one"><div class="card-heading"><div><h2>Stage 1 · 逐数据集规则</h2><p>每个数据集独立设置维度，并选择筛选后随机保留的百分比。</p></div><span id="stage1-source-count">0 源</span></div><div class="rule-groups" id="stage1-rules"></div></article>
+          <article class="card stage-card stage-two"><div class="card-heading"><div><h2>Stage 2 · 逐数据集规则</h2><p>只显示该数据集真实标签；抽样比例默认为 100%。</p></div><span id="stage2-source-count">0 源</span></div><div class="rule-groups" id="stage2-rules"></div></article>
         </div>
 
         <section class="card" id="preview-section" aria-labelledby="preview-title">
@@ -123,10 +123,10 @@
           <details id="preview-detail" hidden>
             <summary>查看构成与按源明细</summary>
             <div class="distribution-grid">
-              <div><div class="subheading"><h3>Stage 1</h3><span id="stage1-dist-total"></span></div><div class="bar-list" id="stage1-distribution"></div></div>
-              <div><div class="subheading"><h3>Stage 2</h3><span id="stage2-dist-total"></span></div><div class="bar-list" id="stage2-distribution"></div></div>
+              <div class="distribution-stage"><div class="subheading"><h3>Stage 1 合计</h3><span id="stage1-dist-total"></span></div><h4>质量与难度</h4><div class="bar-list" id="stage1-distribution"></div><div class="ability-heading"><h4>全部能力维度配比</h4><span id="stage1-ability-count">0 个维度</span></div><div class="ability-bar-list" id="stage1-ability-distribution"></div></div>
+              <div class="distribution-stage"><div class="subheading"><h3>Stage 2 合计</h3><span id="stage2-dist-total"></span></div><h4>质量与难度</h4><div class="bar-list" id="stage2-distribution"></div><div class="ability-heading"><h4>全部能力维度配比</h4><span id="stage2-ability-count">0 个维度</span></div><div class="ability-bar-list" id="stage2-ability-distribution"></div></div>
             </div>
-            <div class="table-wrap"><table><thead><tr><th>数据源</th><th>源数据</th><th>S1</th><th>S2</th><th>重叠</th></tr></thead><tbody id="source-results"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>数据源</th><th>源数据</th><th>S1 保留 / 候选</th><th>S2 保留 / 候选</th><th>重叠</th></tr></thead><tbody id="source-results"></tbody></table></div>
           </details>
         </section>
       </section>
@@ -159,6 +159,7 @@
         <div class="page-heading"><div><p class="eyebrow">ChatTS-Training</p><h1>训练参数</h1></div><span class="status-chip" id="training-version">未选择版本</span></div>
         <section class="card">
           <div class="form-grid form-grid-3">
+            <label class="field field-span-3"><span>训练数据版本</span><select id="training-data-version"><option value="">暂无已发布版本</option></select><small class="field-help" id="training-version-help">默认使用当前版本；这里只选择本次训练数据，不会修改全局当前版本。</small></label>
             <label class="field"><span>训练方案</span><select id="train-profile"><option value="chronos2-full">Chronos-2 两阶段</option><option value="chronos2-stage1">只训练并保存 Stage 1</option></select></label>
             <label class="field"><span>执行后端</span><select id="execution-backend"><option value="docker_host">Docker 宿主流水线</option><option value="slurm">Slurm sbatch</option></select></label>
             <label class="field" id="slurm-sbatch-field" hidden><span>Slurm 脚本</span><select id="slurm-sbatch-path"></select><small class="field-help">只能选择服务端可信 slurm 目录中的 Studio 通用脚本。</small></label>
@@ -234,7 +235,7 @@
             <span class="status-chip" id="integration-state">检查中</span>
           </div>
           <ol class="launch-steps">
-            <li id="launch-step-version"><span>1</span><div><strong>选择并激活版本</strong><small>在“版本”页发布、注册并设为当前版本。</small></div></li>
+            <li id="launch-step-version"><span>1</span><div><strong>选择训练数据版本</strong><small>在“训练”页选择任一已发布版本；未注册版本会在启动时自动注册。</small></div></li>
             <li id="launch-step-training"><span>2</span><div><strong>配置训练参数</strong><small>在“训练”页确认基础模型、GPU 和两阶段参数。</small></div></li>
             <li id="launch-step-preflight"><span>3</span><div><strong>运行 Preflight</strong><small>检查服务端路径、容器、GPU 与脚本。</small></div></li>
             <li id="launch-step-run"><span>4</span><div><strong>一键训练 + 评测</strong><small>有任务运行时自动排队，完成后按提交顺序启动。</small></div></li>
@@ -266,7 +267,7 @@
             <label class="field"><span>Tiny seed</span><input id="tiny-seed" type="number" min="0" value="42"></label>
             <label class="field check-field"><input id="force-eval" type="checkbox"><span>强制重新评测</span></label>
             <label class="field"><span>TSR prompt</span><select id="tsr-prompt-mode"><option value="answer_only">answer_only</option><option value="official">official</option></select></label>
-            <label class="field"><span>协议 Hash</span><input id="eval-protocol-hash" type="text" maxlength="64" placeholder="自动生成" spellcheck="false"></label>
+            <label class="field"><span>期望协议 Hash（可留空）</span><input id="eval-protocol-hash" type="text" maxlength="64" placeholder="服务端自动计算" spellcheck="false"><small class="field-help">填写时只用于一致性校验，不能覆盖服务端计算结果。</small></label>
             <label class="field"><span>TSR 最大长度</span><input id="tsr-max-model-len" type="number" min="1" value="12288"></label>
             <label class="field"><span>TSR 新 token</span><input id="tsr-max-new-tokens" type="number" min="1" value="8"></label>
             <label class="field"><span>TSR Batch</span><input id="tsr-batch-size" type="number" min="1" value="16"></label>

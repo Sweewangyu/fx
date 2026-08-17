@@ -3,7 +3,7 @@
 
 pipeline:
   # full = Stage1 -> Stage2 -> evaluation (backward-compatible default)
-  # stage1 = finalize and retain Stage1, then stop without touching evaluation
+  # stage1 = finalize and retain Stage1, then evaluate that Stage1 checkpoint
   pipeline_mode: full
   seed: 42
   force_train: false
@@ -81,6 +81,10 @@ training:
 evaluation:
   project_root: /workspace/ChatTS/ChatTS-main
   script: /workspace/ChatTS/ChatTS-main/scripts/run_all_chatts_benchmarks.sh
+  # Dataset Studio writes these two derived fields. For a hand-written YAML,
+  # omit them: the host runner derives the exact model and marker from mode.
+  # model_path: /share/.../best_seed42
+  # model_completion_marker: TRAINING_COMPLETE.json
   # Omit model_name/output_root to derive seed-specific defaults automatically.
   chronos2_model_path: /workspace/chronos2
   tsrbench_root: /share/airesearch/data/finiverse/TSRBench-dataset

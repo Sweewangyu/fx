@@ -55,6 +55,13 @@ def _load_config(path: Path | None) -> dict[str, Any]:
         "pipeline_script",
         "slurm_root",
         "slurm_sbatch",
+        "slurm_evaluation_root",
+        "slurm_evaluation_sif_image",
+        "slurm_chronos2_host_root",
+        "slurm_tsrbench_host_root",
+        "slurm_tinybench_host_root",
+        "slurm_ts_haystack_host_root",
+        "slurm_timeseriesexam_host_root",
     ):
         if name in integration_result:
             # A simple sbatch filename is resolved relative to slurm_root by the

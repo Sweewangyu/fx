@@ -523,6 +523,10 @@ vLLM worker；tinyBenchmarks 使用单个 8 卡 tensor-parallel 引擎。某套�
 
 四套评测统一使用 `seed=42`；TSRBench 与 tinyBenchmarks 已补齐 vLLM engine 和
 SamplingParams 的 seed，TS-Haystack 与 TimeSeriesExam 沿用各自已有的 seed 参数。
+总控还会覆盖容器残留的通用环境变量：TSRBench 的 temperature/retry/input cutoff
+由 `TSR_PROMPT_MODE` 唯一决定，tinyBenchmarks 固定 `SUMMARY_ONLY=0`、`dtype=auto`
+和严格数据量检查，TimeSeriesExam 固定 3 个 concepts；这些值都进入 suite protocol
+fingerprint。`OFFLINE=0/1` 也会显式写成 Hugging Face 的 `0/1`，不会继承上一次任务。
 通常只需确认 TS-Haystack、TimeSeriesExam 和 Chronos-2 的本地路径：
 
 ```bash
@@ -598,10 +602,12 @@ training:
   stage1_model_path: /share/airesearch/data/finiverse/output/my-run/best_stage1_seed42
 ```
 
-`stage1` 模式只检查并调用训练容器，不检查或启动评测容器。训练成功后，宿主入口会确认
+`stage1` 模式训练成功后，宿主入口会严格确认
 `STAGE1_COMPLETE.json`、`config.json`、`best_model_manifest.json` 和至少一个非空权重
-文件都位于 `stage1_model_path`，随后直接退出，不运行四套 benchmark。省略
-`pipeline.pipeline_mode` 时仍默认为原来的 `full` 两阶段训练加评测流程。
+文件都位于 `stage1_model_path`，再把该目录作为 `MODEL_PATH` 运行四套 benchmark。
+评测器显式要求 `MODEL_COMPLETION_MARKER=STAGE1_COMPLETE.json`，不会为 Stage1
+伪造或宽松接受 `TRAINING_COMPLETE.json`。省略 `pipeline.pipeline_mode` 时仍默认为
+原来的 `full` 两阶段训练加评测流程。
 
 命令行环境变量的优先级高于 YAML，例如临时做每套 2 条的冒烟评测：
 
@@ -613,8 +619,8 @@ MAX_SAMPLES=2 CONFIG_FILE=configs/train_eval_chronos2.yaml \
 它会先检查两个容器、8 张 GPU、代码和共享目录，再在 `chatts` 中依次完成
 Stage1/Stage2。LLaMAFactory 会在结束时把验证集 `eval_loss` 最优 checkpoint
 加载回内存并导出到阶段根目录；脚本验证该根目录后才删除 `checkpoint-*`。
-Stage2 的 `--model_name_or_path` 明确指向 Stage1 最优导出目录；四套评测的
-`MODEL_PATH` 又明确指向 Stage2 最优导出目录。Stage2 成功后会删除
+Stage2 的 `--model_name_or_path` 明确指向 Stage1 最优导出目录；`full` 模式评测
+Stage2 最优目录，`stage1` 模式评测 Stage1 最优目录。Stage2 成功后会删除
 Stage1 模型目录；若需要让后续 Stage2-only 实验复用它，在 YAML 中设置
 `training.keep_stage1: true`。默认最终只保留：
 

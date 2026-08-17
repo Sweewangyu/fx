@@ -39,6 +39,7 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 OFFLINE="${OFFLINE:-1}"
 REQUIRE_TRAINING_MARKER="${REQUIRE_TRAINING_MARKER:-1}"
+MODEL_COMPLETION_MARKER="${MODEL_COMPLETION_MARKER:-TRAINING_COMPLETE.json}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 
 # All suites run one after another on these eight devices.  The three
@@ -53,12 +54,23 @@ TSR_MAX_MODEL_LEN="${TSR_MAX_MODEL_LEN:-12288}"
 TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-8}"
 TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-16}"
 TSR_REQUEST_CHUNK_SIZE="${TSR_REQUEST_CHUNK_SIZE:-128}"
+if [[ "$TSR_PROMPT_MODE" == "official" ]]; then
+    TSR_TEMPERATURE=1.0
+    TSR_MAX_RETRIES=10
+    TSR_MAX_INPUT_TOKENS=8000
+else
+    TSR_TEMPERATURE=0.0
+    TSR_MAX_RETRIES=0
+    TSR_MAX_INPUT_TOKENS=0
+fi
 
 TINY_MAX_MODEL_LEN="${TINY_MAX_MODEL_LEN:-6000}"
 TINY_REQUEST_CHUNK_SIZE="${TINY_REQUEST_CHUNK_SIZE:-16}"
 TINY_GPU_MEMORY_UTILIZATION="${TINY_GPU_MEMORY_UTILIZATION:-0.70}"
 TINY_DATA_PARTITION="${TINY_DATA_PARTITION:-all}"
 TINY_PARTITION_SEED="${TINY_PARTITION_SEED:-42}"
+TINY_DTYPE=auto
+TINY_FORGETTING_THRESHOLD_PP=5.0
 
 HAYSTACK_MAX_MODEL_LEN="${HAYSTACK_MAX_MODEL_LEN:-40960}"
 HAYSTACK_MAX_NEW_TOKENS="${HAYSTACK_MAX_NEW_TOKENS:-500}"
@@ -70,6 +82,7 @@ EXAM_MAX_MODEL_LEN="${EXAM_MAX_MODEL_LEN:-8192}"
 EXAM_MAX_NEW_TOKENS="${EXAM_MAX_NEW_TOKENS:-1024}"
 EXAM_BATCH_SIZE="${EXAM_BATCH_SIZE:-8}"
 EXAM_REQUEST_CHUNK_SIZE="${EXAM_REQUEST_CHUNK_SIZE:-64}"
+EXAM_MAX_CONCEPTS=3
 
 for flag_name in FORCE_EVAL PREFLIGHT_ONLY OFFLINE REQUIRE_TRAINING_MARKER; do
     flag_value="${!flag_name}"
@@ -78,6 +91,13 @@ for flag_name in FORCE_EVAL PREFLIGHT_ONLY OFFLINE REQUIRE_TRAINING_MARKER; do
         exit 2
     }
 done
+case "$MODEL_COMPLETION_MARKER" in
+    TRAINING_COMPLETE.json|STAGE1_COMPLETE.json) ;;
+    *)
+        echo "MODEL_COMPLETION_MARKER must be TRAINING_COMPLETE.json or STAGE1_COMPLETE.json." >&2
+        exit 2
+        ;;
+esac
 [[ "$SEED" =~ ^[0-9]+$ ]] || { echo "SEED must be a non-negative integer." >&2; exit 2; }
 [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || { echo "MAX_SAMPLES must be non-negative." >&2; exit 2; }
 [[ -z "$DATA_VERSION" || "$DATA_VERSION" =~ ^datav[0-9]+$ ]] || {
@@ -91,9 +111,22 @@ done
 [[ "$EVAL_NUM_GPUS" =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_NUM_GPUS must be positive." >&2; exit 2; }
 [[ "$TS_GPUS_PER_PROCESS" =~ ^[1-9][0-9]*$ ]] || { echo "TS_GPUS_PER_PROCESS must be positive." >&2; exit 2; }
 [[ "$TINY_PARTITION_SEED" =~ ^[0-9]+$ ]] || { echo "TINY_PARTITION_SEED must be non-negative." >&2; exit 2; }
+[[ "$TSR_MAX_RETRIES" =~ ^[0-9]+$ ]] || { echo "TSR_MAX_RETRIES must be non-negative." >&2; exit 2; }
+[[ "$TSR_MAX_INPUT_TOKENS" =~ ^[0-9]+$ ]] || { echo "TSR_MAX_INPUT_TOKENS must be non-negative." >&2; exit 2; }
+[[ "$TSR_TEMPERATURE" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "TSR_TEMPERATURE must be a non-negative number." >&2; exit 2; }
+[[ "$TINY_DTYPE" == "auto" ]] || { echo "TINY_DTYPE is fixed to auto for this protocol." >&2; exit 2; }
+[[ "$TINY_FORGETTING_THRESHOLD_PP" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    echo "TINY_FORGETTING_THRESHOLD_PP must be a non-negative number." >&2
+    exit 2
+}
+[[ "$EXAM_MAX_CONCEPTS" =~ ^[1-9][0-9]*$ ]] || { echo "EXAM_MAX_CONCEPTS must be positive." >&2; exit 2; }
 case "$TINY_DATA_PARTITION" in
     all|search-dev|final-test) ;;
     *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
+esac
+case "$TSR_PROMPT_MODE" in
+    answer_only|official) ;;
+    *) echo "TSR_PROMPT_MODE must be answer_only or official." >&2; exit 2 ;;
 esac
 case "$HAYSTACK_SPLIT" in
     train|validation|test) ;;
@@ -147,6 +180,35 @@ require_dir() {
 require_file() {
     local label="$1" path="$2"
     [[ -f "$path" ]] || { echo "$label file not found: $path" >&2; exit 1; }
+}
+
+require_nonempty_file() {
+    local label="$1" path="$2"
+    [[ -s "$path" ]] || { echo "$label is missing or empty: $path" >&2; exit 1; }
+}
+
+require_model_weights() {
+    "$PYTHON_BIN" - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+patterns = (
+    "pytorch_model*.bin",
+    "model*.safetensors",
+    "adapter_model*.bin",
+    "adapter_model*.safetensors",
+)
+weights = {
+    path
+    for pattern in patterns
+    for path in root.glob(pattern)
+    if path.is_file() and path.stat().st_size > 0
+}
+if not weights:
+    raise SystemExit(f"No non-empty model weights found in {root}")
+print(f"Validated {len(weights)} non-empty model weight file(s) in {root}")
+PY
 }
 
 require_dir "ChatTS project" "$PROJECT_ROOT"
@@ -211,8 +273,12 @@ PY
 
 if [[ -f "$MODEL_PATH/config.json" ]]; then
     if [[ "$REQUIRE_TRAINING_MARKER" == "1" ]]; then
-        require_file "Training completion marker" "$MODEL_PATH/TRAINING_COMPLETE.json"
+        require_nonempty_file "Declared model completion marker" "$MODEL_PATH/$MODEL_COMPLETION_MARKER"
+        if [[ "$MODEL_COMPLETION_MARKER" == "STAGE1_COMPLETE.json" ]]; then
+            require_nonempty_file "Stage1 best-model manifest" "$MODEL_PATH/best_model_manifest.json"
+        fi
     fi
+    require_model_weights "$MODEL_PATH"
 elif [[ "$PREFLIGHT_ONLY" == "1" ]]; then
     echo "Note: final model does not exist yet; model validation is deferred until training completes: $MODEL_PATH"
 else
@@ -233,6 +299,7 @@ echo " TS engines:     $((EVAL_NUM_GPUS / TS_GPUS_PER_PROCESS)) x ${TS_GPUS_PER_
 echo " Max samples:    $MAX_SAMPLES (0 means full benchmark)"
 echo " Benchmarks:     ${SELECTED_SUITES[*]}"
 echo " Protocol hash:  ${EVAL_PROTOCOL_HASH:-derived from code and arguments}"
+echo " Model marker:   $MODEL_COMPLETION_MARKER"
 echo " Output:         $OUTPUT_ROOT"
 echo "============================================================"
 
@@ -251,10 +318,10 @@ export CHATTS_CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH"
 export CHATTS_VLLM_SEED="$SEED"
 export PYTHONHASHSEED="$SEED"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-if [[ "$OFFLINE" == "1" ]]; then
-    export HF_HUB_OFFLINE=1
-    export TRANSFORMERS_OFFLINE=1
-fi
+# Explicit zeroes matter: a long-lived container may otherwise leak offline
+# flags from a previous run into an OFFLINE=0 protocol.
+export HF_HUB_OFFLINE="$OFFLINE"
+export TRANSFORMERS_OFFLINE="$OFFLINE"
 
 run_tsrbench() {
     env \
@@ -272,9 +339,16 @@ run_tsrbench() {
         REQUEST_CHUNK_SIZE="$TSR_REQUEST_CHUNK_SIZE" \
         MAX_SAMPLES="$MAX_SAMPLES" \
         MAX_NEW_TOKENS="$TSR_MAX_NEW_TOKENS" \
+        TEMPERATURE="$TSR_TEMPERATURE" \
+        MAX_RETRIES="$TSR_MAX_RETRIES" \
+        MAX_INPUT_TOKENS="$TSR_MAX_INPUT_TOKENS" \
         CHATTS_VLLM_MAX_MODEL_LEN="$TSR_MAX_MODEL_LEN" \
         MAX_PROCESSED_INPUT_TOKENS="$((TSR_MAX_MODEL_LEN - TSR_MAX_NEW_TOKENS))" \
         ENABLE_THINKING=0 \
+        TS_ENCODER_TYPE=chronos2 \
+        CHATTS_TS_ENCODER_TYPE=chronos2 \
+        CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
+        CHATTS_CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
         SEED="$SEED" \
         FORCE_INFERENCE="${SUITE_FORCE_EVAL:-$FORCE_EVAL}" \
         PYTHON_BIN="$PYTHON_BIN" \
@@ -299,7 +373,13 @@ run_tinybenchmarks() {
         REQUEST_CHUNK_SIZE="$TINY_REQUEST_CHUNK_SIZE" \
         GPU_MEMORY_UTILIZATION="$TINY_GPU_MEMORY_UTILIZATION" \
         CHATTS_VLLM_MAX_MODEL_LEN="$TINY_MAX_MODEL_LEN" \
+        DTYPE="$TINY_DTYPE" \
         MAX_SAMPLES="$MAX_SAMPLES" \
+        SUMMARY_ONLY=0 \
+        ALLOW_SIZE_MISMATCH=0 \
+        FORGETTING_THRESHOLD_PP="$TINY_FORGETTING_THRESHOLD_PP" \
+        CHATTS_TS_ENCODER_TYPE=chronos2 \
+        CHATTS_CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
         SEED="$SEED" \
         OFFLINE="$OFFLINE" \
         DATA_PARTITION="$TINY_DATA_PARTITION" \
@@ -328,6 +408,10 @@ run_ts_haystack() {
         MAX_PROCESSED_INPUT_TOKENS="$((HAYSTACK_MAX_MODEL_LEN - HAYSTACK_MAX_NEW_TOKENS))" \
         MAX_SAMPLES="$MAX_SAMPLES" \
         TEMPERATURE=0.0 \
+        TS_ENCODER_TYPE=chronos2 \
+        CHATTS_TS_ENCODER_TYPE=chronos2 \
+        CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
+        CHATTS_CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
         SEED="$SEED" \
         ENABLE_THINKING=0 \
         FORCE_INFERENCE="${SUITE_FORCE_EVAL:-$FORCE_EVAL}" \
@@ -353,6 +437,11 @@ run_timeseriesexam() {
         MAX_PROCESSED_INPUT_TOKENS="$((EXAM_MAX_MODEL_LEN - EXAM_MAX_NEW_TOKENS))" \
         MAX_SAMPLES="$MAX_SAMPLES" \
         TEMPERATURE=0.0 \
+        MAX_CONCEPTS="$EXAM_MAX_CONCEPTS" \
+        TS_ENCODER_TYPE=chronos2 \
+        CHATTS_TS_ENCODER_TYPE=chronos2 \
+        CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
+        CHATTS_CHRONOS2_MODEL_PATH="$CHRONOS2_MODEL_PATH" \
         SEED="$SEED" \
         ADD_QUESTION_HINT=1 \
         ADD_CONCEPTS=1 \
@@ -414,6 +503,10 @@ suite_artifact() {
                 --protocol "max_new_tokens=$TSR_MAX_NEW_TOKENS"
                 --protocol "batch_size=$TSR_BATCH_SIZE"
                 --protocol "request_chunk_size=$TSR_REQUEST_CHUNK_SIZE"
+                --protocol "temperature=$TSR_TEMPERATURE"
+                --protocol "max_retries=$TSR_MAX_RETRIES"
+                --protocol "max_input_tokens=$TSR_MAX_INPUT_TOKENS"
+                --protocol "ts_encoder_type=chronos2"
                 --protocol "enable_thinking=0"
             )
             ;;
@@ -427,6 +520,10 @@ suite_artifact() {
                 --protocol "max_model_len=$TINY_MAX_MODEL_LEN"
                 --protocol "request_chunk_size=$TINY_REQUEST_CHUNK_SIZE"
                 --protocol "gpu_memory_utilization=$TINY_GPU_MEMORY_UTILIZATION"
+                --protocol "dtype=$TINY_DTYPE"
+                --protocol "summary_only=0"
+                --protocol "allow_size_mismatch=0"
+                --protocol "forgetting_threshold_pp=$TINY_FORGETTING_THRESHOLD_PP"
             )
             if [[ "$TINY_DATA_PARTITION" != "all" ]]; then
                 command+=(
@@ -452,6 +549,7 @@ suite_artifact() {
                 --protocol "batch_size=$HAYSTACK_BATCH_SIZE"
                 --protocol "request_chunk_size=$HAYSTACK_REQUEST_CHUNK_SIZE"
                 --protocol "temperature=0.0"
+                --protocol "ts_encoder_type=chronos2"
                 --protocol "enable_thinking=0"
             )
             ;;
@@ -470,6 +568,8 @@ suite_artifact() {
                 --protocol "batch_size=$EXAM_BATCH_SIZE"
                 --protocol "request_chunk_size=$EXAM_REQUEST_CHUNK_SIZE"
                 --protocol "temperature=0.0"
+                --protocol "max_concepts=$EXAM_MAX_CONCEPTS"
+                --protocol "ts_encoder_type=chronos2"
                 --protocol "enable_thinking=0"
             )
             ;;

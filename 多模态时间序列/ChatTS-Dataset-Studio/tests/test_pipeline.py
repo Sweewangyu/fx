@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -118,7 +119,8 @@ def test_resolve_pipeline_derives_versioned_paths_and_snapshot_datasets(
         f"chatts-msxf-8B-datav3-seed7-{recipe_id}"
     )
     assert evaluation["output_root"].endswith(
-        f"/chatts-msxf-8B-datav3-seed7-{recipe_id}"
+        f"/chatts-msxf-8B-datav3-seed7-{recipe_id}/"
+        f"protocol-{evaluation['protocol_hash'][:16]}"
     )
     assert resolved["config"]["pipeline"]["training_recipe_hash"] == recipe_hash
     assert evaluation["benchmarks"] == "tsrbench,timeseriesexam"
@@ -224,7 +226,7 @@ def test_training_recipe_hash_is_stable_for_retries_and_isolates_parameter_chang
     ]
 
 
-def test_stage1_only_saves_a_final_recipe_model_and_ignores_stage2_and_eval(
+def test_stage1_saves_final_recipe_model_ignores_stage2_but_keeps_evaluation(
     tmp_path: Path,
 ) -> None:
     base_payload = {
@@ -251,14 +253,20 @@ def test_stage1_only_saves_a_final_recipe_model_and_ignores_stage2_and_eval(
     )
 
     assert baseline["pipeline_mode"] == "stage1"
-    assert baseline["mode"] == "train"
+    assert baseline["mode"] == "train_eval"
     assert baseline["config"]["pipeline"]["pipeline_mode"] == "stage1"
     assert baseline["config"]["training"]["keep_stage1"] is True
     assert baseline["config"]["training"]["stage1_model_path"] == baseline["derived"][
         "final_model_path"
     ]
     assert baseline["derived"]["final_model_path"].endswith("/best_stage1_seed42")
-    assert "evaluation" not in baseline["config"]
+    assert baseline["config"]["evaluation"]["model_path"] == baseline["derived"][
+        "final_model_path"
+    ]
+    assert baseline["config"]["evaluation"]["model_completion_marker"] == (
+        "STAGE1_COMPLETE.json"
+    )
+    assert baseline["config"]["evaluation"]["run_id"].endswith("-stage1")
     assert "stage2" not in baseline["derived"]["training_recipe"]
     assert changed_hidden_fields["derived"]["training_recipe_hash"] == baseline[
         "derived"
@@ -266,6 +274,10 @@ def test_stage1_only_saves_a_final_recipe_model_and_ignores_stage2_and_eval(
     assert changed_hidden_fields["derived"]["final_model_path"] == baseline["derived"][
         "final_model_path"
     ]
+    assert changed_hidden_fields["config_hash"] != baseline["config_hash"]
+    assert changed_hidden_fields["config"]["evaluation"]["benchmarks"] == (
+        "timeseriesexam"
+    )
 
 
 def test_stage1_recipe_path_changes_when_an_executed_parameter_changes(
@@ -294,6 +306,115 @@ def test_stage1_recipe_path_changes_when_an_executed_parameter_changes(
     assert changed["derived"]["final_model_path"] != baseline["derived"][
         "final_model_path"
     ]
+
+
+@pytest.mark.parametrize(
+    ("backend", "profile", "marker", "run_suffix"),
+    [
+        ("docker_host", "chronos2-full", "TRAINING_COMPLETE.json", "-full"),
+        ("docker_host", "chronos2-stage1", "STAGE1_COMPLETE.json", "-stage1"),
+        ("slurm", "chronos2-full", "TRAINING_COMPLETE.json", "-full"),
+        ("slurm", "chronos2-stage1", "STAGE1_COMPLETE.json", "-stage1"),
+    ],
+)
+def test_every_profile_and_backend_freezes_complete_evaluation_contract(
+    tmp_path: Path,
+    backend: str,
+    profile: str,
+    marker: str,
+    run_suffix: str,
+) -> None:
+    integration = (
+        _trusted_slurm_integration(tmp_path)
+        if backend == "slurm"
+        else _integration(tmp_path)
+    )
+    resolved = resolve_pipeline_request(
+        {
+            # Legacy frontend spelling remains accepted and canonicalized.
+            "mode": "train" if backend == "slurm" or profile.endswith("stage1") else "train_eval",
+            "execution": {"backend": backend},
+            "training": {"profile": profile},
+            "evaluation": {
+                "benchmarks": ["timeseriesexam", "tsrbench"],
+                "max_samples": 17,
+                "tsr_batch_size": 3,
+            },
+        },
+        _version(tmp_path),
+        integration,
+    )
+
+    evaluation = resolved["config"]["evaluation"]
+    assert resolved["mode"] == "train_eval"
+    assert evaluation["model_path"] == resolved["derived"]["final_model_path"]
+    assert evaluation["model_completion_marker"] == marker
+    assert evaluation["run_id"].endswith(run_suffix)
+    assert f"-{resolved['derived']['evaluation_protocol_id']}-" in evaluation[
+        "run_id"
+    ]
+    assert evaluation["benchmarks"] == "timeseriesexam,tsrbench"
+    assert evaluation["tsr_batch_size"] == 3
+    assert re.fullmatch(r"[0-9a-f]{64}", evaluation["protocol_hash"])
+    assert evaluation["output_root"].endswith(
+        f"/protocol-{evaluation['protocol_hash'][:16]}"
+    )
+    assert resolved["derived"]["evaluation_protocol_id"] == (
+        f"protocol-{evaluation['protocol_hash'][:16]}"
+    )
+    assert resolved["config"]["pipeline"]["max_samples"] == 17
+    if backend == "slurm":
+        assert resolved["config"]["slurm"]["evaluation_host_root"] == str(
+            Path(str(integration["evaluation_root"])).resolve()
+        )
+
+
+def test_evaluation_changes_protocol_and_config_but_never_training_recipe(
+    tmp_path: Path,
+) -> None:
+    baseline = resolve_pipeline_request({}, _version(tmp_path), _integration(tmp_path))
+    changed = resolve_pipeline_request(
+        {"evaluation": {"benchmarks": ["tsrbench"], "exam_batch_size": 2}},
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+
+    assert changed["derived"]["training_recipe_hash"] == baseline["derived"][
+        "training_recipe_hash"
+    ]
+    assert changed["config"]["evaluation"]["protocol_hash"] != baseline["config"][
+        "evaluation"
+    ]["protocol_hash"]
+    assert changed["config_hash"] != baseline["config_hash"]
+    assert changed["derived"]["evaluation_output_root"] != baseline["derived"][
+        "evaluation_output_root"
+    ]
+
+
+def test_client_protocol_hash_is_only_an_expected_server_hash(tmp_path: Path) -> None:
+    integration = _integration(tmp_path)
+    version = _version(tmp_path)
+    baseline = resolve_pipeline_request({}, version, integration)
+    expected = baseline["config"]["evaluation"]["protocol_hash"]
+
+    accepted = resolve_pipeline_request(
+        {"evaluation": {"protocol_hash": expected}}, version, integration
+    )
+    assert accepted["config"]["evaluation"]["protocol_hash"] == expected
+
+    forged = "f" * 64
+    for evaluation in (
+        {"protocol_hash": forged, "benchmarks": ["tsrbench"]},
+        {
+            "protocol_hash": forged,
+            "benchmarks": ["timeseriesexam"],
+            "exam_batch_size": 2,
+        },
+    ):
+        with pytest.raises(StudioError, match="expected hash.*does not match"):
+            resolve_pipeline_request(
+                {"evaluation": evaluation}, version, integration
+            )
 
 
 @pytest.mark.parametrize(
@@ -415,11 +536,10 @@ def test_public_pipeline_defaults_uses_optional_base_model_default(
     assert public_pipeline_defaults(integration)["training"]["base_model_path"] is None
 
 
-def test_slurm_readiness_does_not_require_docker_or_evaluation_repository(
+def test_slurm_readiness_requires_evaluation_protocol_but_not_docker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     integration = _trusted_slurm_integration(tmp_path)
-    integration.pop("evaluation_root")
     monkeypatch.setattr(
         "chatts_dataset_studio.slurm.shutil.which",
         lambda command: f"/mock/bin/{command}",
@@ -505,15 +625,84 @@ def test_slurm_job_submits_frozen_config_and_tracks_scheduler_completion(
         time.sleep(0.01)
 
     assert job["status"] == "completed"
-    assert job["kind"] == "train_stage1"
+    assert job["kind"] == "train_eval_stage1"
     assert job["execution_backend"] == "slurm"
     assert job["scheduler_job_id"] == "12345"
     assert len(job["sbatch_sha256"]) == 64
+    assert job["artifacts"]["评测指标"].endswith("/metrics.json")
+    assert job["artifacts"]["评测状态表"].endswith("/benchmark_status.tsv")
     argv = submitted_args.read_text(encoding="utf-8").splitlines()
     assert "--parsable" in argv
+    assert "--time=00:10:00" not in argv
     assert str(Path(job["config_path"])) in argv
     assert job["job_id"] in argv
     assert job["sbatch_path"] in argv
+
+
+def test_slurm_preflight_submits_short_allocation_and_tracks_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    mock_bin = tmp_path / "mock-preflight-bin"
+    mock_bin.mkdir()
+    submitted_args = tmp_path / "sbatch-preflight-args.txt"
+    preflight_flag = tmp_path / "preflight-flag.txt"
+    training_started = tmp_path / "training-started"
+    scripts = {
+        "sbatch": (
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$@\" > \"$MOCK_SBATCH_ARGS\"\n"
+            "config=''\n"
+            "for arg in \"$@\"; do case \"$arg\" in *.yaml) config=\"$arg\";; esac; done\n"
+            "if grep -q '^  preflight_only: true$' \"$config\"; then\n"
+            "  printf 'true\\n' > \"$MOCK_PREFLIGHT_FLAG\"\n"
+            "else\n"
+            "  touch \"$MOCK_TRAINING_STARTED\"\n"
+            "  exit 91\n"
+            "fi\n"
+            "printf '54321\\n'\n"
+        ),
+        "squeue": "#!/bin/sh\nexit 0\n",
+        "sacct": (
+            "#!/bin/sh\n"
+            "printf '54321|COMPLETED|0:0|2026-01-01|2026-01-01|1|\\n'\n"
+        ),
+    }
+    for name, source in scripts.items():
+        path = mock_bin / name
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{mock_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("MOCK_SBATCH_ARGS", str(submitted_args))
+    monkeypatch.setenv("MOCK_PREFLIGHT_FLAG", str(preflight_flag))
+    monkeypatch.setenv("MOCK_TRAINING_STARTED", str(training_started))
+
+    resolved = resolve_pipeline_request(
+        {"execution": {"backend": "slurm"}},
+        _version(tmp_path),
+        integration,
+    )
+    jobs = PipelineJobs(tmp_path / "preflight-state", None, integration)
+    started = jobs.start(resolved, preflight=True)
+    deadline = time.monotonic() + 5
+    while True:
+        job = jobs.get(started["job_id"])
+        if job["status"] in {"completed", "failed"}:
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    assert job["status"] == "completed"
+    assert job["scheduler_job_id"] == "54321"
+    arguments = submitted_args.read_text(encoding="utf-8").splitlines()
+    assert "--parsable" in arguments
+    assert "--test-only" not in arguments
+    assert "--time=00:10:00" in arguments
+    assert preflight_flag.read_text(encoding="utf-8").strip() == "true"
+    assert not training_started.exists()
+    assert not (tmp_path / "preflight-state" / "run-records").exists()
+    assert job["kind"] == "preflight"
 
 
 def test_docker_fifo_does_not_block_immediate_parallel_slurm_submissions(

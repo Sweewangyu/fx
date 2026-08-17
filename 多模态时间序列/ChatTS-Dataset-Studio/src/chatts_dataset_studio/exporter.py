@@ -9,12 +9,14 @@ import shutil
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
-from .catalog import _validate_annotation
+from .catalog import _validate_annotation, source_signatures
 from .models import ANNOTATION_FIELDS, DEFAULT_ALIASES, Source, StageRule, StudioError, safe_name
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -172,9 +174,51 @@ def canonical_selection(stage1: StageRule, stage2: StageRule) -> dict[str, Any]:
     return {"stage1": stage1.to_mapping(), "stage2": stage2.to_mapping()}
 
 
-def preview_selection(
+def _sample_size(total: int, sample_percent: int | float) -> int:
+    if sample_percent == 100:
+        return total
+    scaled = Decimal(total) * Decimal(str(sample_percent)) / Decimal(100)
+    rounded = int(scaled.to_integral_value(rounding=ROUND_HALF_UP))
+    # A selected source with a non-empty filter must never silently disappear
+    # just because its percentage rounds below one row.
+    return min(total, max(1, rounded))
+
+
+def _quota_tie_key(stage: str, source: str, bucket: str) -> str:
+    value = f"chatts-dataset-quota-v1\0{stage}\0{source}\0{bucket}"
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _allocate_bucket_quotas(
+    counts: dict[str, int],
+    sample_percent: int | float,
+    *,
+    stage: str,
+    source: str,
+) -> dict[str, int]:
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    target = _sample_size(total, sample_percent)
+    if target == total:
+        return dict(counts)
+
+    quotas: dict[str, int] = {}
+    remainders: list[tuple[Decimal, str, str]] = []
+    for bucket, count in sorted(counts.items()):
+        exact = Decimal(count) * Decimal(target) / Decimal(total)
+        base = int(exact.to_integral_value(rounding=ROUND_FLOOR))
+        quotas[bucket] = base
+        remainders.append((exact - Decimal(base), _quota_tie_key(stage, source, bucket), bucket))
+    remaining = target - sum(quotas.values())
+    for _, _, bucket in sorted(remainders, key=lambda item: (-item[0], item[1]))[:remaining]:
+        quotas[bucket] += 1
+    return quotas
+
+
+def _sampling_plan(
     catalog: dict[str, Any], stage1: StageRule, stage2: StageRule
-) -> dict[str, Any]:
+) -> dict[str, dict[str, dict[str, Any]]]:
     source_summaries = {item["name"]: item for item in catalog["sources"]}
     selected = stage1.sources | stage2.sources
     unavailable = {
@@ -185,61 +229,125 @@ def preview_selection(
     if unavailable:
         raise StudioError(f"Selected datasets are unavailable: {unavailable}")
 
+    plan: dict[str, dict[str, dict[str, Any]]] = {"stage1": {}, "stage2": {}}
+    for stage, rule in (("stage1", stage1), ("stage2", stage2)):
+        empty_sources = []
+        for source in sorted(rule.sources):
+            filtered = {
+                packed: count
+                for packed, count in source_summaries[source].get("cube", {}).items()
+                if rule.matches(
+                    source,
+                    {
+                        "quality": packed.split("\u001f", 2)[0],
+                        "difficulty": packed.split("\u001f", 2)[1],
+                        "ability_bucket": packed.split("\u001f", 2)[2],
+                    },
+                )
+            }
+            if not filtered:
+                empty_sources.append(source)
+                continue
+            effective = rule.effective_rule(source)
+            plan[stage][source] = {
+                "filtered": filtered,
+                "selected": _allocate_bucket_quotas(
+                    filtered,
+                    effective.sample_percent,
+                    stage=stage,
+                    source=source,
+                ),
+                "sample_percent": effective.sample_percent,
+            }
+        if empty_sources:
+            raise StudioError(
+                f"{stage.capitalize()} filters select zero rows for selected datasets: "
+                f"{empty_sources}"
+            )
+    return plan
+
+
+def _percentages(counts: Counter[str]) -> dict[str, float]:
+    total = sum(counts.values())
+    if total == 0:
+        return {}
+    return {
+        name: round(count * 100 / total, 6)
+        for name, count in sorted(counts.items())
+    }
+
+
+def _preview_from_plan(
+    catalog: dict[str, Any],
+    stage1: StageRule,
+    stage2: StageRule,
+    plan: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    source_summaries = {item["name"]: item for item in catalog["sources"]}
+    selected_sources = stage1.sources | stage2.sources
     stage_totals = {"stage1": 0, "stage2": 0, "overlap": 0}
+    filtered_totals = {"stage1": 0, "stage2": 0}
     stage_quality = {"stage1": Counter(), "stage2": Counter()}
     stage_difficulty = {"stage1": Counter(), "stage2": Counter()}
     stage_ability = {"stage1": Counter(), "stage2": Counter()}
     rows = []
+
     for name, summary in source_summaries.items():
+        if name not in selected_sources:
+            continue
         counts = {"stage1": 0, "stage2": 0, "overlap": 0}
-        for packed, count in summary.get("cube", {}).items():
-            quality, difficulty, ability = packed.split("\u001f", 2)
-            annotation = {
-                "quality": quality,
-                "difficulty": difficulty,
-                "ability_bucket": ability,
-            }
-            in_stage1 = stage1.matches(name, annotation)
-            in_stage2 = stage2.matches(name, annotation)
-            if in_stage1:
-                counts["stage1"] += count
-                stage_quality["stage1"][quality] += count
-                stage_difficulty["stage1"][difficulty] += count
-                stage_ability["stage1"][ability] += count
-            if in_stage2:
-                counts["stage2"] += count
-                stage_quality["stage2"][quality] += count
-                stage_difficulty["stage2"][difficulty] += count
-                stage_ability["stage2"][ability] += count
-            if in_stage1 and in_stage2:
-                counts["overlap"] += count
+        filtered_counts = {"stage1": 0, "stage2": 0}
+        selected_by_stage: dict[str, dict[str, int]] = {}
+        for stage in ("stage1", "stage2"):
+            details = plan[stage].get(name)
+            selected_by_stage[stage] = details["selected"] if details else {}
+            if not details:
+                continue
+            filtered_counts[stage] = sum(details["filtered"].values())
+            filtered_totals[stage] += filtered_counts[stage]
+            for packed, count in details["selected"].items():
+                quality, difficulty, ability = packed.split("\u001f", 2)
+                counts[stage] += count
+                stage_quality[stage][quality] += count
+                stage_difficulty[stage][difficulty] += count
+                stage_ability[stage][ability] += count
+        counts["overlap"] = sum(
+            min(count, selected_by_stage["stage2"].get(packed, 0))
+            for packed, count in selected_by_stage["stage1"].items()
+        )
         for key in stage_totals:
             stage_totals[key] += counts[key]
-        if name in selected:
-            rows.append({"source": name, "source_rows": summary["rows"], **counts})
-    for stage_name, rule in (("stage1", stage1), ("stage2", stage2)):
-        empty_sources = sorted(
-            row["source"]
-            for row in rows
-            if row["source"] in rule.sources and row[stage_name] == 0
+        rows.append(
+            {
+                "source": name,
+                "source_rows": summary["rows"],
+                "stage1_filtered": filtered_counts["stage1"],
+                "stage2_filtered": filtered_counts["stage2"],
+                **counts,
+            }
         )
-        if empty_sources:
-            raise StudioError(
-                f"{stage_name.capitalize()} filters select zero rows for selected datasets: "
-                f"{empty_sources}"
-            )
+
     return {
         "counts": stage_totals,
+        "filtered_counts": filtered_totals,
         "by_source": rows,
         "distributions": {
             stage: {
                 "quality": dict(stage_quality[stage]),
                 "difficulty": dict(stage_difficulty[stage]),
                 "ability": dict(stage_ability[stage]),
+                "ability_percentages": _percentages(stage_ability[stage]),
             }
             for stage in ("stage1", "stage2")
         },
     }
+
+
+def preview_selection(
+    catalog: dict[str, Any], stage1: StageRule, stage2: StageRule
+) -> dict[str, Any]:
+    plan = _sampling_plan(catalog, stage1, stage2)
+    return _preview_from_plan(catalog, stage1, stage2, plan)
 
 
 def _dataset_key(stage: str, source_name: str, data_version: str | None = None) -> str:
@@ -276,6 +384,10 @@ def _actual_preview(
         key: sum(source_counts[name][key] for name in selected_names)
         for key in ("stage1", "stage2", "overlap")
     }
+    filtered_counts = {
+        stage: sum(source_counts[name][f"{stage}_filtered"] for name in selected_names)
+        for stage in ("stage1", "stage2")
+    }
     distributions: dict[str, dict[str, dict[str, int]]] = {}
     for stage in ("stage1", "stage2"):
         quality: Counter[str] = Counter()
@@ -291,13 +403,17 @@ def _actual_preview(
             "quality": dict(quality),
             "difficulty": dict(difficulty),
             "ability": dict(ability),
+            "ability_percentages": _percentages(ability),
         }
     return {
         "counts": counts,
+        "filtered_counts": filtered_counts,
         "by_source": [
             {
                 "source": name,
                 "source_rows": source_counts[name]["source_rows"],
+                "stage1_filtered": source_counts[name]["stage1_filtered"],
+                "stage2_filtered": source_counts[name]["stage2_filtered"],
                 "stage1": source_counts[name]["stage1"],
                 "stage2": source_counts[name]["stage2"],
                 "overlap": source_counts[name]["overlap"],
@@ -311,9 +427,165 @@ def _actual_preview(
 def _preview_signature(preview: dict[str, Any]) -> dict[str, Any]:
     return {
         "counts": preview.get("counts"),
+        "filtered_counts": preview.get("filtered_counts"),
         "by_source": sorted(preview.get("by_source", []), key=lambda row: row["source"]),
         "distributions": preview.get("distributions"),
     }
+
+
+def _annotation_bucket(annotation: dict[str, Any]) -> str:
+    ability = annotation.get("ability_bucket") or annotation.get("ability_label") or "UNMAPPED"
+    return f"{annotation['quality']}\u001f{annotation['difficulty']}\u001f{ability}"
+
+
+_HASH_SPACE = 1 << 256
+
+
+def _sampling_hash(
+    stream: str,
+    source: str,
+    bucket: str,
+    line_number: int,
+) -> int:
+    value = (
+        f"chatts-dataset-online-sampler-v2\0{stream}\0{source}\0"
+        f"{bucket}\0{line_number}"
+    )
+    return int.from_bytes(hashlib.sha256(value.encode()).digest(), "big")
+
+
+@dataclass
+class _ExactOnlineChooser:
+    population: int
+    target: int
+    stream: str
+    source: str
+    bucket: str
+    seen: int = 0
+    selected: int = 0
+
+    def choose(self, line_number: int) -> bool:
+        if self.seen >= self.population:
+            raise StudioError(
+                "Source data changed after the catalog preview; rescan the catalog and retry"
+            )
+        remaining_population = self.population - self.seen
+        remaining_target = self.target - self.selected
+        if remaining_target == 0:
+            choose = False
+        elif remaining_target == remaining_population:
+            choose = True
+        else:
+            random_value = _sampling_hash(
+                self.stream,
+                self.source,
+                self.bucket,
+                line_number,
+            )
+            choose = (
+                random_value * remaining_population
+                < remaining_target * _HASH_SPACE
+            )
+        self.seen += 1
+        if choose:
+            self.selected += 1
+        return choose
+
+    def finalize(self) -> None:
+        if self.seen != self.population or self.selected != self.target:
+            raise StudioError(
+                "Source data changed after the catalog preview; rescan the catalog and retry"
+            )
+
+
+@dataclass
+class _NestedBucketSampler:
+    stage1_quota: int
+    stage2_quota: int
+    primary: _ExactOnlineChooser
+    secondary: _ExactOnlineChooser | None
+
+    def choose(self, line_number: int) -> tuple[bool, bool]:
+        if not self.primary.choose(line_number):
+            return False, False
+        if self.stage1_quota == self.stage2_quota:
+            return True, True
+        assert self.secondary is not None
+        selected_for_smaller = self.secondary.choose(line_number)
+        if self.stage1_quota > self.stage2_quota:
+            return True, selected_for_smaller
+        return selected_for_smaller, True
+
+    def finalize(self) -> None:
+        self.primary.finalize()
+        if self.secondary is not None:
+            self.secondary.finalize()
+
+
+class _OnlineNestedSampler:
+    """One-pass exact sampler with O(number of selected cubes) scalar state."""
+
+    def __init__(
+        self,
+        source: str,
+        plan: dict[str, dict[str, dict[str, Any]]],
+    ) -> None:
+        self.source = source
+        self.bucket_states: dict[str, _NestedBucketSampler] = {}
+        stage1 = plan["stage1"].get(source)
+        stage2 = plan["stage2"].get(source)
+        buckets = set(stage1["filtered"] if stage1 else ()) | set(
+            stage2["filtered"] if stage2 else ()
+        )
+        for bucket in sorted(buckets):
+            populations = {
+                details["filtered"][bucket]
+                for details in (stage1, stage2)
+                if details is not None and bucket in details["filtered"]
+            }
+            if len(populations) != 1:
+                raise StudioError(f"Inconsistent catalog cube count for {source}: {bucket}")
+            population = populations.pop()
+            stage1_quota = stage1["selected"].get(bucket, 0) if stage1 else 0
+            stage2_quota = stage2["selected"].get(bucket, 0) if stage2 else 0
+            maximum = max(stage1_quota, stage2_quota)
+            minimum = min(stage1_quota, stage2_quota)
+            primary = _ExactOnlineChooser(
+                population,
+                maximum,
+                "primary",
+                source,
+                bucket,
+            )
+            secondary = None
+            if stage1_quota != stage2_quota:
+                secondary = _ExactOnlineChooser(
+                    maximum,
+                    minimum,
+                    "secondary",
+                    source,
+                    bucket,
+                )
+            self.bucket_states[bucket] = _NestedBucketSampler(
+                stage1_quota,
+                stage2_quota,
+                primary,
+                secondary,
+            )
+
+    @property
+    def state_size(self) -> int:
+        return len(self.bucket_states)
+
+    def choose(self, bucket: str, line_number: int) -> tuple[bool, bool]:
+        state = self.bucket_states.get(bucket)
+        if state is None:
+            return False, False
+        return state.choose(line_number)
+
+    def finalize(self) -> None:
+        for state in self.bucket_states.values():
+            state.finalize()
 
 
 def export_selection(
@@ -323,7 +595,8 @@ def export_selection(
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     stage1, stage2 = parse_rules(payload, sources, catalog)
-    preview = preview_selection(catalog, stage1, stage2)
+    sampling_plan = _sampling_plan(catalog, stage1, stage2)
+    preview = _preview_from_plan(catalog, stage1, stage2, sampling_plan)
     run_name = safe_name(payload.get("run_name"), "run_name")
     data_version_value = payload.get("data_version")
     data_version = None
@@ -343,6 +616,12 @@ def export_selection(
     temporary.mkdir()
 
     source_map = {source.name: source for source in sources}
+    source_summary_map = {item["name"]: item for item in catalog["sources"]}
+    expected_signatures = {
+        item["name"]: item
+        for item in catalog.get("signatures", [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
     selected_names = [
         source.name for source in sources if source.name in stage1.sources | stage2.sources
     ]
@@ -365,12 +644,20 @@ def export_selection(
     try:
         for source_index, name in enumerate(selected_names, 1):
             source = source_map[name]
+            expected_signature = expected_signatures.get(name)
+            if expected_signature is None or source_signatures([source])[0] != expected_signature:
+                raise StudioError(
+                    f"Source identity changed after the catalog preview for {name}; "
+                    "rescan the catalog and retry"
+                )
+            sampler = _OnlineNestedSampler(name, sampling_plan)
             joined, identities = _iter_joined(source)
             outputs: dict[str, Any] = {}
             annotation_outputs: dict[str, Any] = {}
             digests: dict[str, Any] = {}
             annotation_digests: dict[str, Any] = {}
             counts = {"stage1": 0, "stage2": 0, "overlap": 0}
+            filtered_counts = {"stage1": 0, "stage2": 0}
             source_rows = 0
             cubes = {"stage1": Counter(), "stage2": Counter()}
             for stage, rule in (("stage1", stage1), ("stage2", stage2)):
@@ -386,10 +673,23 @@ def export_selection(
                 for line_number, raw_record, annotation in joined:
                     source_rows += 1
                     qa = _validate_qa(raw_record, source, line_number)
-                    matches = {
+                    bucket = _annotation_bucket(annotation)
+                    filter_matches = {
                         "stage1": stage1.matches(name, annotation),
                         "stage2": stage2.matches(name, annotation),
                     }
+                    sampled_stage1, sampled_stage2 = sampler.choose(bucket, line_number)
+                    matches = {
+                        "stage1": sampled_stage1,
+                        "stage2": sampled_stage2,
+                    }
+                    for stage in ("stage1", "stage2"):
+                        if filter_matches[stage]:
+                            filtered_counts[stage] += 1
+                        if matches[stage] and not filter_matches[stage]:
+                            raise StudioError(
+                                f"Sampling plan selected a row outside {stage} filters for {name}"
+                            )
                     if matches["stage1"] and matches["stage2"]:
                         counts["overlap"] += 1
                     for stage in ("stage1", "stage2"):
@@ -402,10 +702,7 @@ def export_selection(
                         digests[stage].update(qa_line.encode())
                         annotation_digests[stage].update(annotation_line.encode())
                         counts[stage] += 1
-                        cubes[stage][
-                            f"{annotation['quality']}\u001f{annotation['difficulty']}\u001f"
-                            f"{annotation.get('ability_bucket') or annotation.get('ability_label') or 'UNMAPPED'}"
-                        ] += 1
+                        cubes[stage][bucket] += 1
                     processed += 1
                     if progress and (processed % 1000 == 0 or processed == total_input_rows):
                         progress(
@@ -422,8 +719,30 @@ def export_selection(
                 for stream in (*outputs.values(), *annotation_outputs.values()):
                     stream.close()
 
+            sampler.finalize()
+            if source_rows != source_summary_map[name]["rows"]:
+                raise StudioError(
+                    "Source data changed after the catalog preview; rescan the catalog and retry"
+                )
+            for stage in ("stage1", "stage2"):
+                details = sampling_plan[stage].get(name)
+                expected_filtered = sum(details["filtered"].values()) if details else 0
+                if filtered_counts[stage] != expected_filtered:
+                    raise StudioError(
+                        "Source data changed after the catalog preview; "
+                        "rescan the catalog and retry"
+                    )
+            if source_signatures([source])[0] != expected_signature:
+                raise StudioError(
+                    f"Source identity changed during export for {name}; retry the export"
+                )
             input_identities[name] = identities
-            actual_source_counts[name] = {"source_rows": source_rows, **counts}
+            actual_source_counts[name] = {
+                "source_rows": source_rows,
+                "stage1_filtered": filtered_counts["stage1"],
+                "stage2_filtered": filtered_counts["stage2"],
+                **counts,
+            }
             for stage in ("stage1", "stage2"):
                 if stage not in outputs:
                     continue

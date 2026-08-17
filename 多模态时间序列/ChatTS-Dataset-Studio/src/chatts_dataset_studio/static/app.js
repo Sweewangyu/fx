@@ -8,8 +8,10 @@ const state = {
   versions: [],
   nextVersion: null,
   activeVersion: null,
+  selectedTrainingVersion: null,
   pipelineEnabled: false,
   modelOutputBaseTemplate: "",
+  evaluationOutputBaseTemplate: "",
   jobs: [],
   activeJobId: null,
   busy: new Set(),
@@ -91,6 +93,7 @@ function stagePayload(stageName) {
       qualities: [...rule.qualities].sort(),
       difficulties: [...rule.difficulties].sort(),
       abilities: [...rule.abilities].sort(),
+      sample_percent: rule.samplePercent,
     };
   }
   return {
@@ -136,8 +139,13 @@ function jobId(job) {
   return String(job?.job_id || job?.id || "");
 }
 
-function currentVersionName() {
-  return versionName(state.activeVersion) || $("#version-name").value.trim();
+function selectedTrainingVersionName() {
+  return String(state.selectedTrainingVersion || "");
+}
+
+function selectedTrainingVersion() {
+  const selected = selectedTrainingVersionName();
+  return state.versions.find((version) => versionName(version) === selected) || null;
 }
 
 function setHealth(kind, text) {
@@ -164,7 +172,7 @@ async function withBusy(button, label, task) {
 function renderActionState() {
   const scanned = Boolean(state.catalog);
   const previewReady = Boolean(state.preview && state.previewFingerprint === selectionFingerprint());
-  const hasVersion = Boolean(versionName(state.activeVersion));
+  const hasVersion = Boolean(selectedTrainingVersionName());
   const slurmReady = $("#execution-backend").value !== "slurm" || Boolean($("#slurm-sbatch-path").value);
   const canRun = hasVersion && state.pipelineEnabled && slurmReady && $("#base-model-path").value.trim().startsWith("/");
   $("#scan-button").disabled = !state.defaults || state.busy.has("scan-button");
@@ -259,6 +267,7 @@ function defaultSourceRule(stageName, sourceName) {
     qualities: new Set(presetQualities.length ? presetQualities : availableQualities),
     difficulties: new Set(presetDifficulties.length ? presetDifficulties : availableDifficulties),
     abilities: new Set(),
+    samplePercent: 100,
   };
 }
 
@@ -331,6 +340,44 @@ function abilityGroup(stageName, sourceName, source, selected) {
   return fieldset;
 }
 
+function samplingGroup(stageName, sourceName, samplePercent) {
+  const fieldset = element("fieldset", "rule-group source-sampling");
+  fieldset.append(element("legend", "", "随机抽样"));
+  const field = element("label", "sample-percent-field");
+  const description = element("span");
+  description.append(
+    element("strong", "", "筛选后保留比例"),
+    element("small", "", "按样本稳定随机抽样；同一配方重复预览结果一致。"),
+  );
+  const control = element("span", "sample-percent-control");
+  const input = element("input");
+  input.type = "number";
+  input.min = "1";
+  input.max = "100";
+  input.step = "0.1";
+  input.value = String(samplePercent);
+  input.inputMode = "decimal";
+  input.dataset.stage = stageName;
+  input.dataset.sourceRule = sourceName;
+  input.dataset.type = "sample-percent";
+  input.setAttribute("aria-label", `${sourceName} 随机抽样百分比`);
+  control.append(input, element("b", "", "%"));
+  field.append(description, control);
+  fieldset.append(field);
+  return fieldset;
+}
+
+function sourceRuleSummary(rule) {
+  const abilitySummary = rule.abilities.size ? `${rule.abilities.size} 能力` : "全部能力";
+  return `${rule.qualities.size} 质量 · ${rule.difficulties.size} 难度 · ${abilitySummary} · 抽样 ${rule.samplePercent}%`;
+}
+
+function validSamplePercent(value, raw = String(value)) {
+  if (!Number.isFinite(value) || value < 1 || value > 100) return false;
+  const decimal = String(raw).trim().split(".")[1] || "";
+  return decimal.length <= 6;
+}
+
 function renderRules() {
   if (!state.catalog) return;
   for (const stageName of ["stage1", "stage2"]) {
@@ -346,10 +393,10 @@ function renderRules() {
       const summary = element("summary", "source-rule-summary");
       const identity = element("span");
       identity.append(element("strong", "", sourceName), element("small", "", `${formatCount(source.rows)} 条 · 逐数据集规则`));
-      const abilitySummary = rule.abilities.size ? `${rule.abilities.size} 能力` : "全部能力";
-      summary.append(identity, element("b", "", `${rule.qualities.size} 质量 · ${rule.difficulties.size} 难度 · ${abilitySummary}`));
+      summary.append(identity, element("b", "", sourceRuleSummary(rule)));
       const groups = element("div", "source-rule-groups");
       groups.append(
+        samplingGroup(stageName, sourceName, rule.samplePercent),
         ruleGroup(stageName, sourceName, "qualities", "质量", orderedDimension(source, "quality"), state.defaults.quality_labels_zh, rule.qualities, source.quality),
         ruleGroup(stageName, sourceName, "difficulties", "难度", orderedDimension(source, "difficulty"), state.defaults.difficulty_labels_zh, rule.difficulties, source.difficulty),
         abilityGroup(stageName, sourceName, source, rule.abilities),
@@ -504,6 +551,9 @@ function validateRecipe() {
       const rule = ensureSourceRule(stageName, sourceName);
       if (!rule.qualities.size) throw new Error(`${label} 的 ${sourceName} 至少选择一个质量等级`);
       if (!rule.difficulties.size) throw new Error(`${label} 的 ${sourceName} 至少选择一个难度等级`);
+      if (!validSamplePercent(rule.samplePercent)) {
+        throw new Error(`${label} 的 ${sourceName} 抽样比例必须是 1–100 的有限数字（最多 6 位小数）`);
+      }
     }
   }
 }
@@ -533,11 +583,83 @@ function renderDistribution(stageName, preview) {
   $(`#${stageName}-dist-total`).textContent = `${formatCount(total)} 条`;
 }
 
+function allAbilityDimensions(preview, stageName) {
+  const configuredLevels = Array.isArray(state.catalog?.ability_levels)
+    ? state.catalog.ability_levels.filter((value) => typeof value === "string" && value)
+    : [];
+  const standard = configuredLevels.length
+    ? [...new Set(configuredLevels)]
+    : [...new Set(state.catalog?.abilities || [])].sort((left, right) => left.localeCompare(right));
+  const standardSet = new Set(standard);
+  const observed = new Set(state.catalog?.ability_extras || []);
+  for (const ability of state.catalog?.abilities || []) observed.add(ability);
+  for (const source of state.catalog?.sources || []) {
+    for (const ability of Object.keys(source.ability || {})) observed.add(ability);
+  }
+  for (const ability of Object.keys(preview.distributions?.[stageName]?.ability || {})) observed.add(ability);
+  const percentages = preview.ability_percentages?.[stageName]
+    || preview.distributions?.[stageName]?.ability_percentages
+    || {};
+  for (const ability of Object.keys(percentages)) observed.add(ability);
+  const extras = [...observed]
+    .filter((ability) => !standardSet.has(ability))
+    .sort((left, right) => left.localeCompare(right));
+  return {
+    standard: standard.map((name) => ({ name, extra: false })),
+    extras: extras.map((name) => ({ name, extra: true })),
+  };
+}
+
+function renderAbilityDistribution(stageName, preview) {
+  const root = $(`#${stageName}-ability-distribution`);
+  root.replaceChildren();
+  const total = Number(preview.counts?.[stageName] || 0);
+  const counts = preview.distributions?.[stageName]?.ability || {};
+  const rawPercentages = preview.ability_percentages?.[stageName]
+    || preview.distributions?.[stageName]?.ability_percentages
+    || {};
+  const percentageSum = Object.values(rawPercentages).reduce((sum, value) => sum + Number(value || 0), 0);
+  const percentageScale = percentageSum > 0 && percentageSum <= 1.0001 ? 100 : 1;
+  const dimensions = allAbilityDimensions(preview, stageName);
+  const abilities = [...dimensions.standard, ...dimensions.extras];
+  const standardText = dimensions.standard.length === 15
+    ? "15 个标准维度"
+    : `${dimensions.standard.length} 个标准维度`;
+  $(`#${stageName}-ability-count`).textContent = dimensions.extras.length
+    ? `${standardText} · ${dimensions.extras.length} 个非标准标签`
+    : standardText;
+  for (const dimension of abilities) {
+    const ability = dimension.name;
+    const count = Number(counts[ability] || 0);
+    const supplied = rawPercentages[ability];
+    const percent = supplied === undefined
+      ? (total ? (count / total) * 100 : 0)
+      : Number(supplied || 0) * percentageScale;
+    const normalizedPercent = Math.max(0, Math.min(100, percent));
+    const item = element("div", `ability-bar-item${dimension.extra ? " nonstandard" : ""}`);
+    const progress = element("progress");
+    progress.max = 100;
+    progress.value = normalizedPercent;
+    progress.setAttribute("aria-label", `${ability} ${normalizedPercent.toFixed(1)}%，${formatCount(count)} 条`);
+    item.append(
+      element("span", "", dimension.extra ? `${ability} · 非标准` : ability),
+      progress,
+      element("strong", "", `${normalizedPercent.toFixed(1)}%`),
+      element("small", "", `${formatCount(count)} 条`),
+    );
+    root.append(item);
+  }
+  if (!abilities.length) root.append(element("div", "list-empty", "catalog 中暂无能力维度"));
+}
+
 function renderPreview(preview) {
   state.preview = preview;
   const counts = preview.counts || {};
   $("#metric-stage1").textContent = formatCount(counts.stage1);
   $("#metric-stage2").textContent = formatCount(counts.stage2);
+  const filteredCounts = preview.filtered_counts || {};
+  $("#metric-stage1-detail").textContent = `${state.stages.stage1.sources.size} 源${filteredCounts.stage1 === undefined ? "" : ` · 候选 ${formatCount(filteredCounts.stage1)}`}`;
+  $("#metric-stage2-detail").textContent = `${state.stages.stage2.sources.size} 源${filteredCounts.stage2 === undefined ? "" : ` · 候选 ${formatCount(filteredCounts.stage2)}`}`;
   $("#metric-overlap").textContent = formatCount(counts.overlap);
   const denominator = Math.min(Number(counts.stage1 || 0), Number(counts.stage2 || 0));
   $("#metric-overlap-detail").textContent = denominator ? `${((Number(counts.overlap || 0) / denominator) * 100).toFixed(1)}%` : "无重叠";
@@ -545,14 +667,19 @@ function renderPreview(preview) {
   $("#overview-overlap").textContent = `重叠 ${formatCount(counts.overlap)} 条`;
   renderDistribution("stage1", preview);
   renderDistribution("stage2", preview);
+  renderAbilityDistribution("stage1", preview);
+  renderAbilityDistribution("stage2", preview);
   const body = $("#source-results");
   body.replaceChildren();
   for (const source of preview.by_source || []) {
     const row = element("tr");
-    for (const value of [source.source, source.source_rows, source.stage1, source.stage2, source.overlap]) row.append(element("td", "", typeof value === "number" ? formatCount(value) : value));
+    const stage1 = `${formatCount(source.stage1)} / ${formatCount(source.stage1_filtered ?? source.stage1)}`;
+    const stage2 = `${formatCount(source.stage2)} / ${formatCount(source.stage2_filtered ?? source.stage2)}`;
+    for (const value of [source.source, formatCount(source.source_rows), stage1, stage2, formatCount(source.overlap)]) row.append(element("td", "", value));
     body.append(row);
   }
   $("#preview-detail").hidden = false;
+  $("#preview-detail").open = true;
   $("#preview-message").textContent = "配方已计算，可发布版本。";
   $("#recipe-state").textContent = "已预览";
   $("#recipe-state").className = "dirty-chip ready";
@@ -643,15 +770,55 @@ function renderVersions() {
   }
   if ([...parent.options].some((option) => option.value === selected)) parent.value = selected;
   $("#version-name").value = nextVersionName();
+  renderTrainingVersionOptions();
   renderCurrentVersion();
 }
 
+function isTrainableVersion(version) {
+  if (!versionName(version) || version?.available === false) return false;
+  const status = String(version?.status || "").toLocaleLowerCase();
+  return !["deleted", "deleting", "failed", "invalid", "unavailable"].includes(status);
+}
+
+function renderTrainingVersionOptions() {
+  const select = $("#training-data-version");
+  const previous = selectedTrainingVersionName();
+  const trainable = state.versions
+    .filter(isTrainableVersion)
+    .sort((left, right) => versionName(right).localeCompare(versionName(left), undefined, { numeric: true }));
+  const activeName = versionName(state.activeVersion);
+  const availableNames = new Set(trainable.map(versionName));
+  const selected = availableNames.has(previous)
+    ? previous
+    : (availableNames.has(activeName) ? activeName : (versionName(trainable[0]) || ""));
+
+  select.replaceChildren();
+  for (const version of trainable) {
+    const name = versionName(version);
+    const status = version.registered ? "已注册" : "运行时自动注册";
+    const active = name === activeName ? "当前 · " : "";
+    select.append(new Option(`${name} · ${active}${status}`, name));
+  }
+  if (!trainable.length) select.append(new Option("暂无可训练的已发布版本", ""));
+  select.value = selected;
+  state.selectedTrainingVersion = selected || null;
+}
+
 function renderCurrentVersion() {
-  const name = versionName(state.activeVersion);
-  for (const id of ["#current-version-chip", "#overview-version", "#training-version", "#evaluation-version"]) $(id).textContent = name || "未发布";
-  $("#overview-version-meta").textContent = name ? (state.activeVersion.dataset_snapshot_hash ? `#${String(state.activeVersion.dataset_snapshot_hash).slice(0, 12)}` : "已设为当前版本") : "先发布数据版本";
-  const stage1 = state.activeVersion?.dataset_names?.stage1 || state.activeVersion?.composition?.stage1?.dataset_names || state.activeVersion?.datasets?.stage1 || [];
-  const stage2 = state.activeVersion?.dataset_names?.stage2 || state.activeVersion?.composition?.stage2?.dataset_names || state.activeVersion?.datasets?.stage2 || [];
+  const activeName = versionName(state.activeVersion);
+  for (const id of ["#current-version-chip", "#overview-version"]) $(id).textContent = activeName || "未发布";
+  $("#overview-version-meta").textContent = activeName ? (state.activeVersion.dataset_snapshot_hash ? `#${String(state.activeVersion.dataset_snapshot_hash).slice(0, 12)}` : "已设为当前版本") : "先发布数据版本";
+
+  const trainingVersion = selectedTrainingVersion();
+  const trainingName = selectedTrainingVersionName();
+  for (const id of ["#training-version", "#evaluation-version"]) $(id).textContent = trainingName ? `训练：${trainingName}` : "未选择版本";
+  $("#training-version-help").textContent = trainingVersion
+    ? (trainingVersion.registered
+      ? `${trainingName} 已注册；本次选择不会修改全局当前版本。`
+      : `${trainingName} 尚未注册，启动时会自动注册；不会修改全局当前版本。`)
+    : "请先在“版本”页发布数据版本。";
+  const stage1 = trainingVersion?.dataset_names?.stage1 || trainingVersion?.composition?.stage1?.dataset_names || trainingVersion?.datasets?.stage1 || [];
+  const stage2 = trainingVersion?.dataset_names?.stage2 || trainingVersion?.composition?.stage2?.dataset_names || trainingVersion?.datasets?.stage2 || [];
   $("#stage1-datasets").textContent = Array.isArray(stage1) && stage1.length ? stage1.join(", ") : "由数据版本生成";
   $("#stage2-datasets").textContent = Array.isArray(stage2) && stage2.length ? stage2.join(", ") : "由数据版本生成";
   updateDerivedPaths();
@@ -803,7 +970,7 @@ function runPayload(mode) {
   const backend = $("#execution-backend").value;
   const payload = {
     mode,
-    version: versionName(state.activeVersion),
+    version: selectedTrainingVersionName(),
     execution: {
       backend,
       sbatch_path: backend === "slurm" ? $("#slurm-sbatch-path").value : null,
@@ -820,20 +987,16 @@ function runPayload(mode) {
       stage2: trainingStagePayload("stage2"),
     },
   };
-  if (shouldEvaluate()) payload.evaluation = evaluationPayload();
+  payload.evaluation = evaluationPayload();
   return payload;
 }
 
-function shouldEvaluate() {
-  return $("#train-profile").value === "chronos2-full" && $("#execution-backend").value === "docker_host";
-}
-
 function effectiveRunMode() {
-  return shouldEvaluate() ? "train_eval" : "train";
+  return "train_eval";
 }
 
 function validateRun(mode) {
-  if (!versionName(state.activeVersion)) throw new Error("请先选择已注册的数据版本");
+  if (!selectedTrainingVersionName()) throw new Error("请先在训练页选择一个已发布的数据版本");
   const baseModelPath = $("#base-model-path").value.trim();
   if (!baseModelPath.startsWith("/")) throw new Error("请填写训练容器内可见的基础模型绝对路径");
   if (mode === "train_eval" && !evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
@@ -848,20 +1011,17 @@ async function startRun(mode, button) {
     try {
       const result = await api(endpoint, { method: "POST", body: JSON.stringify(runPayload(effectiveMode)) });
       const id = jobId(result);
-      const isSlurm = (result.execution_backend || $("#execution-backend").value) === "slurm";
       const submittedStatus = result.status === "queued"
-        ? `已加入 Docker 队列，当前第 ${result.queue_position || 1} 位。`
-        : isSlurm
-          ? "已提交 Slurm，正在读取集群调度状态。"
-          : "已经开始运行。";
-      $("#run-status").textContent = mode === "preflight" ? `预检任务${submittedStatus}` : `${shouldEvaluate() ? "训练评测" : "训练"}任务${submittedStatus}`;
+        ? `已加入队列，当前第 ${result.queue_position || 1} 位。`
+        : "已经开始运行。";
+      $("#run-status").textContent = mode === "preflight" ? `预检任务${submittedStatus}` : `训练评测任务${submittedStatus}`;
       if (id) {
         state.activeJobId = id;
         state.jobs.unshift(result);
         renderJobs();
       }
       const queueSuffix = result.status === "queued" ? `，当前第 ${result.queue_position || 1} 位` : "";
-      showToast(mode === "preflight" ? `预检已提交${queueSuffix}` : (result.status === "queued" ? `Docker 流水线已加入队列${queueSuffix}` : isSlurm ? "Slurm 任务已立即提交" : "流水线已启动"), "success");
+      showToast(mode === "preflight" ? `预检已提交${queueSuffix}` : (result.status === "queued" ? `流水线已加入队列${queueSuffix}` : "流水线已启动"), "success");
       activateTab("jobs");
       refreshJobs({ quiet: true });
     } catch (error) {
@@ -872,12 +1032,23 @@ async function startRun(mode, button) {
 }
 
 function jobStatusLabel(status) {
-  return ({ queued: "Docker 排队", scheduled: "Slurm 排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
+  return ({ queued: "本地排队", scheduled: "Slurm 排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
 }
 
 function jobType(job) {
   const value = job.type || job.kind || job.mode || job.phase || "任务";
-  return ({ train_eval: "两阶段训练 + 评测", train_stage1: "Stage 1 训练", train_full: "两阶段训练", preflight: "Preflight", publish: "发布版本" })[value] || value;
+  const stage1 = job.profile === "chronos2-stage1"
+    || job.training_profile === "chronos2-stage1"
+    || job.training?.profile === "chronos2-stage1";
+  return ({
+    train_eval: stage1 ? "Stage 1 训练 + 评测" : "两阶段训练 + 评测",
+    train_eval_stage1: "Stage 1 训练 + 评测",
+    train_eval_full: "两阶段训练 + 评测（Slurm）",
+    train_stage1: "Stage 1 训练 + 评测",
+    train_full: "两阶段训练 + 评测",
+    preflight: "Preflight",
+    publish: "发布版本",
+  })[value] || value;
 }
 
 function formatDate(value) {
@@ -944,14 +1115,20 @@ function renderJobDialog(job) {
   const percent = Number(job.progress_percent ?? (total ? Math.floor((processed / total) * 100) : (job.status === "completed" ? 100 : 0)));
   $("#job-percent").textContent = `${Math.max(0, Math.min(100, percent))}%`;
   $("#job-progress").value = Math.max(0, Math.min(100, percent));
-  const waiting = job.status === "queued" ? `Docker 任务已冻结并进入本地队列，当前第 ${job.queue_position || "?"} 位。` : "等待日志";
+  const waiting = job.status === "queued" ? `任务已冻结并进入队列，当前第 ${job.queue_position || "?"} 位。` : "等待日志";
   const log = Array.isArray(job.log_tail) ? job.log_tail.join("\n") : (job.log_tail || job.log || job.error || waiting);
   $("#job-log").textContent = log;
   const diff = job.diff_from_previous;
   const diffPanel = $("#job-diff");
   const diffList = $("#job-diff-list");
   diffList.replaceChildren();
-  const trainingKinds = new Set(["train_eval", "train_stage1", "train_full"]);
+  const trainingKinds = new Set([
+    "train_eval",
+    "train_eval_stage1",
+    "train_eval_full",
+    "train_stage1",
+    "train_full",
+  ]);
   diffPanel.hidden = !diff || !trainingKinds.has(job.kind);
   if (diff && trainingKinds.has(job.kind)) {
     if (!diff.has_previous_run) {
@@ -1011,14 +1188,20 @@ async function copyText(value, button) {
 }
 
 function updateDerivedPaths() {
-  const version = versionName(state.activeVersion) || $("#version-name").value.trim();
+  const version = selectedTrainingVersionName();
   const root = $("#train-output-root").value.trim();
   const seed = $("#train-seed").value;
   const cleanRoot = root.replace(/\/$/, "").replace(/(?:[-_]?data-?v\d+)$/i, "");
   const finalName = $("#train-profile").value === "chronos2-stage1" ? `best_stage1_seed${seed}` : `best_seed${seed}`;
-  $("#final-model-preview").textContent = cleanRoot && version
+  const finalModelPreview = cleanRoot && version
     ? `${cleanRoot}-${version}/experiments/recipe-<训练参数哈希>/${finalName}`
     : "由服务端按版本与训练参数生成";
+  $("#final-model-preview").textContent = finalModelPreview;
+  $("#eval-model-path").value = cleanRoot && version ? finalModelPreview : "";
+  const evaluationBase = state.evaluationOutputBaseTemplate.replace(/\/$/, "");
+  $("#eval-output-root").value = evaluationBase && version
+    ? `${evaluationBase}/<模型名>/protocol-<服务端计算>`
+    : evaluationBase;
   $("#suite-count").textContent = `${$$("#benchmark-suites input:checked").length} 项`;
 }
 
@@ -1085,15 +1268,13 @@ function refreshTrainingModeUI() {
   const slurm = backend === "slurm";
   $("#slurm-sbatch-field").hidden = !slurm;
   $("#stage2-training-card").hidden = stage1Only;
-  $("#evaluation-config-card").hidden = !shouldEvaluate();
+  $("#evaluation-config-card").hidden = false;
   $("#keep-stage1").disabled = stage1Only;
   if (stage1Only) $("#keep-stage1").checked = true;
 
   const primaryLabel = stage1Only
-    ? "只训练并保存 Stage 1"
-    : slurm
-      ? "提交两阶段 Slurm 训练"
-      : "训练 + 评测";
+    ? (slurm ? "提交 Stage 1 Slurm 训练 + 评测" : "Stage 1 训练 + 评测")
+    : (slurm ? "提交两阶段 Slurm 训练 + 评测" : "两阶段训练 + 评测");
   $("#primary-run-button").textContent = primaryLabel;
   $("#primary-run-button").dataset.defaultLabel = primaryLabel;
   const overview = $("#overview-run");
@@ -1104,15 +1285,13 @@ function refreshTrainingModeUI() {
   $("#launch-step-training small").textContent = stage1Only
     ? "在“训练”页确认基础模型、GPU 和 Stage 1 参数。"
     : "在“训练”页确认基础模型、GPU 和两阶段参数。";
-  $("#launch-guide-title + p").textContent = shouldEvaluate()
-    ? "训练与评测按同一数据版本连续执行。"
-    : "当前方案只训练并保存权重，不自动启动 benchmark。";
+  $("#launch-guide-title + p").textContent = "训练完成后，将使用该阶段的最终模型继续评测。";
   launchTitle.textContent = primaryLabel;
   launchHelp.textContent = slurm
-    ? "提交可信 sbatch；训练参数和数据快照来自本次冻结配置。"
+    ? "提交可信 sbatch；训练完成后自动衔接所选 benchmark。"
     : stage1Only
-      ? "只保存 Stage 1 最终权重，不启动评测容器。"
-      : "有任务运行时自动排队，完成后按提交顺序启动。";
+      ? "保存 Stage 1 最终权重后，直接使用它运行所选 benchmark。"
+      : "有任务运行时自动排队，训练完成后继续评测。";
 
   const pipeline = state.defaults?.pipeline || {};
   renderIntegrationStatus(pipeline, pipeline.integration || state.defaults?.integration || {});
@@ -1121,10 +1300,17 @@ function refreshTrainingModeUI() {
 }
 
 function renderLaunchSteps() {
-  const version = versionName(state.activeVersion);
+  const version = selectedTrainingVersionName();
   const sameVersion = (job) => !job.version || !version || job.version === version;
   const preflightDone = state.jobs.some((job) => job.kind === "preflight" && job.status === "completed" && sameVersion(job));
-  const pipelineDone = state.jobs.some((job) => ["train_eval", "train_stage1", "train_full", "pipeline"].includes(job.kind) && job.status === "completed" && sameVersion(job));
+  const pipelineDone = state.jobs.some((job) => [
+    "train_eval",
+    "train_eval_stage1",
+    "train_eval_full",
+    "train_stage1",
+    "train_full",
+    "pipeline",
+  ].includes(job.kind) && job.status === "completed" && sameVersion(job));
   $("#launch-step-version").classList.toggle("complete", Boolean(version));
   $("#launch-step-training").classList.toggle("complete", Boolean($("#base-model-path").value.trim()));
   $("#launch-step-preflight").classList.toggle("complete", preflightDone);
@@ -1149,11 +1335,10 @@ function renderIntegrationStatus(pipeline, integration) {
   const trainingContainer = integration.training_container || "chatts";
   const evaluationContainer = integration.evaluation_container || "ragas";
   const backend = $("#execution-backend").value || integration.execution_mode;
+  const trainingLabel = $("#train-profile").value === "chronos2-stage1" ? "Stage 1 训练" : "两阶段训练";
   $("#execution-topology").textContent = backend === "docker_host"
-    ? (shouldEvaluate()
-      ? `宿主机 Dataset Studio → ${trainingContainer}（训练）→ ${evaluationContainer}（评测）`
-      : `宿主机 Dataset Studio → ${trainingContainer}（只训练 Stage 1）`)
-    : `宿主机 Dataset Studio → Slurm sbatch → Singularity（${$("#train-profile").value === "chronos2-stage1" ? "Stage 1" : "两阶段"}训练）`;
+    ? `宿主机 Dataset Studio → ${trainingContainer}（${trainingLabel}）→ ${evaluationContainer}（评测）`
+    : `宿主机 Dataset Studio → Slurm sbatch → Singularity（${trainingLabel}）→ 评测流水线`;
   renderLaunchSteps();
 }
 
@@ -1191,7 +1376,7 @@ function applyDefaults(defaults) {
   }
   const evaluation = pipeline.evaluation || defaults.evaluation || {};
   $("#eval-project-root").value = integration.evaluation_root || evaluation.project_root || defaults.eval_project_root || "由服务端配置";
-  $("#eval-output-root").value = evaluation.output_root || defaults.eval_output_root || "";
+  state.evaluationOutputBaseTemplate = evaluation.output_root || defaults.eval_output_root || "";
   const suites = new Set(evaluation.benchmarks || ["tsrbench", "tinybenchmarks", "ts_haystack", "timeseriesexam"]);
   $$("#benchmark-suites input").forEach((input) => { input.checked = suites.has(input.value); });
   const evaluationFields = {
@@ -1234,7 +1419,16 @@ function handleRuleChange(event) {
   const input = event.target.closest("input[data-stage][data-source-rule][data-type]");
   if (!input) return;
   const rule = ensureSourceRule(input.dataset.stage, input.dataset.sourceRule);
-  if (input.dataset.type === "abilities-all") {
+  if (input.dataset.type === "sample-percent") {
+    const value = Number(input.value);
+    if (!validSamplePercent(value, input.value)) {
+      showToast("随机抽样比例必须是 1–100 的有限数字，最多 6 位小数", "error");
+      input.value = String(rule.samplePercent);
+      input.focus();
+      return;
+    }
+    rule.samplePercent = value;
+  } else if (input.dataset.type === "abilities-all") {
     rule.abilities.clear();
     $$('input[data-type="abilities"]', input.closest(".source-rule-card")).forEach((item) => { item.checked = false; });
     input.checked = true;
@@ -1247,10 +1441,7 @@ function handleRuleChange(event) {
     }
   }
   const summary = $(".source-rule-summary b", input.closest(".source-rule-card"));
-  if (summary) {
-    const abilitySummary = rule.abilities.size ? `${rule.abilities.size} 能力` : "全部能力";
-    summary.textContent = `${rule.qualities.size} 质量 · ${rule.difficulties.size} 难度 · ${abilitySummary}`;
-  }
+  if (summary) summary.textContent = sourceRuleSummary(rule);
   markRecipeDirty();
 }
 
@@ -1286,11 +1477,24 @@ function bindEvents() {
   $("#clear-sources").addEventListener("click", () => chooseSources("clear"));
   $("#source-list").addEventListener("change", handleSourceChange);
   $("#rules-section").addEventListener("change", handleRuleChange);
+  // Keep the percentage summary and preview fingerprint in sync while the
+  // user is typing.  Number inputs do not emit `change` until they lose
+  // focus, which made it easy to click Preview while the old 100% value was
+  // still held in state.
+  $("#rules-section").addEventListener("input", (event) => {
+    if (event.target.matches('input[data-type="sample-percent"]')) {
+      handleRuleChange(event);
+    }
+  });
   Object.values(pathFields).forEach((input) => input.addEventListener("change", markRecipeDirty));
   $("#publish-button").addEventListener("click", publishVersion);
   $("#refresh-versions").addEventListener("click", () => refreshVersions());
   $("#version-list").addEventListener("click", (event) => { const button = event.target.closest("button[data-version-action]"); if (button) versionAction(button); });
   $("#version-name").addEventListener("input", updateDerivedPaths);
+  $("#training-data-version").addEventListener("change", (event) => {
+    state.selectedTrainingVersion = event.target.value || null;
+    renderCurrentVersion();
+  });
   $("#train-seed").addEventListener("input", updateDerivedPaths);
   $("#train-profile").addEventListener("change", refreshTrainingModeUI);
   $("#execution-backend").addEventListener("change", refreshTrainingModeUI);

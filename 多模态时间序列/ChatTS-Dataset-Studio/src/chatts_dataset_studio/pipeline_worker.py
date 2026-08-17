@@ -161,40 +161,28 @@ def _execute_slurm(
 
     scheduler_job_id = args.scheduler_job_id
     scheduler_state: str | None = None
-    if args.slurm_preflight:
-        completed = _run(
-            [
-                "sbatch",
-                "--test-only",
-                f"--chdir={args.cwd}",
-                str(args.sbatch_path),
-                str(args.config),
-                args.job_id,
-            ],
-            args.cwd,
-        )
-        _echo_completed(completed)
-        error = None if completed.returncode == 0 else "Slurm rejected the frozen job"
-        return completed.returncode, error, None, None
-
     if scheduler_job_id is None:
         if args.scheduler_stdout is None or args.scheduler_stderr is None:
             return 126, "Slurm worker is missing scheduler log paths", None, None
         args.scheduler_stdout.parent.mkdir(parents=True, exist_ok=True)
         args.scheduler_stderr.parent.mkdir(parents=True, exist_ok=True)
-        completed = _run(
+        submit_command = ["sbatch", "--parsable"]
+        if args.slurm_preflight:
+            # Preflight needs a real compute-node allocation to validate the
+            # loader, images, binds and runner preflights, but must not inherit
+            # a many-hour training wall time.
+            submit_command.append("--time=00:10:00")
+        submit_command.extend(
             [
-                "sbatch",
-                "--parsable",
                 f"--chdir={args.cwd}",
                 f"--output={args.scheduler_stdout}",
                 f"--error={args.scheduler_stderr}",
                 str(args.sbatch_path),
                 str(args.config),
                 args.job_id,
-            ],
-            args.cwd,
+            ]
         )
+        completed = _run(submit_command, args.cwd)
         _echo_completed(completed)
         if completed.returncode != 0:
             return completed.returncode, "sbatch submission failed", None, None
@@ -203,6 +191,12 @@ def _execute_slurm(
         except ValueError as exc:
             return 126, str(exc), None, None
         print(f"Dataset Studio submitted Slurm job {scheduler_job_id}", flush=True)
+        if args.slurm_preflight:
+            print(
+                "This is a short Slurm preflight allocation; its frozen config "
+                "forbids training and evaluation.",
+                flush=True,
+            )
 
     _write_running_status(
         args,

@@ -81,13 +81,69 @@ TRAINING_KEYS = frozenset(
     }
 )
 
+CONTAINER_KEYS = frozenset({"training", "evaluation"})
+
+EVALUATION_KEYS = frozenset(
+    {
+        "project_root",
+        "script",
+        "model_path",
+        "model_name",
+        "output_root",
+        "chronos2_model_path",
+        "tsrbench_root",
+        "tinybench_dataset_root",
+        "ts_haystack_root",
+        "timeseriesexam_root",
+        "timeseriesexam_data_file",
+        "benchmarks",
+        "run_id",
+        "protocol_hash",
+        "model_completion_marker",
+        "haystack_split",
+        "tiny_data_partition",
+        "tiny_partition_seed",
+        "tsr_prompt_mode",
+        "tsr_max_model_len",
+        "tsr_max_new_tokens",
+        "tsr_batch_size",
+        "tsr_request_chunk_size",
+        "tiny_max_model_len",
+        "tiny_request_chunk_size",
+        "tiny_gpu_memory_utilization",
+        "haystack_max_model_len",
+        "haystack_max_new_tokens",
+        "haystack_batch_size",
+        "haystack_request_chunk_size",
+        "exam_max_model_len",
+        "exam_max_new_tokens",
+        "exam_batch_size",
+        "exam_request_chunk_size",
+    }
+)
+
+SLURM_KEYS = frozenset(
+    {
+        "evaluation_host_root",
+        "evaluation_sif_image",
+        "chronos2_host_root",
+        "tsrbench_host_root",
+        "tinybench_host_root",
+        "ts_haystack_host_root",
+        "timeseriesexam_host_root",
+    }
+)
+
 KEY_TO_ENV = {
     "pipeline.seed": "SEED",
     "pipeline.data_version": "DATA_VERSION",
     "pipeline.dataset_snapshot_hash": "DATASET_SNAPSHOT_HASH",
     "pipeline.training_recipe_hash": "TRAINING_RECIPE_HASH",
     "pipeline.force_train": "FORCE_TRAIN",
+    "pipeline.force_eval": "FORCE_EVAL",
     "pipeline.preflight_only": "PREFLIGHT_ONLY",
+    "pipeline.max_samples": "MAX_SAMPLES",
+    "pipeline.offline": "OFFLINE",
     "pipeline.trial_id": "TRIAL_ID",
     "pipeline.trial_config_hash": "TRIAL_CONFIG_HASH",
     "training.project_root": "PROJECT_ROOT",
@@ -135,6 +191,50 @@ KEY_TO_ENV = {
     "training.stage2.per_device_eval_batch_size": "STAGE2_PER_DEVICE_EVAL_BATCH_SIZE",
     "training.stage2.cutoff_len": "STAGE2_CUTOFF_LEN",
     "training.stage2.preprocessing_num_workers": "STAGE2_PREPROCESSING_NUM_WORKERS",
+    "evaluation.project_root": "EVAL_PROJECT_ROOT",
+    "evaluation.script": "EVAL_SCRIPT",
+    "evaluation.model_path": "EVAL_MODEL_PATH",
+    "evaluation.model_name": "MODEL_NAME",
+    "evaluation.output_root": "EVAL_OUTPUT_ROOT",
+    "evaluation.chronos2_model_path": "EVAL_CHRONOS2_MODEL_PATH",
+    "evaluation.tsrbench_root": "TSRBENCH_ROOT",
+    "evaluation.tinybench_dataset_root": "TINYBENCH_DATASET_ROOT",
+    "evaluation.ts_haystack_root": "TS_HAYSTACK_ROOT",
+    "evaluation.timeseriesexam_root": "TIMESERIESEXAM_ROOT",
+    "evaluation.timeseriesexam_data_file": "TIMESERIESEXAM_DATA_FILE",
+    "evaluation.benchmarks": "BENCHMARKS",
+    "evaluation.run_id": "RUN_ID",
+    "evaluation.protocol_hash": "EVAL_PROTOCOL_HASH",
+    "evaluation.model_completion_marker": "MODEL_COMPLETION_MARKER",
+    "evaluation.haystack_split": "HAYSTACK_SPLIT",
+    "evaluation.tiny_data_partition": "TINY_DATA_PARTITION",
+    "evaluation.tiny_partition_seed": "TINY_PARTITION_SEED",
+    "evaluation.tsr_prompt_mode": "TSR_PROMPT_MODE",
+    "evaluation.tsr_max_model_len": "TSR_MAX_MODEL_LEN",
+    "evaluation.tsr_max_new_tokens": "TSR_MAX_NEW_TOKENS",
+    "evaluation.tsr_batch_size": "TSR_BATCH_SIZE",
+    "evaluation.tsr_request_chunk_size": "TSR_REQUEST_CHUNK_SIZE",
+    "evaluation.tiny_max_model_len": "TINY_MAX_MODEL_LEN",
+    "evaluation.tiny_request_chunk_size": "TINY_REQUEST_CHUNK_SIZE",
+    "evaluation.tiny_gpu_memory_utilization": "TINY_GPU_MEMORY_UTILIZATION",
+    "evaluation.haystack_max_model_len": "HAYSTACK_MAX_MODEL_LEN",
+    "evaluation.haystack_max_new_tokens": "HAYSTACK_MAX_NEW_TOKENS",
+    "evaluation.haystack_batch_size": "HAYSTACK_BATCH_SIZE",
+    "evaluation.haystack_request_chunk_size": "HAYSTACK_REQUEST_CHUNK_SIZE",
+    "evaluation.exam_max_model_len": "EXAM_MAX_MODEL_LEN",
+    "evaluation.exam_max_new_tokens": "EXAM_MAX_NEW_TOKENS",
+    "evaluation.exam_batch_size": "EXAM_BATCH_SIZE",
+    "evaluation.exam_request_chunk_size": "EXAM_REQUEST_CHUNK_SIZE",
+}
+
+SLURM_KEY_TO_ENV = {
+    "evaluation_host_root": "CHATTS_EVALUATION_DIR",
+    "evaluation_sif_image": "CHATTS_EVAL_SIF_IMAGE",
+    "chronos2_host_root": "CHATTS_HOST_CHRONOS2_PATH",
+    "tsrbench_host_root": "CHATTS_HOST_TSRBENCH_PATH",
+    "tinybench_host_root": "CHATTS_HOST_TINYBENCH_PATH",
+    "ts_haystack_host_root": "CHATTS_HOST_TS_HAYSTACK_PATH",
+    "timeseriesexam_host_root": "CHATTS_HOST_TIMESERIESEXAM_PATH",
 }
 
 SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
@@ -313,20 +413,146 @@ def validate_stage(stage: dict[str, Any], field: str) -> None:
         raise ValueError(f"{field}.interleave_probs must be empty for concat")
 
 
+def validate_evaluation(
+    evaluation: dict[str, Any], *, final_model: str, mode: str
+) -> dict[str, str]:
+    reject_unknown(evaluation, EVALUATION_KEYS, "evaluation")
+    missing = sorted(EVALUATION_KEYS - set(evaluation))
+    if missing:
+        raise ValueError(f"evaluation is missing fields: {', '.join(missing)}")
+
+    absolute_fields = (
+        "project_root",
+        "script",
+        "model_path",
+        "output_root",
+        "chronos2_model_path",
+        "tsrbench_root",
+        "tinybench_dataset_root",
+        "ts_haystack_root",
+        "timeseriesexam_root",
+        "timeseriesexam_data_file",
+    )
+    paths = {
+        key: require_absolute(evaluation[key], f"evaluation.{key}")
+        for key in absolute_fields
+    }
+    if PurePosixPath(paths["script"]).name != "run_all_chatts_benchmarks.sh":
+        raise ValueError("evaluation.script must name run_all_chatts_benchmarks.sh")
+    if PurePosixPath(paths["project_root"]) not in PurePosixPath(paths["script"]).parents:
+        raise ValueError("evaluation.script must be inside evaluation.project_root")
+    if paths["model_path"] != final_model:
+        raise ValueError("evaluation.model_path must exactly equal training.final_model_path")
+
+    marker = shell_value(
+        evaluation["model_completion_marker"],
+        "evaluation.model_completion_marker",
+    )
+    expected_marker = (
+        "STAGE1_COMPLETE.json" if mode == "stage1" else "TRAINING_COMPLETE.json"
+    )
+    if marker != expected_marker:
+        raise ValueError(
+            f"evaluation.model_completion_marker must be {expected_marker} for {mode}"
+        )
+
+    safe_slugs = ("model_name", "run_id")
+    for key in safe_slugs:
+        value = shell_value(evaluation[key], f"evaluation.{key}")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError(f"evaluation.{key} must be a safe slug")
+    protocol_hash = shell_value(evaluation["protocol_hash"], "evaluation.protocol_hash")
+    if not SHA256_RE.fullmatch(protocol_hash):
+        raise ValueError("evaluation.protocol_hash must be a 64-character SHA256")
+    protocol_id = f"protocol-{protocol_hash.lower()[:16]}"
+    run_id = shell_value(evaluation["run_id"], "evaluation.run_id")
+    if not run_id.endswith(f"-{protocol_id}-{mode}"):
+        raise ValueError(
+            f"evaluation.run_id must end in -{protocol_id}-{mode}"
+        )
+    if PurePosixPath(paths["output_root"]).name != protocol_id:
+        raise ValueError(
+            f"evaluation.output_root must end in the frozen protocol id {protocol_id}"
+        )
+
+    benchmarks = shell_value(evaluation["benchmarks"], "evaluation.benchmarks")
+    requested = benchmarks.split(",")
+    allowed = {"tsrbench", "tinybenchmarks", "ts_haystack", "timeseriesexam"}
+    if not requested or any(item not in allowed for item in requested):
+        raise ValueError("evaluation.benchmarks contains an unsupported benchmark")
+    if len(requested) != len(set(requested)):
+        raise ValueError("evaluation.benchmarks contains duplicates")
+    if evaluation["haystack_split"] not in {"train", "validation", "test"}:
+        raise ValueError("evaluation.haystack_split is invalid")
+    if evaluation["tiny_data_partition"] not in {"all", "search-dev", "final-test"}:
+        raise ValueError("evaluation.tiny_data_partition is invalid")
+    if evaluation["tsr_prompt_mode"] not in {"answer_only", "official"}:
+        raise ValueError("evaluation.tsr_prompt_mode is invalid")
+
+    integer_fields = (
+        "tiny_partition_seed",
+        "tsr_max_model_len",
+        "tsr_max_new_tokens",
+        "tsr_batch_size",
+        "tsr_request_chunk_size",
+        "tiny_max_model_len",
+        "tiny_request_chunk_size",
+        "haystack_max_model_len",
+        "haystack_max_new_tokens",
+        "haystack_batch_size",
+        "haystack_request_chunk_size",
+        "exam_max_model_len",
+        "exam_max_new_tokens",
+        "exam_batch_size",
+        "exam_request_chunk_size",
+    )
+    for key in integer_fields:
+        value = evaluation[key]
+        minimum = 0 if key == "tiny_partition_seed" else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"evaluation.{key} must be an integer >= {minimum}")
+    for prefix in ("tsr", "haystack", "exam"):
+        if evaluation[f"{prefix}_max_model_len"] <= evaluation[f"{prefix}_max_new_tokens"]:
+            raise ValueError(
+                f"evaluation.{prefix}_max_model_len must exceed max_new_tokens"
+            )
+    try:
+        tiny_memory = float(evaluation["tiny_gpu_memory_utilization"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("evaluation.tiny_gpu_memory_utilization must be numeric") from exc
+    if not 0 < tiny_memory < 1:
+        raise ValueError("evaluation.tiny_gpu_memory_utilization must be in (0, 1)")
+    exam_root = PurePosixPath(paths["timeseriesexam_root"])
+    if exam_root not in PurePosixPath(paths["timeseriesexam_data_file"]).parents:
+        raise ValueError(
+            "evaluation.timeseriesexam_data_file must be inside timeseriesexam_root"
+        )
+
+    return paths
+
+
 def validate_and_resolve(
     payload: dict[str, Any], expected_job_id: str
 ) -> dict[str, str]:
-    unknown_top = sorted(set(payload) - {"pipeline", "containers", "training", "evaluation"})
+    unknown_top = sorted(
+        set(payload) - {"pipeline", "containers", "training", "evaluation", "slurm"}
+    )
     if unknown_top:
         raise ValueError(f"unknown top-level fields: {', '.join(unknown_top)}")
     pipeline = mapping(payload, "pipeline")
     training = mapping(payload, "training")
+    containers = mapping(payload, "containers")
+    evaluation = mapping(payload, "evaluation")
+    slurm = mapping(payload, "slurm")
     reject_unknown(pipeline, PIPELINE_KEYS, "pipeline")
     reject_unknown(training, TRAINING_KEYS, "training")
-    if "containers" in payload and not isinstance(payload["containers"], dict):
-        raise ValueError("containers must be a mapping")
-    if "evaluation" in payload and not isinstance(payload["evaluation"], dict):
-        raise ValueError("evaluation must be a mapping")
+    reject_unknown(containers, CONTAINER_KEYS, "containers")
+    reject_unknown(slurm, SLURM_KEYS, "slurm")
+    if set(containers) != CONTAINER_KEYS:
+        raise ValueError("containers must contain exactly training and evaluation")
+    for key, value in containers.items():
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError(f"containers.{key} must be a safe container name")
 
     stage1 = mapping(training, "stage1")
     stage2 = mapping(training, "stage2")
@@ -368,11 +594,21 @@ def validate_and_resolve(
     configured_script = require_absolute(training.get("script"), "training.script")
     if PurePosixPath(configured_script).name != "run_chronos2_best_two_stage.sh":
         raise ValueError("training.script must name run_chronos2_best_two_stage.sh")
+    if PurePosixPath(project_root) not in PurePosixPath(configured_script).parents:
+        raise ValueError("training.script must be inside training.project_root")
     base_model = require_absolute(training.get("base_model_path"), "training.base_model_path")
     output_root = require_absolute(training.get("output_root"), "training.output_root")
     final_model = require_absolute(training.get("final_model_path"), "training.final_model_path")
     chronos = require_absolute(training.get("chronos2_model_path"), "training.chronos2_model_path")
     dataset_dir = require_absolute(training.get("dataset_dir"), "training.dataset_dir")
+    validate_evaluation(evaluation, final_model=final_model, mode=mode)
+
+    if "evaluation_host_root" not in slurm:
+        raise ValueError("slurm.evaluation_host_root is required")
+    slurm_paths = {
+        SLURM_KEY_TO_ENV[key]: require_absolute(value, f"slurm.{key}")
+        for key, value in slurm.items()
+    }
 
     root_path = PurePosixPath(output_root)
     final_path = PurePosixPath(final_model)
@@ -391,9 +627,12 @@ def validate_and_resolve(
     seed = pipeline.get("seed")
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError("pipeline.seed must be a non-negative integer")
-    for flag in ("force_train", "preflight_only"):
+    for flag in ("force_train", "force_eval", "preflight_only", "offline"):
         if not isinstance(pipeline.get(flag), bool):
             raise TypeError(f"pipeline.{flag} must be a boolean")
+    max_samples = pipeline.get("max_samples")
+    if isinstance(max_samples, bool) or not isinstance(max_samples, int) or max_samples < 0:
+        raise ValueError("pipeline.max_samples must be a non-negative integer")
     if not isinstance(training.get("keep_stage1"), bool):
         raise TypeError("training.keep_stage1 must be a boolean")
 
@@ -431,6 +670,7 @@ def validate_and_resolve(
             "DATASET_DIR": dataset_dir,
         }
     )
+    flattened.update(slurm_paths)
     return {
         name: shell_value(value, name)
         for name, value in sorted(flattened.items())

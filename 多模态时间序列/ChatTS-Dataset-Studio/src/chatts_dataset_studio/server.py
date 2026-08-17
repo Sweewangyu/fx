@@ -475,7 +475,10 @@ class StudioService:
             self._ledger().root,
             version,
             model_output_base=self.integration.get("model_output_base"),
-            activate=True,
+            # A run may deliberately target an older published snapshot.  Registering
+            # it for Training is required, but starting that run must not silently
+            # change the Studio-wide active version selected on the data page.
+            activate=False,
             verified_snapshot=entry,
         )
         resolved = resolve_pipeline_request({**payload, "version": version}, entry, self.integration)

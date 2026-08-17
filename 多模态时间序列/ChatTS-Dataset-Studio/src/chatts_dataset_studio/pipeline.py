@@ -556,6 +556,17 @@ def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) ->
         ):
             raise StudioError("evaluation.protocol_hash must be a SHA256 or empty")
         result["protocol_hash"] = protocol_hash.lower()
+    else:
+        # A resolved Studio job must always carry an immutable evaluation
+        # identity.  The benchmark runner can additionally fingerprint code
+        # and data files, but this hash guarantees that no page-selected
+        # protocol value is silently dropped between Studio and the runner.
+        result["protocol_hash"] = _hash(
+            {
+                "schema_version": "chatts-evaluation-protocol-v1",
+                "evaluation": result,
+            }
+        )
     return result
 
 
@@ -618,10 +629,20 @@ def _slurm_profile_readiness(integration: dict[str, Any]) -> dict[str, Any]:
     reasons = list(status["disabled_reasons"])
     for key in (
         "training_root",
+        "evaluation_root",
         "train_project_root",
         "training_script",
         "model_output_base",
         "train_chronos2_model_path",
+        "eval_project_root",
+        "evaluation_script",
+        "evaluation_output_base",
+        "eval_chronos2_model_path",
+        "tsrbench_root",
+        "tinybench_dataset_root",
+        "ts_haystack_root",
+        "timeseriesexam_root",
+        "timeseriesexam_data_file",
     ):
         value = integration.get(key)
         if not isinstance(value, str) or not value:
@@ -633,7 +654,7 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
     """Return safe UI defaults and per-backend readiness information."""
     execution_mode = integration.get("execution_mode", "docker_host")
     docker_full_reasons = _docker_readiness(integration, include_evaluation=True)
-    docker_stage1_reasons = _docker_readiness(integration, include_evaluation=False)
+    docker_stage1_reasons = _docker_readiness(integration, include_evaluation=True)
     slurm_status = _slurm_profile_readiness(integration)
     backend_status = {
         "docker_host": {
@@ -749,13 +770,16 @@ def resolve_pipeline_request(
     )
     if backend not in {"docker_host", "slurm"}:
         raise StudioError("execution.backend must be docker_host or slurm")
-    evaluates = backend == "docker_host" and pipeline_mode == "full"
-    expected_mode = "train_eval" if evaluates else "train"
+    # Every supported training profile/backend is an end-to-end
+    # train-then-evaluate pipeline.  Legacy frontends used ``train`` for
+    # Stage1/Slurm; accept those spellings during rollout but canonicalize the
+    # frozen job to train_eval so downstream launchers cannot skip evaluation.
+    expected_mode = "train_eval"
     requested_mode = payload.get("mode", expected_mode)
-    accepted_modes = {expected_mode}
+    accepted_modes = {expected_mode, "train"}
     if pipeline_mode == "stage1":
         accepted_modes.add("train_stage1")
-    elif not evaluates:
+    else:
         accepted_modes.add("train_full")
     if requested_mode not in accepted_modes:
         raise StudioError(
@@ -836,9 +860,7 @@ def resolve_pipeline_request(
         _reject_unknown(stage2_request, _STAGE_KEYS, "training.stage2")
         stage2 = _resolve_stage("stage2", {}, dataset_names["stage2"])
 
-    evaluation: dict[str, Any] | None = None
-    if evaluates:
-        evaluation = _resolve_evaluation(evaluation_request, integration)
+    evaluation = _resolve_evaluation(evaluation_request, integration)
 
     # A data version is not an experiment identity. Two runs over the same
     # snapshot can still produce different weights when any training setting
@@ -886,22 +908,41 @@ def resolve_pipeline_request(
         ),
         "preflight_only": False,
     }
-    if evaluates:
-        pipeline_config.update(
-            {
-                "force_eval": _as_bool(
-                    evaluation_request.get("force_eval", False),
-                    "evaluation.force_eval",
-                ),
-                "max_samples": _as_int(
-                    evaluation_request.get("max_samples", 0),
-                    "evaluation.max_samples",
-                ),
-                "offline": _as_bool(
-                    evaluation_request.get("offline", True), "evaluation.offline"
-                ),
-            }
+    pipeline_config.update(
+        {
+            "force_eval": _as_bool(
+                evaluation_request.get("force_eval", False),
+                "evaluation.force_eval",
+            ),
+            "max_samples": _as_int(
+                evaluation_request.get("max_samples", 0),
+                "evaluation.max_samples",
+            ),
+            "offline": _as_bool(
+                evaluation_request.get("offline", True), "evaluation.offline"
+            ),
+        }
+    )
+    evaluation_protocol = dict(evaluation)
+    evaluation_protocol.pop("protocol_hash", None)
+    computed_protocol_hash = _hash(
+        {
+            "schema_version": "chatts-evaluation-protocol-v1",
+            "evaluation": evaluation_protocol,
+            "max_samples": pipeline_config["max_samples"],
+            "offline": pipeline_config["offline"],
+        }
+    )
+    supplied_protocol_hash = evaluation_request.get("protocol_hash")
+    if (
+        supplied_protocol_hash not in (None, "")
+        and str(supplied_protocol_hash).lower() != computed_protocol_hash
+    ):
+        raise StudioError(
+            "evaluation.protocol_hash is an expected hash and does not match "
+            "the server-resolved evaluation protocol"
         )
+    evaluation["protocol_hash"] = computed_protocol_hash
     training_config: dict[str, Any] = {
         "project_root": train_project_root,
         "script": train_script,
@@ -937,36 +978,71 @@ def resolve_pipeline_request(
     model_name: str | None = None
     eval_output_root: str | None = None
     run_id: str | None = None
-    if evaluates and evaluation is not None:
-        model_name_base = integration.get("model_name_base", "chatts-msxf-8B")
-        if not isinstance(model_name_base, str) or not re.fullmatch(
-            r"[A-Za-z0-9_.-]+", model_name_base
-        ):
-            raise StudioError("model_name_base must be a safe slug")
-        model_name_base = _with_model_scale(model_name_base, model_scale)
-        model_name = (
-            f"{_versioned_name(model_name_base, version)}-seed{seed}-{training_recipe_id}"
+    model_name_base = integration.get("model_name_base", "chatts-msxf-8B")
+    if not isinstance(model_name_base, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+", model_name_base
+    ):
+        raise StudioError("model_name_base must be a safe slug")
+    model_name_base = _with_model_scale(model_name_base, model_scale)
+    model_name = (
+        f"{_versioned_name(model_name_base, version)}-seed{seed}-{training_recipe_id}"
+    )
+    eval_output_base = integration.get("evaluation_output_base")
+    if not isinstance(eval_output_base, str) or not eval_output_base:
+        raise StudioError("Missing server integration setting: evaluation_output_base")
+    # Evaluation artifacts are protocol-scoped.  Runs that share one training
+    # recipe/model but change a benchmark, partition, prompt, token budget, or
+    # offline policy must never write into the same cache/output directory.
+    eval_protocol_id = f"protocol-{evaluation['protocol_hash'][:16]}"
+    eval_output_root = (
+        f"{eval_output_base.rstrip('/')}/{model_name}/{eval_protocol_id}"
+    )
+    supplied_eval_output = evaluation_request.get("output_root")
+    if supplied_eval_output not in (None, "", eval_output_root):
+        raise StudioError(
+            "evaluation.output_root is derived from data version and cannot be changed"
         )
-        eval_output_base = integration.get("evaluation_output_base")
-        if not isinstance(eval_output_base, str) or not eval_output_base:
-            raise StudioError("Missing server integration setting: evaluation_output_base")
-        eval_output_root = f"{eval_output_base.rstrip('/')}/{model_name}"
-        supplied_eval_output = evaluation_request.get("output_root")
-        if supplied_eval_output not in (None, "", eval_output_root):
-            raise StudioError(
-                "evaluation.output_root is derived from data version and cannot be changed"
-            )
-        supplied_model = evaluation_request.get("model_path")
-        if supplied_model not in (None, "", final_model_path):
-            raise StudioError(
-                "evaluation.model_path is derived from training output and cannot be changed"
-            )
-        run_id = f"chronos2-{version}-seed{seed}-{training_recipe_id}-full"
-        config["evaluation"] = {
-            **evaluation,
-            "model_name": model_name,
-            "output_root": eval_output_root,
-            "run_id": run_id,
+    supplied_model = evaluation_request.get("model_path")
+    if supplied_model not in (None, "", final_model_path):
+        raise StudioError(
+            "evaluation.model_path is derived from training output and cannot be changed"
+        )
+    run_id = (
+        f"chronos2-{version}-seed{seed}-{training_recipe_id}-"
+        f"{eval_protocol_id}-{pipeline_mode}"
+    )
+    completion_marker = (
+        "STAGE1_COMPLETE.json"
+        if pipeline_mode == "stage1"
+        else "TRAINING_COMPLETE.json"
+    )
+    config["evaluation"] = {
+        **evaluation,
+        "model_path": final_model_path,
+        "model_name": model_name,
+        "output_root": eval_output_root,
+        "run_id": run_id,
+        "model_completion_marker": completion_marker,
+    }
+    if backend == "slurm":
+        slurm_paths = {
+            "evaluation_host_root": integration.get("slurm_evaluation_root")
+            or integration.get("evaluation_root"),
+            "evaluation_sif_image": integration.get("slurm_evaluation_sif_image"),
+            "chronos2_host_root": integration.get("slurm_chronos2_host_root"),
+            "tsrbench_host_root": integration.get("slurm_tsrbench_host_root"),
+            "tinybench_host_root": integration.get("slurm_tinybench_host_root"),
+            "ts_haystack_host_root": integration.get(
+                "slurm_ts_haystack_host_root"
+            ),
+            "timeseriesexam_host_root": integration.get(
+                "slurm_timeseriesexam_host_root"
+            ),
+        }
+        config["slurm"] = {
+            key: str(Path(str(value)).expanduser().resolve())
+            for key, value in slurm_paths.items()
+            if value not in (None, "")
         }
     result = {
         "schema_version": "chatts-dataset-studio-pipeline-v1",
@@ -987,6 +1063,7 @@ def resolve_pipeline_request(
             "training_recipe": training_recipe,
             "model_name": model_name,
             "evaluation_output_root": eval_output_root,
+            "evaluation_protocol_id": eval_protocol_id,
             "run_id": run_id,
             "model_scale": model_scale,
         },
@@ -1629,7 +1706,14 @@ class PipelineJobs:
 
     def _previous_training_comparison(self) -> tuple[str | None, dict[str, Any] | None]:
         for job in self.list():
-            if job.get("kind") not in {"train_eval", "train_stage1", "train_full"}:
+            if job.get("kind") not in {
+                "train_eval",
+                "train_eval_stage1",
+                "train_eval_full",
+                # Read older run records written before all modes evaluated.
+                "train_stage1",
+                "train_full",
+            }:
                 continue
             comparison_path = job.get("comparison_path")
             if isinstance(comparison_path, str):
@@ -1750,6 +1834,18 @@ class PipelineJobs:
             record_artifacts["Slurm 提交脚本"] = str(
                 resolved_execution.get("sbatch_path")
             )
+        evaluation_output = resolved.get("derived", {}).get(
+            "evaluation_output_root"
+        )
+        if isinstance(evaluation_output, str) and evaluation_output:
+            record_artifacts["评测输出目录"] = evaluation_output
+            record_artifacts["评测状态表"] = (
+                f"{evaluation_output.rstrip('/')}/benchmark_status.tsv"
+            )
+            record_artifacts["评测汇总"] = (
+                f"{evaluation_output.rstrip('/')}/all_benchmarks_summary.md"
+            )
+            record_artifacts["评测指标"] = f"{evaluation_output.rstrip('/')}/metrics.json"
         record = {
             "schema_version": "chatts-dataset-studio-run-record-v1",
             "job_id": job_id,
@@ -1842,9 +1938,9 @@ class PipelineJobs:
             if preflight:
                 kind = "preflight"
             elif resolved.get("pipeline_mode") == "stage1":
-                kind = "train_stage1"
+                kind = "train_eval_stage1"
             elif backend == "slurm":
-                kind = "train_full"
+                kind = "train_eval_full"
             else:
                 kind = "train_eval"
             job = {

@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_LOADER = REPO_ROOT / "scripts" / "load_train_eval_config.py"
 HOST_RUNNER = REPO_ROOT / "scripts" / "run_train_then_eval.sh"
+EVAL_RUNNER = REPO_ROOT / "scripts" / "run_all_chatts_benchmarks.sh"
 
 ADVANCED_EVAL_DEFAULTS = {
     "TSR_PROMPT_MODE": "answer_only",
@@ -39,6 +40,8 @@ def _clean_environment() -> dict[str, str]:
         "DATASET_SNAPSHOT_HASH",
         "PIPELINE_MODE",
         "STAGE1_OUT",
+        "EVAL_MODEL_PATH",
+        "MODEL_COMPLETION_MARKER",
         "TRAINING_RECIPE_HASH",
         "TRIAL_ID",
         "TRIAL_CONFIG_HASH",
@@ -154,6 +157,7 @@ def _write_capture_script(path: Path, stage: str) -> None:
                 keys.extend(["TRIAL_ID", "TRIAL_CONFIG_HASH"])
             else:
                 keys.extend({list(ADVANCED_EVAL_DEFAULTS)!r})
+                keys.extend(["MODEL_PATH", "MODEL_COMPLETION_MARKER", "EVAL_PROTOCOL_HASH"])
             payload = {{"stage": {stage!r}, **{{key: os.environ.get(key) for key in keys}}}}
             with open(sys.argv[1], "a", encoding="utf-8") as stream:
                 stream.write(json.dumps(payload, sort_keys=True) + "\\n")
@@ -179,6 +183,7 @@ def _write_capture_script(path: Path, stage: str) -> None:
                 '  mkdir -p "$FINAL_MODEL_PATH"\n'
                 '  printf \'%s\\n\' \'{}\' > "$FINAL_MODEL_PATH/config.json"\n'
                 '  printf \'%s\\n\' \'{"status":"complete"}\' > "$FINAL_MODEL_PATH/TRAINING_COMPLETE.json"\n'
+                '  printf \'full-weights\\n\' > "$FINAL_MODEL_PATH/model.safetensors"\n'
                 'fi\n'
             )
     else:
@@ -197,7 +202,6 @@ def _run_host_pipeline(
     pipeline_fields: str,
     evaluation_fields: str,
     *,
-    fail_on_evaluation_container: bool = False,
     empty_stage1_weights: bool = False,
     expected_returncode: int = 0,
     stage1_model_path: Path | None = None,
@@ -213,8 +217,6 @@ import sys
 
 arguments = sys.argv[1:]
 if arguments[:1] == ["inspect"]:
-    if os.environ.get("FAIL_ON_EVALUATION_CONTAINER") == "1" and arguments[-1] == "evaluation":
-        raise SystemExit("stage1-only must not inspect the evaluation container")
     print("true")
     raise SystemExit(0)
 if arguments[:1] != ["exec"]:
@@ -226,8 +228,6 @@ while cursor < len(arguments) and arguments[cursor] == "-e":
     environment[key] = value
     cursor += 2
 container = arguments[cursor]
-if os.environ.get("FAIL_ON_EVALUATION_CONTAINER") == "1" and container == "evaluation":
-    raise SystemExit("stage1-only must not execute in the evaluation container")
 cursor += 1  # container name
 command = arguments[cursor:]
 if command[:2] == ["python", "-c"] and "torch.cuda.device_count" in command[2]:
@@ -318,8 +318,6 @@ raise SystemExit(subprocess.run(command, env=environment, check=False).returncod
             "CAPTURE_PYTHON": sys.executable,
         }
     )
-    if fail_on_evaluation_container:
-        environment["FAIL_ON_EVALUATION_CONTAINER"] = "1"
     if empty_stage1_weights:
         environment["EMPTY_STAGE1_WEIGHTS"] = "1"
     completed = subprocess.run(
@@ -391,6 +389,9 @@ def test_host_forwards_dataset_identity_and_advanced_evaluation(tmp_path: Path) 
         "EXAM_MAX_NEW_TOKENS": "1200",
         "EXAM_BATCH_SIZE": "4",
         "EXAM_REQUEST_CHUNK_SIZE": "32",
+        "MODEL_PATH": str(tmp_path / "shared" / "models" / "candidate"),
+        "MODEL_COMPLETION_MARKER": "TRAINING_COMPLETE.json",
+        "EVAL_PROTOCOL_HASH": "",
     }
 
 
@@ -407,11 +408,14 @@ def test_host_legacy_config_retains_advanced_evaluation_defaults(tmp_path: Path)
         "DATA_VERSION": "",
         "DATASET_SNAPSHOT_HASH": "",
         "TRAINING_RECIPE_HASH": None,
+        "MODEL_PATH": str(tmp_path / "shared" / "models" / "candidate"),
+        "MODEL_COMPLETION_MARKER": "TRAINING_COMPLETE.json",
+        "EVAL_PROTOCOL_HASH": "",
         **ADVANCED_EVAL_DEFAULTS,
     }
 
 
-def test_host_stage1_mode_saves_weights_and_never_touches_evaluation(
+def test_host_stage1_mode_saves_weights_then_evaluates_same_checkpoint(
     tmp_path: Path,
 ) -> None:
     stage1 = tmp_path / "shared" / "models" / "stage1-best"
@@ -419,16 +423,17 @@ def test_host_stage1_mode_saves_weights_and_never_touches_evaluation(
         tmp_path,
         "pipeline_mode: stage1",
         "",
-        fail_on_evaluation_container=True,
         stage1_model_path=stage1,
     )
 
-    assert [event["stage"] for event in events] == ["training"]
+    assert [event["stage"] for event in events] == ["training", "evaluation"]
+    assert events[1]["MODEL_PATH"] == str(stage1)
+    assert events[1]["MODEL_COMPLETION_MARKER"] == "STAGE1_COMPLETE.json"
     assert (stage1 / "STAGE1_COMPLETE.json").is_file()
     assert (stage1 / "config.json").is_file()
     assert (stage1 / "best_model_manifest.json").is_file()
     assert (stage1 / "pytorch_model.bin").stat().st_size > 0
-    assert not (tmp_path / "shared" / "evaluation").exists()
+    assert (tmp_path / "shared" / "evaluation" / "metrics.json").is_file()
 
 
 def test_host_stage1_mode_rejects_empty_model_weights(tmp_path: Path) -> None:
@@ -436,9 +441,83 @@ def test_host_stage1_mode_rejects_empty_model_weights(tmp_path: Path) -> None:
         tmp_path,
         "pipeline_mode: stage1",
         "",
-        fail_on_evaluation_container=True,
         empty_stage1_weights=True,
         expected_returncode=1,
     )
 
     assert [event["stage"] for event in events] == ["training"]
+
+
+def _run_evaluator_preflight(tmp_path: Path, marker: str) -> subprocess.CompletedProcess[str]:
+    model = tmp_path / "model"
+    chronos = tmp_path / "chronos2"
+    dataset = tmp_path / "tsrbench" / "fixture"
+    for directory in (model, chronos, dataset):
+        directory.mkdir(parents=True, exist_ok=True)
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    (dataset / "perception.jsonl").write_text("{}\n", encoding="utf-8")
+    environment = _clean_environment()
+    environment.update(
+        {
+            "PROJECT_ROOT": str(REPO_ROOT),
+            "MODEL_PATH": str(model),
+            "MODEL_NAME": "stage1-fixture",
+            "CHRONOS2_MODEL_PATH": str(chronos),
+            "TSRBENCH_ROOT": str(tmp_path / "tsrbench"),
+            "TSRBENCH_DATASET_ROOT": str(tmp_path / "tsrbench"),
+            "BENCHMARKS": "tsrbench",
+            "OUTPUT_ROOT": str(tmp_path / "evaluation"),
+            "PREFLIGHT_ONLY": "1",
+            "AVAILABLE_GPUS_OVERRIDE": "8",
+            "MODEL_COMPLETION_MARKER": marker,
+            "PYTHON_BIN": sys.executable,
+        }
+    )
+    return subprocess.run(
+        ["bash", str(EVAL_RUNNER)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def test_evaluator_accepts_declared_stage1_marker_manifest_and_weights(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "STAGE1_COMPLETE.json").write_text("{}\n", encoding="utf-8")
+    (model / "best_model_manifest.json").write_text("{}\n", encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"weights")
+
+    completed = _run_evaluator_preflight(tmp_path, "STAGE1_COMPLETE.json")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Evaluation preflight passed" in completed.stdout
+    assert not (model / "TRAINING_COMPLETE.json").exists()
+
+
+def test_evaluator_rejects_wrong_marker_missing_manifest_and_empty_weights(
+    tmp_path: Path,
+) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "TRAINING_COMPLETE.json").write_text("{}\n", encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"weights")
+
+    wrong_marker = _run_evaluator_preflight(tmp_path, "STAGE1_COMPLETE.json")
+    assert wrong_marker.returncode != 0
+    assert "STAGE1_COMPLETE.json" in wrong_marker.stderr
+
+    (model / "STAGE1_COMPLETE.json").write_text("{}\n", encoding="utf-8")
+    missing_manifest = _run_evaluator_preflight(tmp_path, "STAGE1_COMPLETE.json")
+    assert missing_manifest.returncode != 0
+    assert "best_model_manifest.json" in missing_manifest.stderr
+
+    (model / "best_model_manifest.json").write_text("{}\n", encoding="utf-8")
+    (model / "model.safetensors").write_bytes(b"")
+    empty_weights = _run_evaluator_preflight(tmp_path, "STAGE1_COMPLETE.json")
+    assert empty_weights.returncode != 0
+    assert "No non-empty model weights" in empty_weights.stderr

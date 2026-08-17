@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +86,7 @@ class FilterRule:
     qualities: frozenset[str]
     difficulties: frozenset[str]
     abilities: frozenset[str]
+    sample_percent: int | float = 100
 
     @classmethod
     def from_mapping(
@@ -108,10 +111,14 @@ class FilterRule:
             raise StudioError(f"{field} must select at least one quality")
         if required and not difficulties:
             raise StudioError(f"{field} must select at least one difficulty")
+        sample_percent = _sample_percent(
+            value.get("sample_percent", 100), f"{field}.sample_percent"
+        )
         return cls(
             qualities=frozenset(qualities),
             difficulties=frozenset(difficulties),
             abilities=frozenset(abilities),
+            sample_percent=sample_percent,
         )
 
     def matches(self, annotation: dict[str, Any]) -> bool:
@@ -124,12 +131,17 @@ class FilterRule:
             and (not self.abilities or ability in self.abilities)
         )
 
-    def to_mapping(self) -> dict[str, list[str]]:
-        return {
+    def to_mapping(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "qualities": sorted(self.qualities),
             "difficulties": sorted(self.difficulties),
             "abilities": sorted(self.abilities),
         }
+        # Omitting the default preserves the byte-for-byte canonical selection
+        # representation (and therefore the legacy selection/snapshot hashes).
+        if self.sample_percent != 100:
+            result["sample_percent"] = self.sample_percent
+        return result
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,7 @@ class StageRule:
     difficulties: frozenset[str]
     abilities: frozenset[str]
     source_rules: dict[str, FilterRule]
+    sample_percent: int | float = 100
 
     @classmethod
     def from_mapping(
@@ -209,10 +222,16 @@ class StageRule:
             difficulties=fallback.difficulties,
             abilities=fallback.abilities,
             source_rules=source_rules,
+            sample_percent=fallback.sample_percent,
         )
 
     def fallback_rule(self) -> FilterRule:
-        return FilterRule(self.qualities, self.difficulties, self.abilities)
+        return FilterRule(
+            self.qualities,
+            self.difficulties,
+            self.abilities,
+            self.sample_percent,
+        )
 
     def effective_rule(self, source: str) -> FilterRule:
         source_rule = self.source_rules.get(source)
@@ -249,6 +268,26 @@ def _string_set(value: Any, field: str) -> set[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise StudioError(f"{field} must be a list of strings")
     return set(value)
+
+
+def _sample_percent(value: Any, field: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StudioError(f"{field} must be a number from 1 through 100")
+    if isinstance(value, float) and not isfinite(value):
+        raise StudioError(f"{field} must be a finite number from 1 through 100")
+    try:
+        decimal_value = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise StudioError(f"{field} must be a number from 1 through 100") from exc
+    if decimal_value < 1 or decimal_value > 100:
+        raise StudioError(f"{field} must be from 1 through 100")
+    normalized = decimal_value.normalize()
+    decimal_places = max(0, -normalized.as_tuple().exponent)
+    if decimal_places > 6:
+        raise StudioError(f"{field} supports at most 6 decimal places")
+    if normalized == normalized.to_integral_value():
+        return int(normalized)
+    return float(normalized)
 
 
 def safe_name(value: str, field: str = "name") -> str:

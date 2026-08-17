@@ -7,6 +7,41 @@ from typing import Any
 
 from .models import DIFFICULTY_LEVELS, QUALITY_LEVELS, Source, StudioError
 
+ABILITY_CODES = (
+    "PR",
+    "NU",
+    "AD",
+    "CA",
+    "ER",
+    "CD",
+    "AR",
+    "TR",
+    "NR",
+    "DR",
+    "IR",
+    "TSF",
+    "EP",
+    "QualDM",
+    "QuantDM",
+)
+ABILITY_NAMES = (
+    "pattern_recognition",
+    "noise_understanding",
+    "anomaly_detection",
+    "comparative_analysis",
+    "etiological_reasoning",
+    "causal_discovery",
+    "abductive_reasoning",
+    "temporal_relation_reasoning",
+    "numerical_reasoning",
+    "deductive_reasoning",
+    "inductive_reasoning",
+    "time_series_forecasting",
+    "event_prediction",
+    "qualitative_decision_making",
+    "quantitative_decision_making",
+)
+
 
 def _load_json(path: Path) -> Any:
     try:
@@ -254,9 +289,17 @@ def scan_catalog(sources: list[Source]) -> dict[str, Any]:
             for ability in summary["ability"]
         }
     )
+    observed_abilities = set(abilities)
+    code_matches = len(observed_abilities & set(ABILITY_CODES))
+    name_matches = len(observed_abilities & set(ABILITY_NAMES))
+    ability_level_mode = "codes" if code_matches > name_matches else "names"
+    ability_levels = ABILITY_CODES if ability_level_mode == "codes" else ABILITY_NAMES
     return {
         "sources": summaries,
         "abilities": abilities,
+        "ability_levels": list(ability_levels),
+        "ability_level_mode": ability_level_mode,
+        "ability_extras": sorted(observed_abilities - set(ability_levels)),
         "quality_levels": list(QUALITY_LEVELS),
         "difficulty_levels": list(DIFFICULTY_LEVELS),
         "total_sources": len(summaries),

@@ -1,4 +1,4 @@
-# ruff: noqa: PLW1510 -- this module intentionally uses unittest.TestCase.
+# ruff: noqa: PLW1510, PT009 -- this module intentionally uses unittest.TestCase.
 from __future__ import annotations
 
 import csv
@@ -11,9 +11,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+
 DIRECT_FILES = Path(__file__).resolve().parents[2]
+PACKAGED_CHATTS_REPO = DIRECT_FILES / "NetManAIOps-ChatTS"
+DEFAULT_CHATTS_REPO = (
+    PACKAGED_CHATTS_REPO
+    if PACKAGED_CHATTS_REPO.is_dir()
+    else DIRECT_FILES.parent / "ChatTS"
+)
 CHATTS_REPO = Path(
-    os.environ.get("CHATTS_REPO_ROOT", DIRECT_FILES.parent / "ChatTS")
+    os.environ.get("CHATTS_REPO_ROOT", DEFAULT_CHATTS_REPO)
 ).resolve()
 FINALIZER = DIRECT_FILES / "scripts" / "finalize_chatts_best_checkpoint.py"
 DATASET_VERIFIER = DIRECT_FILES / "scripts" / "verify_dataset_snapshot.py"
@@ -284,6 +291,7 @@ printf 'train|%s|%s|%s\n' "$PIPELINE_MODE" "$DATASET_DIR" "$KEEP_STAGE1" >> "$MO
 mkdir -p "$FINAL_MODEL_PATH"
 printf '%s\n' '{"architectures":["Qwen3TSForCausalLM"]}' > "$FINAL_MODEL_PATH/config.json"
 printf '%s\n' '{"status":"complete","pipeline_mode":"full"}' > "$FINAL_MODEL_PATH/TRAINING_COMPLETE.json"
+printf 'mock-weights\n' > "$FINAL_MODEL_PATH/model.safetensors"
 """,
                 encoding="utf-8",
             )
@@ -548,6 +556,7 @@ esac
         model = root / "model"
         write_json(model / "config.json", {})
         write_json(model / "TRAINING_COMPLETE.json", {"status": "complete"})
+        (model / "model.safetensors").write_bytes(b"mock-weights")
         chronos = root / "chronos2"
         chronos.mkdir()
         tsr = root / "tsr"

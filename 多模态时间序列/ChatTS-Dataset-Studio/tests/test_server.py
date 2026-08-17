@@ -395,12 +395,44 @@ def test_version_publish_register_activate_and_pipeline_preflight_api(
         assert duplicate_job["result"]["idempotent"] is True
         assert not (labeled_corpus["output_root"] / "datav4").exists()
 
+        changed_recipe = json.loads(json.dumps(default_selection))
+        changed_recipe["stage1"]["difficulties"] = [
+            "very_easy",
+            "easy",
+            "moderate",
+            "hard",
+        ]
+        status, second_started = _json_request(
+            base_url,
+            "/api/versions/publish",
+            {
+                "version": "datav4",
+                "notes": "historical run target",
+                "register": False,
+                "activate": False,
+                "recipe": changed_recipe,
+            },
+        )
+        assert status == 200
+        deadline = time.monotonic() + 5
+        while True:
+            status, second_job = _json_request(
+                base_url, f"/api/jobs/{second_started['job_id']}"
+            )
+            assert status == 200
+            if second_job["status"] in {"completed", "failed"}:
+                break
+            assert time.monotonic() < deadline, second_job
+            time.sleep(0.01)
+        assert second_job["status"] == "completed", second_job
+        assert server.service.versions()["active_version"] == "datav3"
+
         status, preflight = _json_request(
             base_url,
             "/api/runs/preflight",
             {
                 "mode": "train_eval",
-                "version": "datav3",
+                "version": "datav4",
                 "training": {"seed": 42},
                 "evaluation": {"benchmarks": ["tsrbench"]},
             },
@@ -416,6 +448,10 @@ def test_version_publish_register_activate_and_pipeline_preflight_api(
             time.sleep(0.01)
         assert run_job["status"] == "completed", run_job
         assert "server-preflight-ok" in run_job["log_tail"]
+        assert server.service.versions()["active_version"] == "datav3"
+        assert (
+            training_root / "data" / "studio_versions" / "datav4.json"
+        ).is_file()
         status, jobs = _json_request(base_url, "/api/jobs")
         assert status == 200
         assert {item["kind"] for item in jobs["jobs"]} >= {"publish", "preflight"}
