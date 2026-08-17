@@ -31,7 +31,9 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Durable ChatTS pipeline worker")
     parser.add_argument("--job-id", required=True)
-    parser.add_argument("--lock-path", required=True, type=Path)
+    # Docker jobs share a local lock. Slurm jobs intentionally omit it because
+    # GPU admission and PENDING/RUNNING state belong to the cluster scheduler.
+    parser.add_argument("--lock-path", type=Path)
     parser.add_argument("--status-path", required=True, type=Path)
     parser.add_argument("--backend", choices=("docker_host", "slurm"), default="docker_host")
     parser.add_argument("--script", type=Path)
@@ -264,10 +266,73 @@ def _execute_slurm(
         time.sleep(max(args.poll_seconds, 0.05))
 
 
+def _execute_worker(
+    args: argparse.Namespace, started_at: str, started_monotonic: float
+) -> int:
+    _write_running_status(args, started_at)
+    error: str | None = None
+    scheduler_job_id: str | None = None
+    scheduler_state: str | None = None
+    if args.backend == "slurm":
+        try:
+            exit_code, error, scheduler_job_id, scheduler_state = _execute_slurm(
+                args, started_at, started_monotonic
+            )
+        except OSError as exc:
+            exit_code = 126
+            error = f"Could not execute Slurm command: {exc}"
+    elif args.script is None:
+        exit_code = 126
+        error = "Docker-host worker is missing its fixed pipeline script"
+    else:
+        environment = dict(os.environ)
+        environment["CONFIG_FILE"] = str(args.config)
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed server-side script.
+                ["bash", str(args.script)],
+                cwd=args.cwd,
+                env=environment,
+                check=False,
+            )
+            exit_code = completed.returncode
+        except OSError as exc:
+            exit_code = 126
+            error = f"Could not execute fixed pipeline script: {exc}"
+
+    result = {
+        "schema_version": "chatts-dataset-studio-worker-v1",
+        "job_id": args.job_id,
+        "status": (
+            "completed"
+            if exit_code == 0
+            else "canceled"
+            if scheduler_state and scheduler_state.upper().startswith("CANCELLED")
+            else "failed"
+        ),
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "finished_at": _utc_now(),
+        "duration_seconds": round(time.monotonic() - started_monotonic, 3),
+        "exit_code": exit_code,
+        "execution_backend": args.backend,
+    }
+    if scheduler_job_id:
+        result["scheduler_job_id"] = scheduler_job_id
+    if scheduler_state:
+        result["scheduler_state"] = scheduler_state
+    if error:
+        result["error"] = error
+    _write_json(args.status_path, result)
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     started_at = _utc_now()
     started_monotonic = time.monotonic()
+    if args.lock_path is None:
+        return _execute_worker(args, started_at, started_monotonic)
+
     args.lock_path.parent.mkdir(parents=True, exist_ok=True)
     with args.lock_path.open("a+b") as lock_stream:
         try:
@@ -284,66 +349,11 @@ def main(argv: list[str] | None = None) -> int:
                     "finished_at": _utc_now(),
                     "duration_seconds": 0.0,
                     "exit_code": 73,
-                    "error": "Another ChatTS training/evaluation pipeline holds the run lock",
+                    "error": "Another Docker training/evaluation pipeline holds the run lock",
                 },
             )
             return 73
-
-        _write_running_status(args, started_at)
-        error: str | None = None
-        scheduler_job_id: str | None = None
-        scheduler_state: str | None = None
-        if args.backend == "slurm":
-            try:
-                exit_code, error, scheduler_job_id, scheduler_state = _execute_slurm(
-                    args, started_at, started_monotonic
-                )
-            except OSError as exc:
-                exit_code = 126
-                error = f"Could not execute Slurm command: {exc}"
-        elif args.script is None:
-            exit_code = 126
-            error = "Docker-host worker is missing its fixed pipeline script"
-        else:
-            environment = dict(os.environ)
-            environment["CONFIG_FILE"] = str(args.config)
-            try:
-                completed = subprocess.run(  # noqa: S603 - fixed server-side script.
-                    ["bash", str(args.script)],
-                    cwd=args.cwd,
-                    env=environment,
-                    check=False,
-                )
-                exit_code = completed.returncode
-            except OSError as exc:
-                exit_code = 126
-                error = f"Could not execute fixed pipeline script: {exc}"
-
-        result = {
-            "schema_version": "chatts-dataset-studio-worker-v1",
-            "job_id": args.job_id,
-            "status": (
-                "completed"
-                if exit_code == 0
-                else "canceled"
-                if scheduler_state and scheduler_state.upper().startswith("CANCELLED")
-                else "failed"
-            ),
-            "pid": os.getpid(),
-            "started_at": started_at,
-            "finished_at": _utc_now(),
-            "duration_seconds": round(time.monotonic() - started_monotonic, 3),
-            "exit_code": exit_code,
-            "execution_backend": args.backend,
-        }
-        if scheduler_job_id:
-            result["scheduler_job_id"] = scheduler_job_id
-        if scheduler_state:
-            result["scheduler_state"] = scheduler_state
-        if error:
-            result["error"] = error
-        _write_json(args.status_path, result)
-        return exit_code
+        return _execute_worker(args, started_at, started_monotonic)
 
 
 if __name__ == "__main__":

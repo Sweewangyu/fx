@@ -516,6 +516,176 @@ def test_slurm_job_submits_frozen_config_and_tracks_scheduler_completion(
     assert job["sbatch_path"] in argv
 
 
+def test_docker_fifo_does_not_block_immediate_parallel_slurm_submissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    docker_script = Path(str(integration["pipeline_script"]))
+    docker_script.parent.mkdir(parents=True)
+    docker_state = tmp_path / "docker-state"
+    docker_state.mkdir()
+    docker_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        f"DOCKER_STATE={shlex.quote(str(docker_state))}\n"
+        "if mkdir \"$DOCKER_STATE/first.once\" 2>/dev/null; then\n"
+        "  touch \"$DOCKER_STATE/started\"\n"
+        "  while [[ ! -f \"$DOCKER_STATE/release\" ]]; do sleep 0.02; done\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+
+    mock_bin = tmp_path / "mock-bin"
+    mock_bin.mkdir()
+    counter = tmp_path / "slurm-counter.txt"
+    release_slurm = tmp_path / "release-slurm"
+    scripts = {
+        "sbatch": f"""#!{sys.executable}
+import fcntl
+import os
+from pathlib import Path
+
+path = Path(os.environ["MOCK_SLURM_COUNTER"])
+path.touch(exist_ok=True)
+with path.open("r+", encoding="utf-8") as stream:
+    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+    raw = stream.read().strip()
+    value = int(raw or "0") + 1
+    stream.seek(0)
+    stream.write(str(value))
+    stream.truncate()
+print(30000000 + value)
+""",
+        "squeue": f"""#!{sys.executable}
+import os
+from pathlib import Path
+
+if not Path(os.environ["MOCK_RELEASE_SLURM"]).is_file():
+    print("PENDING")
+""",
+        "sacct": f"""#!{sys.executable}
+import os
+import sys
+from pathlib import Path
+
+if Path(os.environ["MOCK_RELEASE_SLURM"]).is_file():
+    job_id = sys.argv[sys.argv.index("-j") + 1]
+    print(f"{{job_id}}|COMPLETED|0:0|2026-01-01|2026-01-01|1|")
+""",
+    }
+    for name, source in scripts.items():
+        path = mock_bin / name
+        path.write_text(source, encoding="utf-8")
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{mock_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("MOCK_SLURM_COUNTER", str(counter))
+    monkeypatch.setenv("MOCK_RELEASE_SLURM", str(release_slurm))
+
+    jobs = PipelineJobs(tmp_path / "state", docker_script, integration)
+    docker_first = jobs.start(
+        resolve_pipeline_request(
+            {"mode": "train_eval", "execution": {"backend": "docker_host"}},
+            _version(tmp_path),
+            integration,
+        )
+    )
+    deadline = time.monotonic() + 5
+    while not (docker_state / "started").is_file():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    docker_second = jobs.start(
+        resolve_pipeline_request(
+            {
+                "mode": "train_eval",
+                "execution": {"backend": "docker_host"},
+                "training": {"stage2": {"warmup_ratio": 0.05}},
+            },
+            _version(tmp_path),
+            integration,
+        )
+    )
+    slurm_first = jobs.start(
+        resolve_pipeline_request(
+            {
+                "mode": "train",
+                "execution": {"backend": "slurm"},
+                "training": {
+                    "profile": "chronos2-stage1",
+                    "stage1": {"learning_rate": "5e-6"},
+                },
+            },
+            _version(tmp_path),
+            integration,
+        )
+    )
+    slurm_second = jobs.start(
+        resolve_pipeline_request(
+            {
+                "mode": "train",
+                "execution": {"backend": "slurm"},
+                "training": {
+                    "profile": "chronos2-stage1",
+                    "stage1": {"learning_rate": "2e-5"},
+                },
+            },
+            _version(tmp_path),
+            integration,
+        )
+    )
+
+    try:
+        deadline = time.monotonic() + 8
+        while True:
+            slurm_jobs = [
+                jobs.get(job_id, include_log=False)
+                for job_id in (slurm_first["job_id"], slurm_second["job_id"])
+            ]
+            if all(
+                job.get("scheduler_job_id")
+                and job["status"] in {"scheduled", "running"}
+                for job in slurm_jobs
+            ):
+                break
+            assert time.monotonic() < deadline, slurm_jobs
+            time.sleep(0.01)
+
+        assert counter.read_text(encoding="utf-8") == "2"
+        assert len({job["scheduler_job_id"] for job in slurm_jobs}) == 2
+        assert all("queue_position" not in job for job in slurm_jobs)
+        assert jobs.get(docker_first["job_id"], include_log=False)["status"] == "running"
+        queued_docker = jobs.get(docker_second["job_id"], include_log=False)
+        assert queued_docker["status"] == "queued"
+        assert queued_docker["queue_position"] == 1
+
+        release_slurm.touch()
+        deadline = time.monotonic() + 8
+        while True:
+            states = [
+                jobs.get(job_id, include_log=False)["status"]
+                for job_id in (slurm_first["job_id"], slurm_second["job_id"])
+            ]
+            if states == ["completed", "completed"]:
+                break
+            assert time.monotonic() < deadline, states
+            time.sleep(0.01)
+        assert jobs.get(docker_first["job_id"], include_log=False)["status"] == "running"
+    finally:
+        release_slurm.touch(exist_ok=True)
+        (docker_state / "release").touch(exist_ok=True)
+
+    deadline = time.monotonic() + 8
+    while True:
+        docker_states = [
+            jobs.get(job_id, include_log=False)["status"]
+            for job_id in (docker_first["job_id"], docker_second["job_id"])
+        ]
+        if docker_states == ["completed", "completed"]:
+            break
+        assert time.monotonic() < deadline, docker_states
+        time.sleep(0.01)
+
+
 def test_stage1_resolved_yaml_is_accepted_by_training_slurm_contract(
     tmp_path: Path,
 ) -> None:

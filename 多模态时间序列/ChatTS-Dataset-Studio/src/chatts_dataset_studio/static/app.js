@@ -848,9 +848,12 @@ async function startRun(mode, button) {
     try {
       const result = await api(endpoint, { method: "POST", body: JSON.stringify(runPayload(effectiveMode)) });
       const id = jobId(result);
+      const isSlurm = (result.execution_backend || $("#execution-backend").value) === "slurm";
       const submittedStatus = result.status === "queued"
-        ? `已加入队列，当前第 ${result.queue_position || 1} 位。`
-        : "已经开始运行。";
+        ? `已加入 Docker 队列，当前第 ${result.queue_position || 1} 位。`
+        : isSlurm
+          ? "已提交 Slurm，正在读取集群调度状态。"
+          : "已经开始运行。";
       $("#run-status").textContent = mode === "preflight" ? `预检任务${submittedStatus}` : `${shouldEvaluate() ? "训练评测" : "训练"}任务${submittedStatus}`;
       if (id) {
         state.activeJobId = id;
@@ -858,7 +861,7 @@ async function startRun(mode, button) {
         renderJobs();
       }
       const queueSuffix = result.status === "queued" ? `，当前第 ${result.queue_position || 1} 位` : "";
-      showToast(mode === "preflight" ? `预检已提交${queueSuffix}` : (result.status === "queued" ? `流水线已加入队列${queueSuffix}` : "流水线已启动"), "success");
+      showToast(mode === "preflight" ? `预检已提交${queueSuffix}` : (result.status === "queued" ? `Docker 流水线已加入队列${queueSuffix}` : isSlurm ? "Slurm 任务已立即提交" : "流水线已启动"), "success");
       activateTab("jobs");
       refreshJobs({ quiet: true });
     } catch (error) {
@@ -869,7 +872,7 @@ async function startRun(mode, button) {
 }
 
 function jobStatusLabel(status) {
-  return ({ queued: "本地排队", scheduled: "Slurm 排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
+  return ({ queued: "Docker 排队", scheduled: "Slurm 排队", preparing: "准备", running: "运行中", exporting: "导出中", training: "训练中", evaluating: "评测中", completed: "完成", failed: "失败", canceled: "已取消", cancelled: "已取消" })[status] || status || "未知";
 }
 
 function jobType(job) {
@@ -899,7 +902,10 @@ function jobRow(job) {
   button.setAttribute("role", "row");
   button.setAttribute("aria-label", `查看${jobType(job)}任务日志`);
   const queueSuffix = job.status === "queued" && job.queue_position ? ` #${job.queue_position}` : "";
-  const status = element("span", `job-status ${job.status || "unknown"}`, `${jobStatusLabel(job.status)}${queueSuffix}`);
+  const statusLabel = job.status === "queued" && job.execution_backend === "docker_host"
+    ? "Docker 排队"
+    : jobStatusLabel(job.status);
+  const status = element("span", `job-status ${job.status || "unknown"}`, `${statusLabel}${queueSuffix}`);
   for (const value of [jobType(job), job.version || job.data_version || "—"]) button.append(element("span", "", String(value)));
   button.append(status, element("span", "", formatDate(job.started_at || job.created_at)), element("span", "", formatDuration(job)));
   return button;
@@ -938,7 +944,7 @@ function renderJobDialog(job) {
   const percent = Number(job.progress_percent ?? (total ? Math.floor((processed / total) * 100) : (job.status === "completed" ? 100 : 0)));
   $("#job-percent").textContent = `${Math.max(0, Math.min(100, percent))}%`;
   $("#job-progress").value = Math.max(0, Math.min(100, percent));
-  const waiting = job.status === "queued" ? `任务已冻结并进入队列，当前第 ${job.queue_position || "?"} 位。` : "等待日志";
+  const waiting = job.status === "queued" ? `Docker 任务已冻结并进入本地队列，当前第 ${job.queue_position || "?"} 位。` : "等待日志";
   const log = Array.isArray(job.log_tail) ? job.log_tail.join("\n") : (job.log_tail || job.log || job.error || waiting);
   $("#job-log").textContent = log;
   const diff = job.diff_from_previous;

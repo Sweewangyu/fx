@@ -996,7 +996,7 @@ def resolve_pipeline_request(
 
 
 class PipelineJobs:
-    """Persistent FIFO scheduler for Docker-host and trusted Slurm launchers."""
+    """Persist jobs while separating local Docker FIFO from Slurm scheduling."""
 
     def __init__(
         self,
@@ -1069,11 +1069,19 @@ class PipelineJobs:
     def _decorate_queue_positions(
         self, jobs: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
+        # Only Docker jobs wait in Dataset Studio. Slurm jobs are submitted
+        # immediately and any PENDING order belongs to the cluster scheduler.
         positions = {
             str(job.get("job_id")): position
             for position, job in enumerate(
                 sorted(
-                    (item for item in jobs if item.get("status") == "queued"),
+                    (
+                        item
+                        for item in jobs
+                        if item.get("status") == "queued"
+                        and item.get("execution_backend", "docker_host")
+                        == "docker_host"
+                    ),
                     key=self._fifo_key,
                 ),
                 1,
@@ -1271,8 +1279,6 @@ class PipelineJobs:
             str(Path(__file__).with_name("pipeline_worker.py")),
             "--job-id",
             str(job["job_id"]),
-            "--lock-path",
-            str(self.run_lock_path),
             "--status-path",
             str(self._status_path(str(job["job_id"]))),
             "--backend",
@@ -1285,7 +1291,14 @@ class PipelineJobs:
         if backend == "docker_host":
             if self.pipeline_script is None:
                 raise StudioError("One-click Docker pipeline is disabled")
-            command.extend(["--script", str(self.pipeline_script)])
+            command.extend(
+                [
+                    "--lock-path",
+                    str(self.run_lock_path),
+                    "--script",
+                    str(self.pipeline_script),
+                ]
+            )
         elif backend == "slurm":
             command.extend(
                 [
@@ -1434,22 +1447,42 @@ class PipelineJobs:
 
     def _dispatch_next_locked(self) -> None:
         jobs = self._list_raw()
-        if any(job.get("status") == "running" for job in jobs):
-            return
-        queued = sorted(
-            (job for job in jobs if job.get("status") == "queued"),
+        queued_docker = sorted(
+            (
+                job
+                for job in jobs
+                if job.get("status") == "queued"
+                and job.get("execution_backend", "docker_host") == "docker_host"
+            ),
             key=self._fifo_key,
         )
-        # If a queued item has lost its immutable config or the configured
-        # launcher disappeared, fail it explicitly and continue draining the
-        # queue instead of blocking every later experiment forever.
-        for job in queued:
-            if job.get("execution_backend", "docker_host") == "docker_host" and (
-                self.pipeline_script is None or not self.pipeline_script.is_file()
-            ):
-                continue
-            if self._launch_locked(job):
-                return
+        docker_running = any(
+            job.get("status") == "running"
+            and job.get("execution_backend", "docker_host") == "docker_host"
+            for job in jobs
+        )
+        if not docker_running:
+            # Docker uses one shared pair of training/evaluation containers, so
+            # it retains the durable local FIFO and a process-level run lock.
+            for job in queued_docker:
+                if self.pipeline_script is None or not self.pipeline_script.is_file():
+                    break
+                if self._launch_locked(job):
+                    break
+
+        # Slurm owns GPU admission and scheduling. Submit every frozen Slurm
+        # job immediately; do not serialize them behind Docker or each other.
+        queued_slurm = sorted(
+            (
+                job
+                for job in jobs
+                if job.get("status") == "queued"
+                and job.get("execution_backend") == "slurm"
+            ),
+            key=self._fifo_key,
+        )
+        for job in queued_slurm:
+            self._launch_locked(job)
 
     def _watch(self, job_id: str, process: subprocess.Popen[bytes] | None = None) -> None:
         if process is not None:
