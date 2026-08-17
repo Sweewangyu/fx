@@ -2,6 +2,8 @@ import json
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -177,6 +179,377 @@ class InspectorServerTest(unittest.TestCase):
             self.assertFalse(payload["tsrbench"]["found"])
             self.assertEqual(payload["tsrbench"]["tasks_found"], 0)
             self.assertIn(str((root / "missing-one" / "dataset").resolve()), payload["tsrbench"]["checked_paths"])
+
+    def test_imports_multi_model_json_and_jsonl_shards_by_task_and_idx(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root = root / "data"
+            data_root.mkdir()
+            (data_root / "sources.json").write_text('{"sources": []}', encoding="utf-8")
+            benchmark = root / "TSRBench" / "dataset" / "reasoning"
+            benchmark.mkdir(parents=True)
+            samples = [
+                {
+                    "question": "First?",
+                    "answer": "A",
+                    "timeseries": [[1, 2]],
+                    "choices": ["yes", "no"],
+                },
+                {
+                    "question": "Second?",
+                    "answer": "B",
+                    "timeseries": [[2, 1]],
+                    "choices": ["yes", "no"],
+                },
+            ]
+            (benchmark / "causal_reasoning.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in samples), encoding="utf-8"
+            )
+            results = root / "results"
+            alpha = results / "causal_reasoning_model_alpha"
+            alpha.mkdir(parents=True)
+            (alpha / "generated_answer.json").write_text(
+                json.dumps(
+                    [
+                        {"idx": 0, "response": "A", "answer": "A", "prompt_mode": "answer_only"},
+                        {"idx": 1, "response": "A", "answer": "A", "prompt_mode": "answer_only"},
+                        {"response": "missing idx"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            beta = results / "causal_reasoning_model_beta"
+            beta.mkdir(parents=True)
+            (beta / "generated_answer_2_0.jsonl").write_text(
+                json.dumps({"idx": 0, "response": "B", "answer": "B", "prompt_mode": "official"}) + "\n",
+                encoding="utf-8",
+            )
+            (beta / "generated_answer_2_1.json").write_text(
+                json.dumps(
+                    [
+                        {"idx": 0, "response": "A", "answer": "A", "prompt_mode": "official"},
+                        {"idx": 1, "response": "B", "answer": "B", "prompt_mode": "official"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "data": {
+                    "root": "data",
+                    "registry": "data/sources.json",
+                    "tsrbench_root": "TSRBench/dataset",
+                },
+                "qwen": {"base_url": "http://localhost:1/v1", "model": "fixture", "allow_no_key": True},
+                "evaluation_results": {"root": "results"},
+                "review": {"state_db": "state/inspector-state.sqlite3"},
+                "server": {"cache_dir": "cache"},
+            }
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            store = server.DatasetStore(config_path)
+            imported = store.import_model_results()
+
+            self.assertEqual(len(imported["runs"]), 2)
+            record0 = store.record("tsrbench_causal_reasoning", 0)
+            self.assertEqual(len(record0["model_responses"]), 2)
+            self.assertEqual(
+                {row["model_name"]: row["status"] for row in record0["model_responses"]},
+                {"model_alpha": "correct", "model_beta": "error"},
+            )
+            alpha_run = next(row for row in store.model_runs() if row["model_name"] == "model_alpha")
+            self.assertEqual(alpha_run["invalid"], 1)
+            beta_run = next(row for row in store.model_runs() if row["model_name"] == "model_beta")
+            self.assertTrue(
+                any(item["type"] == "duplicate_index_conflict" for item in beta_run["diagnostics"])
+            )
+            badcase = store.next_badcase(alpha_run["run_id"], "tsrbench_causal_reasoning", -1)
+            self.assertEqual(badcase["index"], 1)
+            page = store.badcases(alpha_run["run_id"], None, "incorrect", 0, 10)
+            self.assertEqual([item["index"] for item in page["items"]], [1])
+
+            # Re-importing an unchanged root is idempotent.
+            store.import_model_results()
+            self.assertEqual(len(store.model_runs()), 2)
+            self.assertEqual(len(store.record("tsrbench_causal_reasoning", 0)["model_responses"]), 2)
+
+    def test_model_identity_prompt_modes_missing_and_mutually_exclusive_statuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root = root / "data"
+            data_root.mkdir()
+            (data_root / "sources.json").write_text('{"sources": []}', encoding="utf-8")
+            benchmark = root / "TSRBench" / "dataset" / "reasoning"
+            benchmark.mkdir(parents=True)
+            samples = [
+                {"question": f"Question {index}?", "answer": answer, "timeseries": [[index]]}
+                for index, answer in enumerate(("A", "B", "C"))
+            ]
+            (benchmark / "causal_reasoning.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in samples), encoding="utf-8"
+            )
+
+            results = root / "results"
+            model3 = results / "text" / "causal_reasoning_OpenGVLab" / "InternVL3-8B"
+            model4 = results / "text" / "causal_reasoning_OpenGVLab" / "InternVL4-8B"
+            model3.mkdir(parents=True)
+            model4.mkdir(parents=True)
+            (model3 / "generated_answer.json").write_text(
+                json.dumps(
+                    [
+                        {"idx": 0, "raw_response": "A", "prompt_mode": "answer_only"},
+                        {
+                            "idx": 1,
+                            "response": "B",
+                            "answer": "B",
+                            "error": "generation failed after partial output",
+                            "prompt_mode": "official",
+                        },
+                        {"idx": True, "response": "B", "prompt_mode": "official"},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            model4_file = model4 / "generated_answer.jsonl"
+            model4_file.write_text(
+                json.dumps({"idx": 0, "completion": "A", "prompt_mode": "official"}) + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "data": {
+                    "root": "data",
+                    "registry": "data/sources.json",
+                    "tsrbench_root": "TSRBench/dataset",
+                },
+                "qwen": {"base_url": "http://localhost:1/v1", "model": "fixture", "allow_no_key": True},
+                "evaluation_results": {"root": "results"},
+                "review": {"state_db": "state/inspector-state.sqlite3"},
+                "server": {"cache_dir": "cache"},
+            }
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            store = server.DatasetStore(config_path)
+            store.import_model_results()
+
+            runs = store.model_runs()
+            self.assertEqual(
+                {(run["model_name"], run["prompt_mode"]) for run in runs},
+                {
+                    ("OpenGVLab/InternVL3-8B", "answer_only"),
+                    ("OpenGVLab/InternVL3-8B", "official"),
+                    ("OpenGVLab/InternVL4-8B", "official"),
+                },
+            )
+            record0 = store.record("tsrbench_causal_reasoning", 0)["model_responses"]
+            statuses0 = {
+                (row["model_name"], row["prompt_mode"]): row["status"] for row in record0
+            }
+            self.assertEqual(statuses0[("OpenGVLab/InternVL3-8B", "answer_only")], "correct")
+            self.assertEqual(statuses0[("OpenGVLab/InternVL3-8B", "official")], "missing")
+            record1 = store.record("tsrbench_causal_reasoning", 1)["model_responses"]
+            statuses1 = {
+                (row["model_name"], row["prompt_mode"]): row["status"] for row in record1
+            }
+            self.assertEqual(statuses1[("OpenGVLab/InternVL3-8B", "official")], "error")
+            official3 = next(
+                run for run in runs
+                if run["model_name"] == "OpenGVLab/InternVL3-8B" and run["prompt_mode"] == "official"
+            )
+            self.assertEqual((official3["correct"], official3["errors"]), (0, 1))
+            official4 = next(run for run in runs if run["model_name"] == "OpenGVLab/InternVL4-8B")
+            self.assertEqual(
+                store.next_badcase(official4["run_id"], "tsrbench_causal_reasoning", 0)["index"],
+                1,
+            )
+
+            # A successful full refresh removes runs whose source disappeared.
+            model4_file.unlink()
+            store.import_model_results()
+            self.assertNotIn(
+                "OpenGVLab/InternVL4-8B", {run["model_name"] for run in store.model_runs()}
+            )
+
+    def test_human_good_bad_annotations_persist_progress_next_export_and_reject_benchmark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root = root / "data"
+            files = data_root / "files"
+            files.mkdir(parents=True)
+            rows = [
+                {"input": f"Question {index}", "timeseries": [[index]], "output": "answer"}
+                for index in range(3)
+            ]
+            (files / "train.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            (data_root / "sources.json").write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "train_fixture",
+                                "family": "test",
+                                "path": "files/train.jsonl",
+                                "split": "train",
+                                "training_role": "sft",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            benchmark = root / "TSRBench" / "dataset" / "perception"
+            benchmark.mkdir(parents=True)
+            (benchmark / "perception.jsonl").write_text(
+                json.dumps({"question": "Benchmark?", "answer": "A", "timeseries": [[1]]}) + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "data": {
+                    "root": "data",
+                    "registry": "data/sources.json",
+                    "tsrbench_root": "TSRBench/dataset",
+                },
+                "qwen": {"base_url": "http://localhost:1/v1", "model": "fixture", "allow_no_key": True},
+                "review": {"state_db": "state/inspector-state.sqlite3"},
+                "server": {"cache_dir": "cache"},
+            }
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            store = server.DatasetStore(config_path)
+
+            first = store.save_human_annotation("train_fixture", 0, "good", annotator="alice", expected_revision=0)
+            self.assertEqual(first["label"], "good")
+            self.assertEqual(first["revision"], 1)
+            with self.assertRaises(server.AnnotationConflict):
+                store.save_human_annotation("train_fixture", 0, "bad", expected_revision=0)
+            changed = store.save_human_annotation(
+                "train_fixture", 0, "bad", comment="bad rationale", expected_revision=1
+            )
+            self.assertEqual(changed["revision"], 2)
+            store.save_human_annotation("train_fixture", 1, "good", expected_revision=0)
+            progress = store.human_progress("train_fixture")
+            self.assertEqual((progress["labeled"], progress["good"], progress["bad"]), (2, 1, 1))
+            self.assertEqual(store.next_unlabeled("train_fixture", -1)["index"], 2)
+            exported, _, _ = store.export_human_annotations("jsonl", "train_fixture")
+            self.assertEqual(len([line for line in exported.decode().splitlines() if line]), 2)
+            self.assertNotIn(".cache", str(store.state_db))
+
+            recreated = server.DatasetStore(config_path)
+            persisted = recreated.record("train_fixture", 0)["human_review"]
+            self.assertEqual((persisted["label"], persisted["revision"]), ("bad", 2))
+            with self.assertRaises(server.ApiError) as context:
+                recreated.save_human_annotation("tsrbench_perception", 0, "good")
+            self.assertEqual(context.exception.status, 403)
+            cleared = recreated.delete_human_annotation("train_fixture", 0, expected_revision=2)
+            self.assertIsNone(cleared["label"])
+            self.assertEqual(cleared["revision"], 3)
+            self.assertEqual(cleared["progress"]["labeled"], 1)
+            with self.assertRaises(server.AnnotationConflict):
+                recreated.save_human_annotation(
+                    "train_fixture", 0, "good", expected_revision=2
+                )
+            restored = recreated.save_human_annotation(
+                "train_fixture", 0, "good", expected_revision=3
+            )
+            self.assertEqual(restored["revision"], 4)
+
+            # Source changes conservatively invalidate old labels: they no
+            # longer count as progress, are revisited, or appear in the default export.
+            changed_rows = [
+                {"input": f"Changed question {index}", "timeseries": [[index]], "output": "answer"}
+                for index in range(3)
+            ]
+            (files / "train.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in changed_rows), encoding="utf-8"
+            )
+            self.assertEqual(recreated.human_progress("train_fixture")["labeled"], 0)
+            self.assertEqual(recreated.next_unlabeled("train_fixture", -1)["index"], 0)
+            fresh_export, _, _ = recreated.export_human_annotations("jsonl", "train_fixture")
+            self.assertEqual(fresh_export, b"")
+            stale_export, _, _ = recreated.export_human_annotations(
+                "jsonl", "train_fixture", include_stale=True
+            )
+            self.assertTrue(all(json.loads(line)["stale"] for line in stale_export.splitlines()))
+            self.assertTrue(recreated.record("train_fixture", 0)["human_review"]["stale"])
+
+    def test_human_label_http_alias_validates_required_fields_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_root = root / "data"
+            files = data_root / "files"
+            files.mkdir(parents=True)
+            (files / "train.jsonl").write_text(
+                json.dumps({"input": "Question", "timeseries": [[1]], "output": "Answer"}) + "\n",
+                encoding="utf-8",
+            )
+            (data_root / "sources.json").write_text(
+                json.dumps(
+                    {
+                        "sources": [
+                            {
+                                "name": "train_fixture",
+                                "family": "test",
+                                "path": "files/train.jsonl",
+                                "split": "train",
+                                "training_role": "sft",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "data": {"root": "data", "registry": "data/sources.json"},
+                "qwen": {"base_url": "http://localhost:1/v1", "model": "fixture", "allow_no_key": True},
+                "review": {"state_db": "state/inspector-state.sqlite3"},
+                "server": {"cache_dir": "cache"},
+            }
+            config_path = root / "config.yaml"
+            config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+            server.ApiHandler.store = server.DatasetStore(config_path)
+            server.ApiHandler.allowed_origin = "*"
+            api = ThreadingHTTPServer(("127.0.0.1", 0), server.ApiHandler)
+            thread = threading.Thread(target=api.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{api.server_port}"
+
+            def post(payload):
+                request = urllib.request.Request(
+                    base + "/api/human-label",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status, json.loads(response.read())
+
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as missing_label:
+                    post({"dataset": "train_fixture", "index": 0})
+                self.assertEqual(missing_label.exception.code, 400)
+                with self.assertRaises(urllib.error.HTTPError) as unsafe_index:
+                    post({"dataset": "train_fixture", "index": True, "label": "good"})
+                self.assertEqual(unsafe_index.exception.code, 400)
+
+                status, saved = post(
+                    {
+                        "dataset": "train_fixture",
+                        "index": 0,
+                        "label": "good",
+                        "annotator": "http-test",
+                        "expected_revision": 0,
+                    }
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(saved["human_review"]["label"], "good")
+                with urllib.request.urlopen(
+                    base + "/api/human-labels/next?dataset=train_fixture&after=-1", timeout=5
+                ) as response:
+                    self.assertTrue(json.loads(response.read())["complete"])
+            finally:
+                api.shutdown()
+                api.server_close()
+                thread.join(timeout=2)
 
     def test_qwen_translation_proxy_and_cache(self):
         requests = []

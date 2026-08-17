@@ -8,6 +8,9 @@ OpenTSLM 数据质量检查，并原生兼容 TSRBench 官方评测集。
 - 兼容统一的 `input / timeseries / output` JSONL；
 - 原生读取 TSRBench 的12个评测文件，包括普通 `question/choices/timeseries/answer` 样本和
   `abductive_reasoning` 的特殊比赛事件格式；
+- 从一个服务器目录递归导入多个模型的 TSRBench 推理结果，在每道题下对照金标展示正确、错误、解析失败和推理异常；
+- 按模型跳到下一条 badcase，并可对单条模型回答调用 Qwen 中译；
+- 在真正的 `train` 数据上人工标注“好 / 不好”，支持标注进度、自动下一条、撤销、修改冲突保护和 JSONL/CSV 导出；
 - 数据集切换、序号跳转、随机抽样和同模板随机抽样；
 - 多通道时间序列折线图、通道开关、统计量和长序列降采样；
 - 问题、答案原文与 Qwen 中文翻译并排检查，译文自动缓存；
@@ -58,6 +61,13 @@ data:
 qwen:
   base_url: http://10.112.164.1:30001/v1
   model: /share/global/pymaip/models/Qwen3.6-27B
+
+evaluation_results:
+  root: "" # 也可在页面右上角设置中填写
+  auto_scan: false
+
+review:
+  state_db: state/inspector-state.sqlite3
 ```
 
 路径相对于 YAML 文件解析。如果合并标签在其他位置，只需调整 `annotations_dir`。即使没有
@@ -95,6 +105,33 @@ export TSRBENCH_ROOT=/实际目录/TSRBench/dataset
 启动服务时才读取路径配置；修改 YAML 或环境变量后需要重启 `run_local.sh`。TSRBench 筛选页会
 直接显示路径未找到或任务文件未匹配，不再以空白列表误导为“0条数据”。
 
+## 导入多模型推理结果
+
+把所有模型的推理结果放在同一个服务器根目录下。页面右上角点齿轮，在“服务器推理结果根路径”填入该目录并点“保存路径并扫描”。路径是数据 API 所在服务器的文件系统路径，不是浏览器所在电脑的路径。
+
+支持 ChatTS 现有脚本的 JSON 数组、JSONL 及 GPU 分片：
+
+```text
+/workspace/model_outputs/
+├── causal_reasoning_qwen3-1.7b/generated_answer.json
+├── numerical_reasoning_qwen3-1.7b/generated_answer_2_0.json
+├── numerical_reasoning_qwen3-1.7b/generated_answer_2_1.json
+└── another-model/tsrbench/perception_another-model/generated_answer.jsonl
+```
+
+结果项应包含 `idx`（也兼容 `index` / `sample_index`）以及 `response`；服务严格使用“TSRBench 任务 + 零基 `idx`”对齐，不会在缺少索引时猜测数组顺序。重复索引、越界索引和损坏文件会记入扫描诊断。也可通过环境变量预置：
+
+```bash
+export TSRBENCH_RESULTS_ROOT=/workspace/model_outputs
+./run_local.sh
+```
+
+## 人工好/不好标注
+
+标注控件只在 `schema=chatts` 且 `split=train` 的数据上显示；TSRBench 和 dev 集在前后端都禁止写入。标注存到 `state/inspector-state.sqlite3`，不在可删除的 `.cache/` 中。每次判定都绑定当前样本内容指纹；原数据变化时，页面会把旧标注提示为需重新确认。过期标注不计入进度，也不进入默认导出；如需审计旧记录，导出接口可加 `include_stale=1`。
+
+迁移或升级服务时，请单独备份这个 SQLite 文件（包括同目录下可能短暂存在的 `-wal` / `-shm`），或先从页面导出标注。
+
 如果 Qwen 需要密钥：
 
 ```bash
@@ -118,10 +155,12 @@ export DT_QWEN_API_KEY='...'
 ## 服务器上传
 
 需要上传整个 `tsqa-inspector/`，但不需要上传 `.cache/`、`.vinext/`、`.wrangler/`、`dist/`
-或 `node_modules/`。DataTaste 和 SFT_CURATOR 默认与本目录同级；目录不同就修改 YAML。
+或 `node_modules/`。DataTaste 和 SFT_CURATOR 默认与本目录同级；目录不同就修改 YAML。如果是覆盖升级已经使用过的服务，不要删除服务器上原有的 `state/`。
 
 ## 快捷键
 
 - `← / →`：上一条 / 下一条；
 - `R`：随机抽样；
-- `T`：打开同模板成员页。
+- `T`：打开同模板成员页；
+- `G`：将当前训练样本标为“好”；
+- `B`：将当前训练样本标为“不好”。

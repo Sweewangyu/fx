@@ -29,12 +29,26 @@ qwen:
   max_tokens: 2048
   compatibility_retry: true
 
+# Model inference outputs produced by inference_tsrbench_vllm.py. The server
+# recursively discovers generated_answer.json and generated_answer_*.json
+# shards, groups them by model, and joins every response by TSRBench task+idx.
+# Environment variables TSRBENCH_RESULTS_ROOT or TSR_RESULTS_ROOT override it.
+evaluation_results:
+  root: ""
+  auto_scan: false
+
+# Durable human good/bad review state. This deliberately lives outside .cache;
+# deleting generated dataset indexes or translation caches will not delete it.
+review:
+  state_db: state/inspector-state.sqlite3
+
 server:
   host: 0.0.0.0
   port: 8765
   cache_dir: .cache
-  # The service has no mutating endpoint and is normally reached from another
-  # machine's browser, so allow the frontend hostname used by the cluster.
+  # The cluster UI is normally opened from another machine, so CORS must allow
+  # that browser origin. On a public network, replace "*" with the exact UI
+  # origin and protect ports 3000/8765 with the cluster firewall or gateway.
   frontend_origin: "*"
   max_chart_points: 900
   template_page_size: 12

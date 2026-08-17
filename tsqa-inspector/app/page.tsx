@@ -15,6 +15,70 @@ type Dataset = {
   index_ready: boolean;
   schema: "chatts" | "tsrbench";
   benchmark_task: string | null;
+  model_runs?: number;
+  human_review?: HumanReviewProgress | null;
+};
+
+type HumanLabel = "good" | "bad";
+
+type HumanReviewProgress = {
+  total: number;
+  labeled: number;
+  good: number;
+  bad: number;
+  remaining: number;
+  coverage_percent?: number;
+};
+
+type HumanReview = {
+  editable?: boolean;
+  label: HumanLabel | null;
+  verdict?: HumanLabel | null;
+  comment?: string | null;
+  annotator?: string | null;
+  updated_at?: string | null;
+  revision?: number | null;
+  stale?: boolean;
+  progress: HumanReviewProgress;
+};
+
+type ModelResponseStatus = "correct" | "incorrect" | "wrong" | "unparsed" | "error" | "empty" | "missing" | "unknown";
+
+type ModelResponse = {
+  run_id: string;
+  model_name: string;
+  display_name?: string | null;
+  response: string;
+  raw_response?: string | null;
+  parsed_answer?: string | null;
+  gold_answer?: string | null;
+  status?: ModelResponseStatus;
+  prompt_mode?: string | null;
+  reported_answer?: string | null;
+  correctness?: boolean | string | null;
+  generation_status?: string | null;
+  parse_status?: string | null;
+  error?: string | null;
+  source_file?: string | null;
+  latency_ms?: number | null;
+};
+
+type EvaluationRun = {
+  run_id: string;
+  model_name?: string | null;
+  display_name?: string | null;
+  source_file?: string | null;
+  matched_rows?: number;
+  total_rows?: number;
+};
+
+type EvaluationStatus = {
+  results_root: string | null;
+  source?: string | null;
+  exists?: boolean;
+  runs: EvaluationRun[];
+  scanned_at?: string | null;
+  error?: string | null;
 };
 
 type SeriesChannel = {
@@ -70,6 +134,8 @@ type RecordPayload = {
   issues: string[];
   normalized_template: string;
   template: TemplateSummary;
+  model_responses?: ModelResponse[];
+  human_review?: HumanReview | null;
 };
 
 type Member = {
@@ -151,6 +217,16 @@ const DIFFICULTY_LABELS: Record<string, string> = {
   very_hard: "很困难",
 };
 
+const MODEL_STATUS_LABELS: Record<Exclude<ModelResponseStatus, "wrong">, { label: string; tone: string }> = {
+  correct: { label: "正确", tone: "correct" },
+  incorrect: { label: "错误", tone: "incorrect" },
+  unparsed: { label: "解析失败", tone: "unparsed" },
+  error: { label: "推理错误", tone: "error" },
+  empty: { label: "空回答", tone: "empty" },
+  missing: { label: "结果缺失", tone: "missing" },
+  unknown: { label: "未判定", tone: "unknown" },
+};
+
 function formatNumber(value: number | undefined | null): string {
   return new Intl.NumberFormat("zh-CN").format(value ?? 0);
 }
@@ -158,6 +234,35 @@ function formatNumber(value: number | undefined | null): string {
 function shortText(value: string, max = 80): string {
   const clean = value.replace(/\s+/g, " ").trim();
   return clean.length > max ? `${clean.slice(0, max)}…` : clean;
+}
+
+function percentOf(progress: HumanReviewProgress | null | undefined): number {
+  if (!progress || progress.total <= 0) return 0;
+  if (typeof progress.coverage_percent === "number") return Math.max(0, Math.min(100, progress.coverage_percent));
+  return Math.max(0, Math.min(100, (progress.labeled / progress.total) * 100));
+}
+
+function normalizedResponseStatus(item: ModelResponse): Exclude<ModelResponseStatus, "wrong"> {
+  const explicit = String(item.status || "").toLowerCase();
+  if (explicit === "wrong") return "incorrect";
+  if (["correct", "incorrect", "unparsed", "error", "empty", "missing", "unknown"].includes(explicit)) {
+    return explicit as Exclude<ModelResponseStatus, "wrong">;
+  }
+  const generation = String(item.generation_status || "").toLowerCase();
+  const parsing = String(item.parse_status || "").toLowerCase();
+  const correctness = String(item.correctness ?? "").toLowerCase();
+  if (item.error || ["error", "failed", "failure"].includes(generation)) return "error";
+  if (generation === "missing") return "missing";
+  if (!(item.response || item.raw_response || "").trim() || generation === "empty") return "empty";
+  if (item.correctness === true || ["correct", "true", "1", "pass", "passed"].includes(correctness)) return "correct";
+  if (item.correctness === false || ["incorrect", "wrong", "false", "0", "fail", "failed"].includes(correctness)) return "incorrect";
+  if (["unparsed", "parse_failed", "failed", "failure", "invalid"].includes(parsing)) return "unparsed";
+  return "unknown";
+}
+
+function basename(path: string | null | undefined): string {
+  if (!path) return "";
+  return path.split(/[\\/]/).filter(Boolean).pop() || path;
 }
 
 function asString(value: unknown): string | null {
@@ -473,6 +578,249 @@ function ChoicePanel({ choices, answer, translations }: { choices: RecordPayload
   );
 }
 
+type ModelResponseFilter = "all" | "incorrect" | "unparsed" | "correct";
+
+function ModelResponseCard({
+  item,
+  translated,
+  translating,
+  badcaseBusy,
+  onTranslate,
+  onNextBadcase,
+}: {
+  item: ModelResponse;
+  translated?: string;
+  translating: boolean;
+  badcaseBusy: boolean;
+  onTranslate: () => void;
+  onNextBadcase: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const status = normalizedResponseStatus(item);
+  const statusMeta = MODEL_STATUS_LABELS[status];
+  const response = item.response || item.raw_response || "";
+  const long = response.length > 2400;
+  const titleId = `model-run-${item.run_id.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+
+  return (
+    <article className={`model-response-card model-response-card--${statusMeta.tone}`} aria-labelledby={titleId}>
+      <div className="model-response-card__head">
+        <div>
+          <span className={`response-status response-status--${statusMeta.tone}`}>{statusMeta.label}</span>
+          <h3 id={titleId}>{item.display_name || item.model_name || item.run_id}</h3>
+          <code>{item.run_id}</code>
+        </div>
+        <button type="button" className="translate-button" onClick={onTranslate} disabled={translating || !response}>
+          <span aria-hidden="true">文</span>
+          {translating ? "翻译中…" : translated ? "重新翻译" : "翻译"}
+        </button>
+      </div>
+
+      <dl className="model-response-meta">
+        <div><dt>解析答案</dt><dd>{item.parsed_answer || item.reported_answer || "—"}</dd></div>
+        {item.prompt_mode && <div><dt>提示模式</dt><dd>{item.prompt_mode}</dd></div>}
+        {item.latency_ms != null && <div><dt>耗时</dt><dd>{formatNumber(Math.round(item.latency_ms))} ms</dd></div>}
+        {item.source_file && <div><dt>结果文件</dt><dd title={item.source_file}>{basename(item.source_file)}</dd></div>}
+      </dl>
+
+      {item.error && <div className="model-response-error" role="alert">{item.error}</div>}
+      <div className={`document-text model-response-text ${!expanded && long ? "document-text--clamped" : ""}`}>
+        {response || "（模型没有返回内容）"}
+      </div>
+      {long && (
+        <button type="button" className="expand-button" onClick={() => setExpanded((value) => !value)}>
+          {expanded ? "收起回答" : `展开全部 ${formatNumber(response.length)} 字符`}
+        </button>
+      )}
+      {translated && (
+        <div className="translation-block">
+          <div className="translation-label"><span>中</span> Qwen 译文</div>
+          <div className="document-text document-text--translated">{translated}</div>
+        </div>
+      )}
+      <div className="model-response-card__actions">
+        <button type="button" onClick={onNextBadcase} disabled={badcaseBusy}>
+          {badcaseBusy ? "正在查找…" : "查看该模型下一 badcase"}
+        </button>
+      </div>
+    </article>
+  );
+}
+
+function ModelResponsesPanel({
+  responses,
+  filter,
+  onFilterChange,
+  translations,
+  translationBusyKey,
+  badcaseBusyRun,
+  actionError,
+  resultsRoot,
+  onTranslate,
+  onNextBadcase,
+  onOpenSettings,
+}: {
+  responses: ModelResponse[];
+  filter: ModelResponseFilter;
+  onFilterChange: (filter: ModelResponseFilter) => void;
+  translations: Translation;
+  translationBusyKey: string | null;
+  badcaseBusyRun: string | null;
+  actionError: string | null;
+  resultsRoot: string | null;
+  onTranslate: (item: ModelResponse) => void;
+  onNextBadcase: (runId: string) => void;
+  onOpenSettings: () => void;
+}) {
+  const counts = responses.reduce((current, item) => {
+    const status = normalizedResponseStatus(item);
+    current[status] = (current[status] || 0) + 1;
+    return current;
+  }, {} as Record<string, number>);
+  const filtered = responses.filter((item) => filter === "all" || normalizedResponseStatus(item) === filter);
+  const filters: Array<{ value: ModelResponseFilter; label: string }> = [
+    { value: "all", label: `全部 ${responses.length}` },
+    { value: "incorrect", label: `错误 ${counts.incorrect || 0}` },
+    { value: "unparsed", label: `解析失败 ${counts.unparsed || 0}` },
+    { value: "correct", label: `正确 ${counts.correct || 0}` },
+  ];
+
+  return (
+    <section className="model-responses-panel" aria-labelledby="model-responses-title">
+      <div className="model-response-toolbar">
+        <div>
+          <span className="eyebrow">MODEL OUTPUTS</span>
+          <h2 id="model-responses-title">模型推理结果</h2>
+          <p>逐模型对照参考答案，直接定位解析失败和错误样本。</p>
+        </div>
+        {responses.length > 0 && (
+          <div className="response-filter" role="group" aria-label="模型回答状态筛选">
+            {filters.map((item) => (
+              <button
+                type="button"
+                key={item.value}
+                className={filter === item.value ? "active" : ""}
+                aria-pressed={filter === item.value}
+                onClick={() => onFilterChange(item.value)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {actionError && <div className="inline-error" role="alert">{actionError}</div>}
+      {!responses.length ? (
+        <div className="model-response-empty">
+          <strong>{resultsRoot ? "当前样本没有匹配到模型回答" : "尚未导入模型推理结果"}</strong>
+          <p>{resultsRoot ? "请检查结果文件中的任务名、样本序号或样本ID是否与TSRBench一致。" : "在连接设置中填写服务器上的推理结果根路径，然后扫描即可。"}</p>
+          <button type="button" onClick={onOpenSettings}>{resultsRoot ? "检查结果路径" : "配置结果路径"}</button>
+        </div>
+      ) : filtered.length ? (
+        <div className="model-response-grid">
+          {filtered.map((item) => {
+            const translationKey = `model:${item.run_id}`;
+            return (
+              <ModelResponseCard
+                key={item.run_id}
+                item={item}
+                translated={translations[translationKey]}
+                translating={translationBusyKey === translationKey}
+                badcaseBusy={badcaseBusyRun === item.run_id}
+                onTranslate={() => onTranslate(item)}
+                onNextBadcase={() => onNextBadcase(item.run_id)}
+              />
+            );
+          })}
+        </div>
+      ) : (
+        <div className="model-response-empty" role="status">
+          <strong>当前筛选没有模型回答</strong>
+          <p>切换到“全部”可查看其他状态。</p>
+          <button type="button" onClick={() => onFilterChange("all")}>显示全部</button>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function HumanReviewCard({
+  review,
+  total,
+  saving,
+  error,
+  statusMessage,
+  autoAdvance,
+  annotator,
+  nextBusy,
+  onLabel,
+  onAutoAdvanceChange,
+  onNextUnlabeled,
+  onExport,
+}: {
+  review: HumanReview | null | undefined;
+  total: number;
+  saving: HumanLabel | "clear" | null;
+  error: string | null;
+  statusMessage: string;
+  autoAdvance: boolean;
+  annotator: string;
+  nextBusy: boolean;
+  onLabel: (label: HumanLabel | null) => void;
+  onAutoAdvanceChange: (value: boolean) => void;
+  onNextUnlabeled: () => void;
+  onExport: () => void;
+}) {
+  const label = review?.label ?? review?.verdict ?? null;
+  const progress = review?.progress || { total, labeled: 0, good: 0, bad: 0, remaining: total };
+  const progressTotal = progress.total || total;
+  const percent = percentOf({ ...progress, total: progressTotal });
+
+  return (
+    <section className="rail-card human-review-card" aria-labelledby="human-review-title" aria-busy={saving !== null}>
+      <div className="rail-card__heading">
+        <span id="human-review-title">人工质量复核</span>
+        <small>{label ? "已标注" : "未标注"}</small>
+      </div>
+
+      <fieldset className="human-review-fieldset" disabled={saving !== null || nextBusy}>
+        <legend>这条训练样本是否适合用于训练？</legend>
+        <div className="human-review-actions">
+          <button type="button" className={`human-label-button human-label-button--good ${label === "good" ? "selected" : ""}`} aria-pressed={label === "good"} onClick={() => onLabel("good")}>
+            <span aria-hidden="true">✓</span><strong>{saving === "good" ? "保存中…" : "好"}</strong><kbd>G</kbd>
+          </button>
+          <button type="button" className={`human-label-button human-label-button--bad ${label === "bad" ? "selected" : ""}`} aria-pressed={label === "bad"} onClick={() => onLabel("bad")}>
+            <span aria-hidden="true">×</span><strong>{saving === "bad" ? "保存中…" : "不好"}</strong><kbd>B</kbd>
+          </button>
+        </div>
+      </fieldset>
+
+      {review?.stale && <div className="human-review-warning">原数据已变化，这条旧标注需要重新确认。</div>}
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      <div className="sr-live" role="status" aria-live="polite">{statusMessage}</div>
+
+      <div className="human-review-progress">
+        <div><span>数据集进度</span><strong>{percent.toFixed(1)}%</strong></div>
+        <progress value={progress.labeled} max={Math.max(1, progressTotal)} aria-label={`人工复核进度 ${progress.labeled} / ${progressTotal}`} />
+        <p>已标 {formatNumber(progress.labeled)} / {formatNumber(progressTotal)} · 好 {formatNumber(progress.good)} · 不好 {formatNumber(progress.bad)}</p>
+      </div>
+
+      <label className="switch-label human-review-auto">
+        <input type="checkbox" checked={autoAdvance} onChange={(event) => onAutoAdvanceChange(event.target.checked)} />
+        标注后自动跳到下一条未标注样本
+      </label>
+      {annotator && <div className="human-review-annotator">标注者：{annotator}</div>}
+
+      <div className="human-review-tools">
+        <button type="button" onClick={onNextUnlabeled} disabled={saving !== null || nextBusy}>{nextBusy ? "查找中…" : "下一条未标注"}</button>
+        <button type="button" onClick={onExport}>导出标注</button>
+        {label && <button type="button" onClick={() => onLabel(null)} disabled={saving !== null}>清除本条</button>}
+      </div>
+    </section>
+  );
+}
+
 export default function Home() {
   const { apiBase, saveApiBase } = useApiBase();
   const [datasets, setDatasets] = useState<Dataset[]>([]);
@@ -481,7 +829,7 @@ export default function Home() {
   const [members, setMembers] = useState<MembersPayload | null>(null);
   const [memberPage, setMemberPage] = useState(0);
   const [translations, setTranslations] = useState<Translation>({});
-  const [translationBusy, setTranslationBusy] = useState<"input" | "output" | "both" | null>(null);
+  const [translationBusyKey, setTranslationBusyKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -492,14 +840,41 @@ export default function Home() {
   const [serverOk, setServerOk] = useState(false);
   const [qwenModel, setQwenModel] = useState("");
   const [tsrbenchStatus, setTsrbenchStatus] = useState<TsrbenchStatus | null>(null);
+  const [evaluation, setEvaluation] = useState<EvaluationStatus | null>(null);
+  const [resultsRootDraft, setResultsRootDraft] = useState("");
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanMessage, setScanMessage] = useState("");
+  const [modelResponseFilter, setModelResponseFilter] = useState<ModelResponseFilter>("all");
+  const [modelResponseError, setModelResponseError] = useState<string | null>(null);
+  const [badcaseBusyRun, setBadcaseBusyRun] = useState<string | null>(null);
+  const [labelSaving, setLabelSaving] = useState<HumanLabel | "clear" | null>(null);
+  const [labelError, setLabelError] = useState<string | null>(null);
+  const [labelStatus, setLabelStatus] = useState("");
+  const [nextUnlabeledBusy, setNextUnlabeledBusy] = useState(false);
+  const [autoAdvance, setAutoAdvanceState] = useState(() => {
+    if (typeof window === "undefined") return true;
+    return window.localStorage.getItem("tsqa-lens-auto-advance") !== "false";
+  });
+  const [annotator, setAnnotator] = useState(() => {
+    if (typeof window === "undefined") return "human";
+    return window.localStorage.getItem("tsqa-lens-annotator") || "human";
+  });
+  const [annotatorDraft, setAnnotatorDraft] = useState("human");
   const [activeTab, setActiveTab] = useState<"record" | "template" | "raw">("record");
+  const settingsFirstInputRef = useRef<HTMLInputElement>(null);
+  const settingsModalRef = useRef<HTMLDivElement>(null);
+  const settingsTriggerRef = useRef<HTMLButtonElement>(null);
 
-  const loadDatasets = useCallback(async () => {
+  const loadDatasets = useCallback(async (baseOverride?: string) => {
     try {
-      const payload = await apiJson<{ datasets: Dataset[]; qwen: { model: string }; tsrbench: TsrbenchStatus }>(`${apiBase}/api/datasets`);
+      const base = baseOverride || apiBase;
+      const payload = await apiJson<{ datasets: Dataset[]; qwen: { model: string }; tsrbench: TsrbenchStatus; evaluation?: EvaluationStatus | null }>(`${base}/api/datasets`);
       setDatasets(payload.datasets);
       setQwenModel(payload.qwen.model || "");
       setTsrbenchStatus(payload.tsrbench);
+      setEvaluation(payload.evaluation || null);
+      if (payload.evaluation?.results_root) setResultsRootDraft(payload.evaluation.results_root);
       setServerOk(true);
       setError(null);
       setDatasetName((current) => payload.datasets.some((item) => item.name === current)
@@ -521,6 +896,10 @@ export default function Home() {
       setRecord(payload);
       setJumpValue(String(payload.index + 1));
       setTranslations({});
+      setModelResponseFilter("all");
+      setModelResponseError(null);
+      setLabelError(null);
+      setLabelStatus("");
       setMemberPage(0);
       setServerOk(true);
     } catch (exception) {
@@ -550,18 +929,71 @@ export default function Home() {
   }, [record, activeTab, memberPage, apiBase]);
 
   useEffect(() => {
+    if (!settingsOpen) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const frame = window.requestAnimationFrame(() => settingsFirstInputRef.current?.focus());
+    const handleDialogKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSettingsOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || !settingsModalRef.current) return;
+      const focusable = Array.from(settingsModalRef.current.querySelectorAll<HTMLElement>(
+        "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href]",
+      ));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleDialogKey);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", handleDialogKey);
+      previousFocus?.focus();
+    };
+  }, [settingsOpen]);
+
+  useEffect(() => {
     const handler = (event: KeyboardEvent) => {
-      if (!record || event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
-      if (event.key === "ArrowLeft") loadRecord(record.dataset, Math.max(0, record.index - 1));
-      if (event.key === "ArrowRight") loadRecord(record.dataset, Math.min(record.dataset_total - 1, record.index + 1));
-      if (event.key.toLowerCase() === "r") void randomRecord();
-      if (event.key.toLowerCase() === "t") setActiveTab("template");
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      const editing = target?.closest("input, textarea, select, button, a, [contenteditable='true']");
+      if (!record || editing || settingsOpen || loading || labelSaving || event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      const trainingRecord = record.human_review?.editable === true;
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        void loadRecord(record.dataset, Math.max(0, record.index - 1));
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        void loadRecord(record.dataset, Math.min(record.dataset_total - 1, record.index + 1));
+      }
+      if (key === "r") void randomRecord();
+      if (key === "t") setActiveTab("template");
+      if (trainingRecord && key === "g") {
+        event.preventDefault();
+        void labelCurrentRecord("good");
+      }
+      if (trainingRecord && key === "b") {
+        event.preventDefault();
+        void labelCurrentRecord("bad");
+      }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   });
 
   const selectedDataset = datasets.find((item) => item.name === datasetName);
+  const isBenchmarkRecord = record?.schema === "tsrbench";
+  const isTrainingRecord = record?.human_review?.editable === true;
+  const reviewProgress = record?.human_review?.progress || selectedDataset?.human_review || null;
   const filteredDatasets = useMemo(() => datasets.filter((dataset) => {
     const familyMatch = familyFilter === "all"
       || (familyFilter === "opentslm" && dataset.name.startsWith("opentslm_"))
@@ -594,7 +1026,7 @@ export default function Home() {
 
   async function translate(which: "input" | "output" | "both") {
     if (!record) return;
-    setTranslationBusy(which);
+    setTranslationBusyKey(which);
     setError(null);
     const texts: Record<string, string> = {};
     if (which === "input" || which === "both") {
@@ -612,7 +1044,180 @@ export default function Home() {
     } catch (exception) {
       setError(exception instanceof Error ? exception.message : String(exception));
     } finally {
-      setTranslationBusy(null);
+      setTranslationBusyKey(null);
+    }
+  }
+
+  async function translateModelResponse(item: ModelResponse) {
+    const response = item.response || item.raw_response || "";
+    if (!response) return;
+    const translationKey = `model:${item.run_id}`;
+    setTranslationBusyKey(translationKey);
+    setModelResponseError(null);
+    try {
+      const payload = await apiJson<{ translations: Translation }>(`${apiBase}/api/translate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texts: { [translationKey]: response } }),
+      });
+      setTranslations((current) => ({ ...current, ...payload.translations }));
+    } catch (exception) {
+      setModelResponseError(exception instanceof Error ? exception.message : String(exception));
+    } finally {
+      setTranslationBusyKey(null);
+    }
+  }
+
+  async function nextBadcase(runId: string) {
+    if (!record) return;
+    setBadcaseBusyRun(runId);
+    setModelResponseError(null);
+    try {
+      const payload = await apiJson<{ index?: number; next_index?: number; complete?: boolean; message?: string }>(
+        `${apiBase}/api/model-results/badcase?dataset=${encodeURIComponent(record.dataset)}&run_id=${encodeURIComponent(runId)}&after=${record.index}`,
+      );
+      const nextIndex = payload.index ?? payload.next_index;
+      if (typeof nextIndex !== "number") {
+        setModelResponseError(payload.message || "这个模型没有更多 badcase。");
+        return;
+      }
+      await loadRecord(record.dataset, nextIndex);
+    } catch (exception) {
+      setModelResponseError(exception instanceof Error ? exception.message : String(exception));
+    } finally {
+      setBadcaseBusyRun(null);
+    }
+  }
+
+  function setAutoAdvance(value: boolean) {
+    window.localStorage.setItem("tsqa-lens-auto-advance", String(value));
+    setAutoAdvanceState(value);
+  }
+
+  async function goToNextUnlabeled(dataset: string, after: number) {
+    setNextUnlabeledBusy(true);
+    setLabelError(null);
+    try {
+      const payload = await apiJson<{ index?: number; next_index?: number; complete?: boolean; message?: string }>(
+        `${apiBase}/api/human-labels/next?dataset=${encodeURIComponent(dataset)}&after=${after}`,
+      );
+      const nextIndex = payload.index ?? payload.next_index;
+      if (typeof nextIndex !== "number") {
+        setLabelStatus(payload.message || "当前数据集已全部标注完成。");
+        return;
+      }
+      await loadRecord(dataset, nextIndex);
+    } catch (exception) {
+      setLabelError(exception instanceof Error ? exception.message : String(exception));
+    } finally {
+      setNextUnlabeledBusy(false);
+    }
+  }
+
+  async function labelCurrentRecord(label: HumanLabel | null) {
+    if (!record || record.human_review?.editable !== true) return;
+    const currentDataset = record.dataset;
+    const currentIndex = record.index;
+    const busyValue = label || "clear";
+    setLabelSaving(busyValue);
+    setLabelError(null);
+    setLabelStatus("");
+    try {
+      const payload = await apiJson<{
+        human_review?: HumanReview;
+        review?: HumanReview;
+        progress?: HumanReviewProgress;
+        label?: HumanLabel | null;
+        revision?: number;
+      }>(`${apiBase}/api/human-label`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dataset: currentDataset,
+          index: currentIndex,
+          label,
+          annotator: annotator.trim() || "human",
+          expected_revision: record.human_review?.revision ?? undefined,
+        }),
+      });
+      const updatedReview = payload.human_review || payload.review || {
+        ...(record.human_review || { progress: payload.progress || { total: record.dataset_total, labeled: 0, good: 0, bad: 0, remaining: record.dataset_total } }),
+        label: payload.label ?? label,
+        revision: payload.revision ?? record.human_review?.revision,
+        progress: payload.progress || record.human_review?.progress || { total: record.dataset_total, labeled: 0, good: 0, bad: 0, remaining: record.dataset_total },
+      };
+      setRecord((current) => current && current.dataset === currentDataset && current.index === currentIndex
+        ? { ...current, human_review: updatedReview }
+        : current);
+      setDatasets((current) => current.map((dataset) => dataset.name === currentDataset
+        ? { ...dataset, human_review: updatedReview.progress }
+        : dataset));
+      setLabelStatus(label ? `第 ${currentIndex + 1} 条已标注为${label === "good" ? "好" : "不好"}。` : `第 ${currentIndex + 1} 条标注已清除。`);
+      if (label && autoAdvance) await goToNextUnlabeled(currentDataset, currentIndex);
+    } catch (exception) {
+      setLabelError(exception instanceof Error ? exception.message : String(exception));
+    } finally {
+      setLabelSaving(null);
+    }
+  }
+
+  function exportHumanLabels() {
+    if (!record) return;
+    const link = document.createElement("a");
+    link.href = `${apiBase}/api/human-labels/export?dataset=${encodeURIComponent(record.dataset)}`;
+    link.download = `${record.dataset}.human-labels.jsonl`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setLabelStatus("正在导出当前数据集的人工标注。");
+  }
+
+  function openSettings() {
+    setApiDraft(apiBase);
+    setResultsRootDraft(evaluation?.results_root || "");
+    setAnnotatorDraft(annotator);
+    setScanError(null);
+    setScanMessage("");
+    setSettingsOpen(true);
+  }
+
+  function saveConnectionSettings() {
+    const nextAnnotator = annotatorDraft.trim() || "human";
+    window.localStorage.setItem("tsqa-lens-annotator", nextAnnotator);
+    setAnnotator(nextAnnotator);
+    saveApiBase(apiDraft);
+    setSettingsOpen(false);
+  }
+
+  async function configureAndScanModelResults() {
+    const root = resultsRootDraft.trim();
+    const nextBase = apiDraft.trim().replace(/\/$/, "");
+    if (!root) {
+      setScanError("请填写服务器上的模型推理结果根路径。");
+      return;
+    }
+    setScanBusy(true);
+    setScanError(null);
+    setScanMessage("正在扫描结果文件，请稍候…");
+    try {
+      saveApiBase(nextBase);
+      const nextAnnotator = annotatorDraft.trim() || "human";
+      window.localStorage.setItem("tsqa-lens-annotator", nextAnnotator);
+      setAnnotator(nextAnnotator);
+      await apiJson(`${nextBase}/api/model-results/configure`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root }),
+      });
+      await apiJson(`${nextBase}/api/model-results/refresh`, { method: "POST" });
+      await loadDatasets(nextBase);
+      setScanMessage("扫描完成。关闭设置后即可逐模型查看回答和 badcase。");
+      if (record?.schema === "tsrbench" && nextBase === apiBase) await loadRecord(record.dataset, record.index);
+    } catch (exception) {
+      setScanMessage("");
+      setScanError(exception instanceof Error ? exception.message : String(exception));
+    } finally {
+      setScanBusy(false);
     }
   }
 
@@ -670,14 +1275,20 @@ export default function Home() {
               <div className="dataset-item__meta">
                 <span>{formatNumber(dataset.rows)} 条</span>
                 <span>{formatNumber(dataset.templates)} 模板</span>
-                <span>{dataset.compression_ratio ? `${dataset.compression_ratio.toFixed(dataset.compression_ratio > 100 ? 0 : 1)}×` : "—"}</span>
+                <span>{dataset.schema === "tsrbench"
+                  ? `${formatNumber(dataset.model_runs)} 模型`
+                  : dataset.split === "train" && dataset.human_review
+                    ? `${percentOf(dataset.human_review).toFixed(0)}% 复核`
+                    : dataset.compression_ratio
+                      ? `${dataset.compression_ratio.toFixed(dataset.compression_ratio > 100 ? 0 : 1)}×`
+                      : "—"}</span>
               </div>
             </button>
           ))}
         </nav>
 
         <div className="sidebar-footer">
-          <button type="button" className="server-card" onClick={() => { setApiDraft(apiBase); setSettingsOpen(true); }}>
+          <button ref={settingsTriggerRef} type="button" className="server-card" onClick={openSettings}>
             <StatusDot ok={serverOk} />
             <div><strong>{serverOk ? "本地服务已连接" : "等待本地服务"}</strong><span>{qwenModel ? shortText(qwenModel.split("/").pop() || qwenModel, 28) : "配置Qwen翻译"}</span></div>
             <span aria-hidden="true">›</span>
@@ -697,6 +1308,8 @@ export default function Home() {
               <span>{formatNumber(selectedDataset?.rows)} 条QA</span>
               <span>·</span>
               <span>{formatNumber(selectedDataset?.templates)} 个问题模板</span>
+              {selectedDataset?.schema === "tsrbench" && <><span>·</span><span>{formatNumber(selectedDataset.model_runs)} 个模型运行</span></>}
+              {selectedDataset?.split === "train" && reviewProgress && <><span>·</span><span>人工复核 {percentOf(reviewProgress).toFixed(1)}%</span></>}
             </div>
           </div>
 
@@ -709,6 +1322,7 @@ export default function Home() {
             <button type="button" className="square-button" aria-label="上一条" disabled={!record || record.index === 0} onClick={() => record && loadRecord(record.dataset, record.index - 1)}>←</button>
             <button type="button" className="square-button" aria-label="下一条" disabled={!record || record.index >= record.dataset_total - 1} onClick={() => record && loadRecord(record.dataset, record.index + 1)}>→</button>
             <button type="button" className="primary-button" onClick={() => randomRecord()}><span aria-hidden="true">↝</span> 随机抽样</button>
+            <button type="button" className="square-button" aria-label="连接与推理结果设置" onClick={openSettings}>⚙</button>
           </div>
         </header>
 
@@ -722,8 +1336,8 @@ export default function Home() {
               <span aria-hidden="true">!</span> {ISSUE_LABELS[issue]?.title || issue}
             </button>
           ))}
-          <button type="button" className="translate-all" onClick={() => translate("both")} disabled={!record || translationBusy !== null}>
-            {translationBusy === "both" ? "Qwen翻译中…" : "中译问题与答案"}
+          <button type="button" className="translate-all" onClick={() => translate("both")} disabled={!record || translationBusyKey !== null}>
+            {translationBusyKey === "both" ? "Qwen翻译中…" : "中译问题与答案"}
           </button>
         </div>
 
@@ -758,7 +1372,7 @@ export default function Home() {
                   title="问题与指令"
                   original={record.input}
                   translated={translations.input}
-                  translating={translationBusy === "input" || translationBusy === "both"}
+                  translating={translationBusyKey === "input" || translationBusyKey === "both"}
                   onTranslate={() => translate("input")}
                   accent="question"
                 />
@@ -768,13 +1382,44 @@ export default function Home() {
                   title="参考答案"
                   original={record.output}
                   translated={translations.output}
-                  translating={translationBusy === "output" || translationBusy === "both"}
+                  translating={translationBusyKey === "output" || translationBusyKey === "both"}
                   onTranslate={() => translate("output")}
                   accent="answer"
                 />
+                {isBenchmarkRecord && (
+                  <ModelResponsesPanel
+                    responses={record.model_responses || []}
+                    filter={modelResponseFilter}
+                    onFilterChange={setModelResponseFilter}
+                    translations={translations}
+                    translationBusyKey={translationBusyKey}
+                    badcaseBusyRun={badcaseBusyRun}
+                    actionError={modelResponseError}
+                    resultsRoot={evaluation?.results_root || null}
+                    onTranslate={translateModelResponse}
+                    onNextBadcase={nextBadcase}
+                    onOpenSettings={openSettings}
+                  />
+                )}
               </div>
 
               <aside className="inspection-rail">
+                {isTrainingRecord && (
+                  <HumanReviewCard
+                    review={record.human_review}
+                    total={record.dataset_total}
+                    saving={labelSaving}
+                    error={labelError}
+                    statusMessage={labelStatus}
+                    autoAdvance={autoAdvance}
+                    annotator={annotator}
+                    nextBusy={nextUnlabeledBusy}
+                    onLabel={(label) => void labelCurrentRecord(label)}
+                    onAutoAdvanceChange={setAutoAdvance}
+                    onNextUnlabeled={() => void goToNextUnlabeled(record.dataset, record.index)}
+                    onExport={exportHumanLabels}
+                  />
+                )}
                 <section className="rail-card">
                   <div className="rail-card__heading"><span>样本标签</span><small>#{record.index + 1}</small></div>
                   <MetadataGrid record={record} />
@@ -897,13 +1542,38 @@ export default function Home() {
 
       {settingsOpen && (
         <div className="modal-backdrop">
-          <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <div className="settings-modal__head"><div><span className="eyebrow">CONNECTION</span><h2 id="settings-title">本地数据服务</h2></div><button aria-label="关闭" onClick={() => setSettingsOpen(false)}>×</button></div>
-            <p>前端只读取这个地址。Qwen地址、模型名和密钥保存在服务端配置中，不会发送到浏览器。</p>
-            <label><span>API地址</span><input value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} placeholder="http://localhost:8765" /></label>
-            <div className="settings-status"><StatusDot ok={serverOk} /><span>{serverOk ? "已连接" : "未连接"}</span>{qwenModel && <code>{qwenModel}</code>}</div>
-            <div className="settings-modal__actions"><button onClick={() => setSettingsOpen(false)}>取消</button><button className="primary-button" onClick={() => { saveApiBase(apiDraft); setSettingsOpen(false); }}>保存并连接</button></div>
-          </section>
+          <div ref={settingsModalRef} className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-describedby="settings-description">
+            <div className="settings-modal__head"><div><span className="eyebrow">CONNECTION & RESULTS</span><h2 id="settings-title">数据服务与推理结果</h2></div><button type="button" aria-label="关闭" onClick={() => setSettingsOpen(false)}>×</button></div>
+            <p id="settings-description">路径均由服务器读取。Qwen地址、模型名和密钥保存在服务端，不会发送到浏览器。</p>
+
+            <div className="settings-fields">
+              <label><span>API地址</span><input ref={settingsFirstInputRef} value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} placeholder="http://localhost:8765" /></label>
+              <label><span>标注者名称</span><input value={annotatorDraft} onChange={(event) => setAnnotatorDraft(event.target.value)} placeholder="例如 wang17" /></label>
+              <label className="settings-field--wide"><span>服务器推理结果根路径</span><input value={resultsRootDraft} onChange={(event) => setResultsRootDraft(event.target.value)} placeholder="/workspace/model_outputs" /></label>
+            </div>
+
+            <div className="settings-status"><StatusDot ok={serverOk} /><span>{serverOk ? "数据服务已连接" : "数据服务未连接"}</span>{qwenModel && <code>{qwenModel}</code>}</div>
+            <div className="results-scan-card" aria-busy={scanBusy}>
+              <div className="results-scan-card__head">
+                <div><strong>模型推理结果</strong><span>{evaluation?.scanned_at ? `最近扫描 ${evaluation.scanned_at}` : "尚未扫描"}</span></div>
+                <Pill tone={evaluation?.runs?.length ? "green" : "neutral"}>{formatNumber(evaluation?.runs?.length)} 个运行</Pill>
+              </div>
+              {evaluation?.runs?.length ? (
+                <div className="results-run-list">
+                  {evaluation.runs.slice(0, 6).map((run) => (
+                    <div key={run.run_id}><strong>{run.display_name || run.model_name || run.run_id}</strong><code>{run.run_id}</code></div>
+                  ))}
+                  {evaluation.runs.length > 6 && <small>另有 {evaluation.runs.length - 6} 个运行</small>}
+                </div>
+              ) : <p>扫描后会按运行/模型建立索引，并把回答挂到对应的TSRBench样本下。</p>}
+              {(scanError || evaluation?.error) && <div className="inline-error" role="alert">{scanError || evaluation?.error}</div>}
+              {scanMessage && <div className="scan-message" role="status" aria-live="polite">{scanMessage}</div>}
+              <button type="button" className="scan-button" onClick={() => void configureAndScanModelResults()} disabled={scanBusy || !resultsRootDraft.trim()}>
+                {scanBusy ? "正在保存并扫描…" : "保存路径并扫描"}
+              </button>
+            </div>
+            <div className="settings-modal__actions"><button type="button" onClick={() => setSettingsOpen(false)}>取消</button><button type="button" className="primary-button" onClick={saveConnectionSettings}>保存连接设置</button></div>
+          </div>
         </div>
       )}
     </main>

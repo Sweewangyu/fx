@@ -29,13 +29,24 @@ test("server-renders the TSQA inspection shell", async () => {
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/);
 });
 
-test("source wires record, template and Qwen translation APIs", async () => {
+test("source wires inspection, model-result and human-review APIs", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const config = await readFile(new URL("../inspector_config.yaml", import.meta.url), "utf8");
 
   assert.match(page, /\/api\/record\?dataset=/);
   assert.match(page, /\/api\/template-members\?dataset=/);
   assert.match(page, /\/api\/translate/);
+  assert.match(page, /\/api\/model-results\/configure/);
+  assert.match(page, /\/api\/model-results\/refresh/);
+  assert.match(page, /\/api\/model-results\/badcase\?dataset=/);
+  assert.match(page, /\/api\/human-label["`]/);
+  assert.match(page, /\/api\/human-labels\/next\?dataset=/);
+  assert.match(page, /\/api\/human-labels\/export\?dataset=/);
+  assert.match(page, /model_responses/);
+  assert.match(page, /human_review/);
+  assert.match(page, /模型推理结果/);
+  assert.match(page, /人工质量复核/);
+  assert.match(page, /event\.key\.toLowerCase\(\)/);
   assert.match(page, /choice_\$\{label\}/);
   assert.match(page, /<SeriesChart/);
   assert.match(config, /Qwen3\.6-27B/);
