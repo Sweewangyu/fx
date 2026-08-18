@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -20,6 +21,9 @@ from .models import StudioError
 from .slurm import resolve_slurm_launcher, slurm_readiness
 
 BENCHMARKS = ("tsrbench", "tinybenchmarks", "ts_haystack", "timeseriesexam")
+MAX_EVALUATION_MODELS = 64
+EVALUATION_SBATCH_MARKER = "# CHATTS_STUDIO_EVALUATION_SBATCH_API=1"
+DEFAULT_EVALUATION_SBATCH_NAME = "run_chatts_studio_evaluation.sbatch"
 SCHEDULERS = ("cosine", "linear", "constant", "constant_with_warmup")
 MIX_STRATEGIES = ("concat", "interleave_under", "interleave_over")
 
@@ -244,6 +248,40 @@ def _user_posix_absolute_path(value: Any, field: str) -> str:
     if not PurePosixPath(value).is_absolute():
         raise StudioError(f"{field} must be a non-empty absolute POSIX path")
     return value
+
+
+def _standalone_model_paths(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        raise StudioError("model_paths must be a list of absolute POSIX paths")
+    if not value:
+        raise StudioError("model_paths must contain at least one model path")
+    if len(value) > MAX_EVALUATION_MODELS:
+        raise StudioError(
+            f"model_paths accepts at most {MAX_EVALUATION_MODELS} paths per batch"
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(value):
+        field = f"model_paths[{index}]"
+        path = _user_posix_absolute_path(raw, field)
+        if path == "/" or path.endswith("/"):
+            raise StudioError(f"{field} must name a model directory, without a trailing slash")
+        raw_parts = path.split("/")
+        if any(part in {".", ".."} for part in raw_parts):
+            raise StudioError(f"{field} must not contain . or .. path components")
+        canonical = posixpath.normpath(path)
+        if canonical not in seen:
+            seen.add(canonical)
+            result.append(canonical)
+    return result
+
+
+def _standalone_model_name(model_path: str) -> str:
+    basename = PurePosixPath(model_path).name
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", basename).strip("._-")
+    slug = slug[:80].rstrip("._-") or "model"
+    path_hash = hashlib.sha256(model_path.encode("utf-8")).hexdigest()[:12]
+    return f"{slug}-{path_hash}"
 
 
 def _version_record_fields(record: dict[str, Any]) -> tuple[str, str, dict[str, list[str]]]:
@@ -570,6 +608,202 @@ def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) ->
     return result
 
 
+def _evaluation_slurm_integration(integration: dict[str, Any]) -> dict[str, Any]:
+    result = dict(integration)
+    result["slurm_sbatch"] = integration.get(
+        "slurm_evaluation_sbatch", DEFAULT_EVALUATION_SBATCH_NAME
+    )
+    return result
+
+
+def _evaluation_pipeline_script(integration: dict[str, Any]) -> str | None:
+    value = integration.get("evaluation_pipeline_script")
+    if isinstance(value, str) and value:
+        return value
+    evaluation_root = integration.get("evaluation_root")
+    if isinstance(evaluation_root, str) and evaluation_root:
+        return str(Path(evaluation_root) / "scripts" / "run_eval_only.sh")
+    return None
+
+
+def _resolve_evaluation_slurm_launcher(
+    integration: dict[str, Any], requested: Any = None
+) -> dict[str, Any]:
+    launcher = resolve_slurm_launcher(
+        _evaluation_slurm_integration(integration), requested
+    )
+    try:
+        header = Path(launcher["path"]).read_bytes()[:8192].decode(
+            "utf-8", errors="replace"
+        )
+    except OSError as exc:
+        raise StudioError(f"Cannot read trusted evaluation Slurm launcher: {exc}") from exc
+    if EVALUATION_SBATCH_MARKER not in header.splitlines():
+        raise StudioError(
+            "Slurm launcher does not implement the standalone evaluation contract: "
+            f"{launcher['path']}"
+        )
+    return launcher
+
+
+def resolve_evaluation_requests(
+    payload: dict[str, Any], integration: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Resolve one immutable standalone-evaluation job per unique model path."""
+
+    allowed_root = {"model_paths", "evaluation", "execution"}
+    unknown_root = sorted(set(payload) - allowed_root)
+    if unknown_root:
+        raise StudioError(f"Unknown standalone evaluation fields: {unknown_root}")
+    model_paths = _standalone_model_paths(payload.get("model_paths"))
+    evaluation_request = _mapping(payload.get("evaluation"), "evaluation")
+    execution_request = _mapping(payload.get("execution"), "execution")
+    _reject_unknown(evaluation_request, _EVALUATION_KEYS, "evaluation")
+    _reject_unknown(execution_request, _EXECUTION_KEYS, "execution")
+
+    backend = execution_request.get(
+        "backend", integration.get("execution_mode", "docker_host")
+    )
+    if backend not in {"docker_host", "slurm"}:
+        raise StudioError("execution.backend must be docker_host or slurm")
+    execution: dict[str, Any] = {"backend": backend}
+    if backend == "docker_host":
+        script_value = _evaluation_pipeline_script(integration)
+        if not isinstance(script_value, str) or not script_value:
+            raise StudioError(
+                "Missing server integration setting: evaluation_pipeline_script"
+            )
+        script_path = Path(script_value).expanduser().resolve()
+        execution.update(
+            {
+                "pipeline_script": str(script_path),
+                "execution_root": str(script_path.parent.parent),
+            }
+        )
+    else:
+        launcher = _resolve_evaluation_slurm_launcher(
+            integration, execution_request.get("sbatch_path")
+        )
+        execution.update(
+            {
+                "sbatch_path": launcher["path"],
+                "sbatch_relative_path": launcher["relative_path"],
+                "sbatch_sha256": launcher["sha256"],
+                "execution_root": str(Path(launcher["root"]).parent),
+            }
+        )
+
+    evaluation = _resolve_evaluation(evaluation_request, integration)
+    pipeline_config = {
+        "task_type": "standalone_evaluation",
+        "seed": 42,
+        "force_eval": _as_bool(
+            evaluation_request.get("force_eval", False), "evaluation.force_eval"
+        ),
+        "preflight_only": False,
+        "max_samples": _as_int(
+            evaluation_request.get("max_samples", 0), "evaluation.max_samples"
+        ),
+        "offline": _as_bool(
+            evaluation_request.get("offline", True), "evaluation.offline"
+        ),
+    }
+    evaluation_protocol = dict(evaluation)
+    evaluation_protocol.pop("protocol_hash", None)
+    computed_protocol_hash = _hash(
+        {
+            "schema_version": "chatts-evaluation-protocol-v1",
+            "evaluation": evaluation_protocol,
+            "max_samples": pipeline_config["max_samples"],
+            "offline": pipeline_config["offline"],
+        }
+    )
+    supplied_protocol_hash = evaluation_request.get("protocol_hash")
+    if (
+        supplied_protocol_hash not in (None, "")
+        and str(supplied_protocol_hash).lower() != computed_protocol_hash
+    ):
+        raise StudioError(
+            "evaluation.protocol_hash is an expected hash and does not match "
+            "the server-resolved evaluation protocol"
+        )
+    evaluation["protocol_hash"] = computed_protocol_hash
+    protocol_id = f"protocol-{computed_protocol_hash[:16]}"
+
+    eval_output_base = integration.get("evaluation_output_base")
+    if not isinstance(eval_output_base, str) or not eval_output_base:
+        raise StudioError("Missing server integration setting: evaluation_output_base")
+    supplied_output = evaluation_request.get("output_root")
+    supplied_model = evaluation_request.get("model_path")
+    resolved: list[dict[str, Any]] = []
+    for model_path in model_paths:
+        model_name = _standalone_model_name(model_path)
+        output_root = (
+            f"{eval_output_base.rstrip('/')}/{model_name}/{protocol_id}"
+        )
+        if supplied_output not in (None, "", output_root):
+            raise StudioError(
+                "evaluation.output_root is derived from model path and protocol "
+                "and cannot be changed"
+            )
+        if supplied_model not in (None, "", model_path):
+            raise StudioError(
+                "evaluation.model_path must be supplied through model_paths"
+            )
+        run_id = f"{model_name}-{protocol_id}-eval"
+        config: dict[str, Any] = {
+            "pipeline": dict(pipeline_config),
+            "containers": {
+                "evaluation": integration.get("evaluation_container", "ragas")
+            },
+            "evaluation": {
+                **evaluation,
+                "model_path": model_path,
+                "model_name": model_name,
+                "output_root": output_root,
+                "run_id": run_id,
+            },
+            "slurm": {},
+        }
+        if backend == "slurm":
+            slurm_paths = {
+                "evaluation_host_root": integration.get("slurm_evaluation_root")
+                or integration.get("evaluation_root"),
+                "evaluation_sif_image": integration.get("slurm_evaluation_sif_image"),
+                "chronos2_host_root": integration.get("slurm_chronos2_host_root"),
+                "tsrbench_host_root": integration.get("slurm_tsrbench_host_root"),
+                "tinybench_host_root": integration.get("slurm_tinybench_host_root"),
+                "ts_haystack_host_root": integration.get(
+                    "slurm_ts_haystack_host_root"
+                ),
+                "timeseriesexam_host_root": integration.get(
+                    "slurm_timeseriesexam_host_root"
+                ),
+            }
+            config["slurm"] = {
+                key: str(Path(str(value)).expanduser().resolve())
+                for key, value in slurm_paths.items()
+                if value not in (None, "")
+            }
+        result = {
+            "schema_version": "chatts-dataset-studio-evaluation-v1",
+            "mode": "evaluate",
+            "task_type": "standalone_evaluation",
+            "execution": dict(execution),
+            "config": config,
+            "derived": {
+                "model_path": model_path,
+                "model_name": model_name,
+                "evaluation_output_root": output_root,
+                "evaluation_protocol_id": protocol_id,
+                "run_id": run_id,
+            },
+        }
+        result["config_hash"] = _hash(config)
+        resolved.append(result)
+    return resolved
+
+
 def _docker_readiness(integration: dict[str, Any], *, include_evaluation: bool) -> list[str]:
     reasons: list[str] = []
     if shutil.which("docker") is None:
@@ -650,12 +884,98 @@ def _slurm_profile_readiness(integration: dict[str, Any]) -> dict[str, Any]:
     return {**status, "enabled": not reasons, "disabled_reasons": reasons}
 
 
+def _standalone_evaluation_required_settings(
+    integration: dict[str, Any], reasons: list[str]
+) -> None:
+    for key in (
+        "evaluation_root",
+        "eval_project_root",
+        "evaluation_script",
+        "evaluation_output_base",
+        "eval_chronos2_model_path",
+        "tsrbench_root",
+        "tinybench_dataset_root",
+        "ts_haystack_root",
+        "timeseriesexam_root",
+        "timeseriesexam_data_file",
+    ):
+        value = integration.get(key)
+        if not isinstance(value, str) or not value:
+            reasons.append(f"integration.{key} is not configured")
+
+
+def _docker_evaluation_readiness(integration: dict[str, Any]) -> dict[str, Any]:
+    reasons: list[str] = []
+    if shutil.which("docker") is None:
+        reasons.append(
+            "Docker CLI is unavailable to Dataset Studio; run the Studio control plane "
+            "on the Docker host, not inside the evaluation container"
+        )
+    for key, kind, value in (
+        (
+            "evaluation_pipeline_script",
+            "file",
+            _evaluation_pipeline_script(integration),
+        ),
+        ("evaluation_root", "directory", integration.get("evaluation_root")),
+    ):
+        if not isinstance(value, str) or not value:
+            reasons.append(f"integration.{key} is not configured")
+            continue
+        path = Path(value).expanduser()
+        exists = path.is_file() if kind == "file" else path.is_dir()
+        if not exists:
+            reasons.append(
+                f"integration.{key} does not exist or is not a {kind}: {path}"
+            )
+    _standalone_evaluation_required_settings(integration, reasons)
+    return {"enabled": not reasons, "disabled_reasons": reasons}
+
+
+def _slurm_evaluation_readiness(integration: dict[str, Any]) -> dict[str, Any]:
+    evaluation_integration = _evaluation_slurm_integration(integration)
+    status = slurm_readiness(evaluation_integration)
+    reasons = list(status["disabled_reasons"])
+    launchers: list[dict[str, Any]] = []
+    for item in status.get("launchers", []):
+        relative = item.get("relative_path")
+        try:
+            launcher = _resolve_evaluation_slurm_launcher(integration, relative)
+        except StudioError:
+            continue
+        launchers.append(
+            {
+                "relative_path": launcher["relative_path"],
+                "sha256": launcher["sha256"],
+            }
+        )
+    default_sbatch: str | None = None
+    try:
+        default_sbatch = _resolve_evaluation_slurm_launcher(integration)[
+            "relative_path"
+        ]
+    except StudioError as exc:
+        message = str(exc)
+        if message not in reasons:
+            reasons.append(message)
+    _standalone_evaluation_required_settings(integration, reasons)
+    return {
+        **status,
+        "enabled": not reasons,
+        "disabled_reasons": reasons,
+        "launchers": launchers,
+        "default_sbatch": default_sbatch,
+    }
+
+
 def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
     """Return safe UI defaults and per-backend readiness information."""
     execution_mode = integration.get("execution_mode", "docker_host")
     docker_full_reasons = _docker_readiness(integration, include_evaluation=True)
     docker_stage1_reasons = _docker_readiness(integration, include_evaluation=True)
     slurm_status = _slurm_profile_readiness(integration)
+    evaluation_docker_status = _docker_evaluation_readiness(integration)
+    evaluation_slurm_status = _slurm_evaluation_readiness(integration)
     backend_status = {
         "docker_host": {
             "enabled": not docker_full_reasons,
@@ -700,6 +1020,19 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
         if isinstance(configured_model_output, str)
         else configured_model_output
     )
+    evaluation_backend_status = {
+        "docker_host": evaluation_docker_status,
+        "slurm": evaluation_slurm_status,
+    }
+    evaluation_default_status = evaluation_backend_status.get(execution_mode)
+    if evaluation_default_status is None:
+        evaluation_disabled_reasons = [
+            f"integration.execution_mode must be docker_host or slurm, got: {execution_mode}"
+        ]
+    else:
+        evaluation_disabled_reasons = list(
+            evaluation_default_status["disabled_reasons"]
+        )
     return {
         "training": {
             "profile": "chronos2-full",
@@ -733,6 +1066,17 @@ def public_pipeline_defaults(integration: dict[str, Any]) -> dict[str, Any]:
             "evaluation_root": integration.get("evaluation_root"),
             "training_container": integration.get("training_container", "chatts"),
             "evaluation_container": integration.get("evaluation_container", "ragas"),
+            "evaluation_only": {
+                "enabled": not evaluation_disabled_reasons,
+                "disabled_reasons": evaluation_disabled_reasons,
+                "execution_mode": execution_mode,
+                "backends": evaluation_backend_status,
+                "evaluation_container": integration.get(
+                    "evaluation_container", "ragas"
+                ),
+                "evaluation_root": integration.get("evaluation_root"),
+                "max_batch_models": MAX_EVALUATION_MODELS,
+            },
         },
     }
 
@@ -1092,6 +1436,17 @@ class PipelineJobs:
             Path(pipeline_script).expanduser().resolve() if pipeline_script else None
         )
         self.integration = dict(integration or {})
+        evaluation_pipeline_script = self.integration.get(
+            "evaluation_pipeline_script"
+        )
+        if not isinstance(evaluation_pipeline_script, str) or not evaluation_pipeline_script:
+            evaluation_pipeline_script = _evaluation_pipeline_script(self.integration)
+        self.evaluation_pipeline_script = (
+            Path(evaluation_pipeline_script).expanduser().resolve()
+            if isinstance(evaluation_pipeline_script, str)
+            and evaluation_pipeline_script
+            else None
+        )
         self.lock = threading.Lock()
         self.processes: dict[str, subprocess.Popen[bytes]] = {}
         self._recover()
@@ -1347,8 +1702,9 @@ class PipelineJobs:
         backend = job.get("execution_backend", "docker_host")
         execution_cwd = job.get("execution_cwd")
         if not isinstance(execution_cwd, str) or not execution_cwd:
-            if backend == "docker_host" and self.pipeline_script is not None:
-                execution_cwd = str(self.pipeline_script.parent.parent)
+            job_script = self._docker_script_for_job(job)
+            if backend == "docker_host" and job_script is not None:
+                execution_cwd = str(job_script.parent.parent)
             else:
                 raise StudioError("Queued job has no execution working directory")
         command = [
@@ -1366,14 +1722,15 @@ class PipelineJobs:
             execution_cwd,
         ]
         if backend == "docker_host":
-            if self.pipeline_script is None:
+            job_script = self._docker_script_for_job(job)
+            if job_script is None:
                 raise StudioError("One-click Docker pipeline is disabled")
             command.extend(
                 [
                     "--lock-path",
                     str(self.run_lock_path),
                     "--script",
-                    str(self.pipeline_script),
+                    str(job_script),
                 ]
             )
         elif backend == "slurm":
@@ -1396,17 +1753,24 @@ class PipelineJobs:
             scheduler_job_id = job.get("scheduler_job_id")
             if isinstance(scheduler_job_id, str):
                 command.extend(["--scheduler-job-id", scheduler_job_id])
-            if job.get("kind") == "preflight":
+            if job.get("kind") in {"preflight", "evaluation_preflight"}:
                 command.append("--slurm-preflight")
         else:
             raise StudioError(f"Unknown execution backend in queued job: {backend}")
         return command
 
+    def _docker_script_for_job(self, job: dict[str, Any]) -> Path | None:
+        value = job.get("pipeline_script_path")
+        if isinstance(value, str) and value:
+            return Path(value).expanduser().resolve()
+        return self.pipeline_script
+
     def _launch_locked(self, job: dict[str, Any]) -> bool:
         job_id = str(job["job_id"])
         backend = job.get("execution_backend", "docker_host")
+        docker_script = self._docker_script_for_job(job)
         if backend == "docker_host" and (
-            self.pipeline_script is None or not self.pipeline_script.is_file()
+            docker_script is None or not docker_script.is_file()
         ):
             job.update(
                 {
@@ -1479,8 +1843,8 @@ class PipelineJobs:
             execution_cwd = job.get("execution_cwd")
             if not isinstance(execution_cwd, str) or not execution_cwd:
                 execution_cwd = (
-                    str(self.pipeline_script.parent.parent)
-                    if self.pipeline_script is not None
+                    str(docker_script.parent.parent)
+                    if docker_script is not None
                     else str(self.state_root)
                 )
             with Path(str(job["log_path"])).open("wb") as log_stream:
@@ -1542,7 +1906,10 @@ class PipelineJobs:
             # Docker uses one shared pair of training/evaluation containers, so
             # it retains the durable local FIFO and a process-level run lock.
             for job in queued_docker:
-                if self.pipeline_script is None or not self.pipeline_script.is_file():
+                job_script = self._docker_script_for_job(job)
+                if job_script is None or not job_script.is_file():
+                    # Preserve a durable queued job while the host checkout is
+                    # temporarily unavailable (for example during a restart).
                     break
                 if self._launch_locked(job):
                     break
@@ -1873,15 +2240,89 @@ class PipelineJobs:
             },
         }
 
-    def start(self, resolved: dict[str, Any], *, preflight: bool = False) -> dict[str, Any]:
+    def _write_evaluation_record(
+        self,
+        job_id: str,
+        batch_id: str,
+        resolved: dict[str, Any],
+        config: dict[str, Any],
+        config_path: Path,
+    ) -> dict[str, Any]:
+        record_root = self.run_records_root / job_id
+        record_root.mkdir(parents=True, exist_ok=False)
+        exported_config = record_root / "evaluation_config.resolved.yaml"
+        exported_config.write_text(
+            config_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        derived = resolved.get("derived", {})
+        output_root = derived.get("evaluation_output_root")
+        record = {
+            "schema_version": "chatts-dataset-studio-evaluation-record-v1",
+            "job_id": job_id,
+            "batch_id": batch_id,
+            "created_at": _utc_now(),
+            "model_path": derived.get("model_path"),
+            "model_name": derived.get("model_name"),
+            "run_id": derived.get("run_id"),
+            "evaluation_protocol_id": derived.get("evaluation_protocol_id"),
+            "config_hash": config["pipeline"]["trial_config_hash"],
+            "execution": resolved.get("execution", {"backend": "docker_host"}),
+            "output_root": output_root,
+        }
+        record_path = record_root / "evaluation_record.json"
+        record_path.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        artifacts = {
+            "评测参数配置": str(exported_config),
+            "被评测模型": str(derived.get("model_path", "")),
+            "评测运行档案": str(record_path),
+        }
+        if isinstance(output_root, str) and output_root:
+            artifacts.update(
+                {
+                    "评测输出目录": output_root,
+                    "评测状态表": f"{output_root.rstrip('/')}/benchmark_status.tsv",
+                    "评测汇总": f"{output_root.rstrip('/')}/all_benchmarks_summary.md",
+                    "评测指标": f"{output_root.rstrip('/')}/metrics.json",
+                }
+            )
+        return artifacts
+
+    def _execution_spec(
+        self, resolved: dict[str, Any]
+    ) -> tuple[str, Path, Path | None]:
         execution = _mapping(resolved.get("execution"), "resolved.execution")
         backend = execution.get("backend", "docker_host")
         if backend == "docker_host":
-            if self.pipeline_script is None or not self.pipeline_script.is_file():
+            configured = execution.get("pipeline_script")
+            script_path = (
+                Path(configured).expanduser().resolve()
+                if isinstance(configured, str) and configured
+                else self.pipeline_script
+            )
+            allowed_scripts = {
+                path
+                for path in (self.pipeline_script, self.evaluation_pipeline_script)
+                if path is not None
+            }
+            if script_path is None or script_path not in allowed_scripts:
+                raise StudioError("Resolved Docker pipeline script is not server-trusted")
+            if not script_path.is_file():
                 raise StudioError(
-                    "One-click pipeline is disabled or pipeline_script does not exist on the host"
+                    "One-click pipeline is disabled or its fixed script does not exist on the host"
                 )
-            execution_cwd = self.pipeline_script.parent.parent
+            execution_root = execution.get("execution_root")
+            execution_cwd = (
+                Path(execution_root).expanduser().resolve()
+                if isinstance(execution_root, str) and execution_root
+                else script_path.parent.parent
+            )
+            if not execution_cwd.is_dir():
+                raise StudioError(
+                    f"Docker pipeline working directory is unavailable: {execution_cwd}"
+                )
+            return backend, execution_cwd, script_path
         elif backend == "slurm":
             if shutil.which("sbatch") is None:
                 raise StudioError("Slurm backend is disabled because sbatch is unavailable")
@@ -1893,85 +2334,181 @@ class PipelineJobs:
                 raise StudioError(f"Cannot read trusted Slurm launcher: {exc}") from exc
             if current_sha256 != sbatch_sha256:
                 raise StudioError("Trusted Slurm launcher changed after request resolution")
-            execution_cwd = Path(str(execution.get("training_root", "")))
+            execution_cwd = Path(
+                str(
+                    execution.get("execution_root")
+                    or execution.get("training_root", "")
+                )
+            )
             if not execution_cwd.is_dir():
                 raise StudioError(
-                    f"Slurm training root is unavailable: {execution_cwd}"
+                    f"Slurm execution root is unavailable: {execution_cwd}"
                 )
+            return backend, execution_cwd, None
         else:
             raise StudioError(f"Unknown execution backend: {backend}")
-        with self.lock:
-            job_id = uuid.uuid4().hex
-            self.config_root.mkdir(parents=True, exist_ok=True)
-            self.logs_root.mkdir(parents=True, exist_ok=True)
-            config_path = self.config_root / f"{job_id}.yaml"
-            log_path = self.logs_root / f"{job_id}.log"
-            config = json.loads(json.dumps(resolved["config"]))
-            config["pipeline"]["preflight_only"] = preflight
-            config["pipeline"]["trial_id"] = job_id
-            effective_config_hash = _hash(config)
-            config["pipeline"]["trial_config_hash"] = effective_config_hash
-            config_path.write_text(
-                yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
-            )
-            artifacts = {"训练参数配置": str(config_path)}
-            comparison_path = None
-            diff_summary = None
-            if not preflight:
-                artifacts = self._write_run_record(job_id, resolved, config, config_path)
+
+    def _create_job_locked(
+        self,
+        resolved: dict[str, Any],
+        *,
+        preflight: bool,
+        batch_id: str | None,
+        batch_index: int | None,
+        batch_size: int | None,
+        execution_spec: tuple[str, Path, Path | None],
+        queue_sequence: int,
+    ) -> str:
+        backend, execution_cwd, docker_script = execution_spec
+        execution = _mapping(resolved.get("execution"), "resolved.execution")
+        standalone = resolved.get("task_type") == "standalone_evaluation"
+        job_id = uuid.uuid4().hex
+        self.config_root.mkdir(parents=True, exist_ok=True)
+        self.logs_root.mkdir(parents=True, exist_ok=True)
+        config_path = self.config_root / f"{job_id}.yaml"
+        log_path = self.logs_root / f"{job_id}.log"
+        config = json.loads(json.dumps(resolved["config"]))
+        config["pipeline"]["preflight_only"] = preflight
+        config["pipeline"]["trial_id"] = job_id
+        if standalone and batch_id is not None:
+            config["pipeline"]["batch_id"] = batch_id
+        effective_config_hash = _hash(config)
+        config["pipeline"]["trial_config_hash"] = effective_config_hash
+        config_path.write_text(
+            yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8"
+        )
+        artifacts = {
+            "评测参数配置" if standalone else "训练参数配置": str(config_path)
+        }
+        comparison_path = None
+        diff_summary = None
+        if not preflight:
+            if standalone:
+                if batch_id is None:
+                    raise StudioError("Standalone evaluation job is missing its batch id")
+                artifacts = self._write_evaluation_record(
+                    job_id, batch_id, resolved, config, config_path
+                )
+            else:
+                artifacts = self._write_run_record(
+                    job_id, resolved, config, config_path
+                )
                 comparison_path = artifacts.pop("comparison")
                 diff_summary = artifacts.pop("diff_summary")
-            scheduler_stdout_path = (
-                self.logs_root / f"{job_id}-slurm-%j.out"
-                if backend == "slurm"
-                else None
+        scheduler_stdout_path = (
+            self.logs_root / f"{job_id}-slurm-%j.out"
+            if backend == "slurm"
+            else None
+        )
+        scheduler_stderr_path = (
+            self.logs_root / f"{job_id}-slurm-%j.err"
+            if backend == "slurm"
+            else None
+        )
+        if backend == "slurm":
+            artifacts["Slurm 提交脚本"] = str(execution["sbatch_path"])
+            artifacts["Slurm 标准输出"] = str(scheduler_stdout_path)
+            artifacts["Slurm 标准错误"] = str(scheduler_stderr_path)
+        if standalone:
+            kind = "evaluation_preflight" if preflight else "evaluation"
+        elif preflight:
+            kind = "preflight"
+        elif resolved.get("pipeline_mode") == "stage1":
+            kind = "train_eval_stage1"
+        elif backend == "slurm":
+            kind = "train_eval_full"
+        else:
+            kind = "train_eval"
+        derived = resolved.get("derived", {})
+        job = {
+            "schema_version": "chatts-dataset-studio-job-v1",
+            "job_id": job_id,
+            "kind": kind,
+            "status": "queued",
+            "created_at": _utc_now(),
+            "queue_sequence": queue_sequence,
+            "version": resolved.get("version"),
+            "dataset_snapshot_hash": resolved.get("dataset_snapshot_hash"),
+            "config_hash": effective_config_hash,
+            "config_path": str(config_path),
+            "comparison_path": comparison_path,
+            "diff_from_previous": diff_summary,
+            "log_path": str(log_path),
+            "execution_backend": backend,
+            "execution_cwd": str(execution_cwd),
+            "derived": derived,
+            "artifacts": artifacts,
+        }
+        if standalone:
+            job.update(
+                {
+                    "batch_id": batch_id,
+                    "batch_index": batch_index,
+                    "batch_size": batch_size,
+                    "model_path": derived.get("model_path"),
+                    "model_name": derived.get("model_name"),
+                    "run_id": derived.get("run_id"),
+                }
             )
-            scheduler_stderr_path = (
-                self.logs_root / f"{job_id}-slurm-%j.err"
-                if backend == "slurm"
-                else None
+        if backend == "docker_host" and docker_script is not None:
+            job["pipeline_script_path"] = str(docker_script)
+        if backend == "slurm":
+            job.update(
+                {
+                    "sbatch_path": str(execution["sbatch_path"]),
+                    "sbatch_relative_path": execution.get("sbatch_relative_path"),
+                    "sbatch_sha256": execution["sbatch_sha256"],
+                    "scheduler_stdout_path": str(scheduler_stdout_path),
+                    "scheduler_stderr_path": str(scheduler_stderr_path),
+                }
             )
-            if backend == "slurm":
-                artifacts["Slurm 提交脚本"] = str(execution["sbatch_path"])
-                artifacts["Slurm 标准输出"] = str(scheduler_stdout_path)
-                artifacts["Slurm 标准错误"] = str(scheduler_stderr_path)
-            if preflight:
-                kind = "preflight"
-            elif resolved.get("pipeline_mode") == "stage1":
-                kind = "train_eval_stage1"
-            elif backend == "slurm":
-                kind = "train_eval_full"
-            else:
-                kind = "train_eval"
-            job = {
-                "schema_version": "chatts-dataset-studio-job-v1",
-                "job_id": job_id,
-                "kind": kind,
-                "status": "queued",
-                "created_at": _utc_now(),
-                "queue_sequence": self._next_queue_sequence_locked(),
-                "version": resolved["version"],
-                "dataset_snapshot_hash": resolved["dataset_snapshot_hash"],
-                "config_hash": effective_config_hash,
-                "config_path": str(config_path),
-                "comparison_path": comparison_path,
-                "diff_from_previous": diff_summary,
-                "log_path": str(log_path),
-                "execution_backend": backend,
-                "execution_cwd": str(execution_cwd),
-                "derived": resolved["derived"],
-                "artifacts": artifacts,
-            }
-            if backend == "slurm":
-                job.update(
-                    {
-                        "sbatch_path": str(execution["sbatch_path"]),
-                        "sbatch_relative_path": execution.get("sbatch_relative_path"),
-                        "sbatch_sha256": execution["sbatch_sha256"],
-                        "scheduler_stdout_path": str(scheduler_stdout_path),
-                        "scheduler_stderr_path": str(scheduler_stderr_path),
-                    }
-                )
-            self._write(job)
+        self._write(job)
+        return job_id
+
+    def start(self, resolved: dict[str, Any], *, preflight: bool = False) -> dict[str, Any]:
+        if resolved.get("task_type") == "standalone_evaluation":
+            return self.start_many([resolved], preflight=preflight)["jobs"][0]
+        execution_spec = self._execution_spec(resolved)
+        with self.lock:
+            queue_sequence = self._next_queue_sequence_locked()
+            job_id = self._create_job_locked(
+                resolved,
+                preflight=preflight,
+                batch_id=None,
+                batch_index=None,
+                batch_size=None,
+                execution_spec=execution_spec,
+                queue_sequence=queue_sequence,
+            )
             self._dispatch_next_locked()
             return self.get(job_id, include_log=False)
+
+    def start_many(
+        self, resolved_items: list[dict[str, Any]], *, preflight: bool = False
+    ) -> dict[str, Any]:
+        if not resolved_items:
+            raise StudioError("Standalone evaluation batch is empty")
+        # Validate every executable, working directory and immutable launcher
+        # hash before writing the first durable job.
+        execution_specs = [self._execution_spec(item) for item in resolved_items]
+        batch_id = uuid.uuid4().hex
+        with self.lock:
+            first_sequence = self._next_queue_sequence_locked()
+            job_ids = [
+                self._create_job_locked(
+                    item,
+                    preflight=preflight,
+                    batch_id=batch_id,
+                    batch_index=index,
+                    batch_size=len(resolved_items),
+                    execution_spec=execution_specs[index - 1],
+                    queue_sequence=first_sequence + index - 1,
+                )
+                for index, item in enumerate(resolved_items, 1)
+            ]
+            self._dispatch_next_locked()
+            return {
+                "batch_id": batch_id,
+                "job_count": len(job_ids),
+                "jobs": [self.get(job_id, include_log=False) for job_id in job_ids],
+            }

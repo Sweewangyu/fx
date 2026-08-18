@@ -133,3 +133,24 @@ def test_registry_auto_build_defaults_to_true(tmp_path: Path) -> None:
     loaded = _load_config(config)
 
     assert loaded["registry_auto_build"] is True
+
+
+def test_server_config_resolves_eval_script_but_keeps_eval_sbatch_relative(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "server.yaml"
+    config.write_text(
+        "integration:\n"
+        "  evaluation_pipeline_script: ../ChatTS/scripts/run_eval_only.sh\n"
+        "  slurm_evaluation_sbatch: run_chatts_studio_evaluation.sbatch\n",
+        encoding="utf-8",
+    )
+
+    loaded = _load_config(config)
+
+    assert loaded["integration"]["evaluation_pipeline_script"] == str(
+        (tmp_path / "../ChatTS/scripts/run_eval_only.sh").resolve()
+    )
+    assert loaded["integration"]["slurm_evaluation_sbatch"] == (
+        "run_chatts_studio_evaluation.sbatch"
+    )

@@ -53,8 +53,10 @@ def _load_config(path: Path | None) -> dict[str, Any]:
         "training_root",
         "evaluation_root",
         "pipeline_script",
+        "evaluation_pipeline_script",
         "slurm_root",
         "slurm_sbatch",
+        "slurm_evaluation_sbatch",
         "slurm_evaluation_root",
         "slurm_evaluation_sif_image",
         "slurm_chronos2_host_root",
@@ -66,7 +68,7 @@ def _load_config(path: Path | None) -> dict[str, Any]:
         if name in integration_result:
             # A simple sbatch filename is resolved relative to slurm_root by the
             # trusted launcher validator, not relative to this YAML file.
-            if name == "slurm_sbatch" and isinstance(
+            if name in {"slurm_sbatch", "slurm_evaluation_sbatch"} and isinstance(
                 integration_result[name], str
             ) and "/" not in integration_result[name]:
                 continue

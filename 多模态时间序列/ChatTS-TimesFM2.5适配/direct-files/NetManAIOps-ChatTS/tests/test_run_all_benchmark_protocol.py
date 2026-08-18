@@ -266,3 +266,52 @@ def test_tsr_declared_prompt_changes_fixed_protocol_fingerprint(tmp_path: Path) 
     assert official_events["tsrbench"]["TEMPERATURE"] == "1.0"
     assert official_events["tsrbench"]["MAX_RETRIES"] == "10"
     assert official_events["tsrbench"]["MAX_INPUT_TOKENS"] == "8000"
+
+
+def test_standalone_preflight_requires_selected_model_immediately(tmp_path: Path) -> None:
+    project = _fake_project(tmp_path)
+    chronos = tmp_path / "chronos2"
+    tsrbench = tmp_path / "tsrbench"
+    chronos.mkdir()
+    tsrbench.mkdir()
+    _write(tsrbench / "perception.jsonl", "{}\n")
+    missing_model = tmp_path / "missing-model"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PROJECT_ROOT": str(project),
+            "MODEL_PATH": str(missing_model),
+            "MODEL_NAME": "external-candidate",
+            "CHRONOS2_MODEL_PATH": str(chronos),
+            "TSRBENCH_ROOT": str(tsrbench),
+            "TSRBENCH_DATASET_ROOT": str(tsrbench),
+            "OUTPUT_ROOT": str(tmp_path / "output"),
+            "BENCHMARKS": "tsrbench",
+            "PREFLIGHT_ONLY": "1",
+            "REQUIRE_TRAINING_MARKER": "0",
+            "REQUIRE_MODEL_ON_PREFLIGHT": "1",
+            "AVAILABLE_GPUS_OVERRIDE": "8",
+            "PYTHON_BIN": sys.executable,
+        }
+    )
+
+    strict = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    environment["REQUIRE_MODEL_ON_PREFLIGHT"] = "0"
+    deferred = subprocess.run(
+        ["bash", str(RUNNER)],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert strict.returncode != 0
+    assert "Final model config not found" in strict.stderr
+    assert deferred.returncode == 0, deferred.stderr
+    assert not (tmp_path / "output").exists()

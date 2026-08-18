@@ -229,9 +229,60 @@
 
       <section id="panel-evaluation" role="tabpanel" aria-labelledby="tab-evaluation" data-panel="evaluation" hidden>
         <div class="page-heading"><div><p class="eyebrow">Benchmark</p><h1>评测参数</h1></div><span class="status-chip" id="evaluation-version">未选择版本</span></div>
+        <section class="card standalone-evaluation-card" aria-labelledby="standalone-evaluation-title">
+          <div class="card-heading">
+            <div>
+              <h2 id="standalone-evaluation-title">单独评测已有模型</h2>
+              <p>无需启动训练；每行填写一个评测容器或计算节点可见的模型绝对路径，批量提交后每个模型都是独立任务。</p>
+            </div>
+            <span class="status-chip" id="standalone-evaluation-state">检查中</span>
+          </div>
+          <div class="form-grid form-grid-3 standalone-evaluation-grid">
+            <label class="field field-span-3">
+              <span>模型目录（每行一个）</span>
+              <textarea id="standalone-model-paths" rows="6" spellcheck="false" autocomplete="off" placeholder="/share/models/chatts-run-a&#10;/share/models/chatts-run-b"></textarea>
+              <small class="field-help">空行会忽略，重复路径会自动去重；路径必须以 <code>/</code> 开头。</small>
+            </label>
+            <label class="field">
+              <span>评测执行后端</span>
+              <select id="standalone-eval-backend">
+                <option value="docker_host">本地 Docker（ragas）</option>
+                <option value="slurm">Slurm（ragas.sif）</option>
+              </select>
+            </label>
+            <label class="field" id="standalone-eval-slurm-field" hidden>
+              <span>评测 Slurm 脚本</span>
+              <select id="standalone-eval-sbatch-path"></select>
+              <small class="field-help">只显示服务端可信目录内、支持单独评测的 sbatch。</small>
+            </label>
+            <label class="field readonly-field">
+              <span>评测输出目录</span>
+              <input id="standalone-eval-output-root" type="text" readonly aria-readonly="true" spellcheck="false">
+            </label>
+          </div>
+          <div class="standalone-evaluation-summary" aria-live="polite">
+            <div>
+              <strong id="standalone-model-count">0 个模型</strong>
+              <span id="standalone-model-summary">等待输入模型路径</span>
+            </div>
+            <code id="standalone-eval-topology">Dataset Studio → ragas 评测容器</code>
+          </div>
+          <div class="integration-diagnostic standalone-diagnostic" id="standalone-evaluation-diagnostic" role="status" aria-live="polite" hidden>
+            <strong>单独评测暂不可用</strong>
+            <p id="standalone-evaluation-diagnostic-summary"></p>
+            <ul id="standalone-evaluation-missing"></ul>
+          </div>
+          <div class="standalone-evaluation-actions">
+            <p id="standalone-evaluation-status" aria-live="polite">输入模型路径并选择下方评测套件；Docker 使用本地 FIFO，Slurm 由调度器排队。</p>
+            <div class="button-row">
+              <button class="button secondary" id="standalone-eval-preflight" type="button">批量预检</button>
+              <button class="button primary" id="standalone-eval-submit" type="button">批量提交评测</button>
+            </div>
+          </div>
+        </section>
         <section class="launch-guide" aria-labelledby="launch-guide-title">
           <div class="launch-guide-heading">
-            <div><h2 id="launch-guide-title">启动流程</h2><p>训练与评测按同一数据版本连续执行。</p><p class="execution-topology" id="execution-topology">宿主机控制面 → 训练容器 → 评测容器</p></div>
+            <div><h2 id="launch-guide-title">训练后自动评测</h2><p>训练与评测按同一数据版本连续执行。</p><p class="execution-topology" id="execution-topology">宿主机控制面 → 训练容器 → 评测容器</p></div>
             <span class="status-chip" id="integration-state">检查中</span>
           </div>
           <ol class="launch-steps">
@@ -248,7 +299,7 @@
           </div>
         </section>
         <section class="card" id="evaluation-config-card">
-          <div class="card-heading"><h2>评测套件</h2><span id="suite-count">4 项</span></div>
+          <div class="card-heading"><div><h2>评测套件</h2><p>以下参数同时用于单独评测和训练后自动评测。</p></div><span id="suite-count">4 项</span></div>
           <fieldset class="suite-grid" id="benchmark-suites"><legend class="sr-only">选择评测套件</legend>
             <label><input type="checkbox" value="tsrbench" checked><span><strong>TSRBench</strong><small>时序推理</small></span></label>
             <label><input type="checkbox" value="tinybenchmarks" checked><span><strong>TinyBenchmarks</strong><small>轻量基准</small></span></label>
@@ -292,7 +343,7 @@
           </div></details>
         </section>
         <section class="card run-bar" aria-labelledby="run-title">
-          <div><h2 id="run-title">启动 / 排队</h2><p id="run-status" aria-live="polite">先发布并注册数据版本；运行期间可继续提交下一版本。</p></div>
+          <div><h2 id="run-title">训练后评测 / 排队</h2><p id="run-status" aria-live="polite">先发布并注册数据版本；运行期间可继续提交下一版本。</p></div>
           <div class="button-row"><button class="button secondary run-button" data-run-mode="preflight" type="button">预检</button><button class="button primary run-button" id="primary-run-button" data-run-mode="train_eval" type="button">训练 + 评测</button></div>
         </section>
       </section>
@@ -301,7 +352,7 @@
         <div class="page-heading"><div><p class="eyebrow">后台运行</p><h1>任务</h1></div><button class="button secondary" id="refresh-jobs" type="button">刷新</button></div>
         <section class="card jobs-card">
           <div class="job-table" role="table" aria-label="任务列表">
-            <div class="job-head" role="row"><span>任务</span><span>版本</span><span>状态</span><span>开始时间</span><span>耗时</span></div>
+            <div class="job-head" role="row"><span>任务</span><span>版本 / 模型</span><span>状态</span><span>开始时间</span><span>耗时</span></div>
             <div id="job-list" role="rowgroup"><div class="list-empty">暂无任务</div></div>
           </div>
         </section>

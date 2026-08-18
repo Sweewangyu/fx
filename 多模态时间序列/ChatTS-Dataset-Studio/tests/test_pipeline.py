@@ -17,6 +17,7 @@ from chatts_dataset_studio.models import StudioError
 from chatts_dataset_studio.pipeline import (
     PipelineJobs,
     public_pipeline_defaults,
+    resolve_evaluation_requests,
     resolve_pipeline_request,
 )
 
@@ -80,6 +81,18 @@ def _trusted_slurm_integration(tmp_path: Path) -> dict[str, object]:
     return integration
 
 
+def _standalone_integration(tmp_path: Path) -> dict[str, object]:
+    integration = _integration(tmp_path)
+    evaluation_root = Path(str(integration["evaluation_root"]))
+    script = evaluation_root / "scripts" / "run_eval_only.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\ntest -f \"$CONFIG_FILE\"\n",
+        encoding="utf-8",
+    )
+    return integration
+
+
 def test_resolve_pipeline_derives_versioned_paths_and_snapshot_datasets(
     tmp_path: Path,
 ) -> None:
@@ -125,6 +138,118 @@ def test_resolve_pipeline_derives_versioned_paths_and_snapshot_datasets(
     assert resolved["config"]["pipeline"]["training_recipe_hash"] == recipe_hash
     assert evaluation["benchmarks"] == "tsrbench,timeseriesexam"
     assert resolved["config_hash"]
+
+
+def test_resolve_standalone_evaluation_batch_deduplicates_and_isolates_models(
+    tmp_path: Path,
+) -> None:
+    integration = _standalone_integration(tmp_path)
+    resolved = resolve_evaluation_requests(
+        {
+            "model_paths": [
+                "/share/models/team-a/checkpoint",
+                "/share/models/team-b/checkpoint",
+                "/share/models/team-a//checkpoint",
+            ],
+            "evaluation": {"benchmarks": ["tsrbench", "timeseriesexam"]},
+            "execution": {"backend": "docker_host"},
+        },
+        integration,
+    )
+
+    assert len(resolved) == 2
+    first, second = resolved
+    assert first["task_type"] == "standalone_evaluation"
+    assert first["config"]["pipeline"]["task_type"] == "standalone_evaluation"
+    assert "training" not in first["config"]
+    assert first["config"]["slurm"] == {}
+    assert first["derived"]["model_name"] != second["derived"]["model_name"]
+    assert first["derived"]["model_name"].startswith("checkpoint-")
+    assert first["config"]["evaluation"]["model_path"] == (
+        "/share/models/team-a/checkpoint"
+    )
+    protocol_id = first["derived"]["evaluation_protocol_id"]
+    assert first["derived"]["evaluation_output_root"].endswith(
+        f"/{first['derived']['model_name']}/{protocol_id}"
+    )
+    assert first["derived"]["run_id"].endswith(f"-{protocol_id}-eval")
+    assert "model_completion_marker" not in first["config"]["evaluation"]
+
+
+@pytest.mark.parametrize(
+    "model_path",
+    ["relative/model", "/", "/share/model/", "/share/../model", "/share/./model"],
+)
+def test_resolve_standalone_evaluation_rejects_ambiguous_model_paths(
+    tmp_path: Path, model_path: str
+) -> None:
+    with pytest.raises(StudioError):
+        resolve_evaluation_requests(
+            {"model_paths": [model_path]}, _standalone_integration(tmp_path)
+        )
+
+
+def test_resolve_standalone_slurm_requires_evaluation_launcher_marker(
+    tmp_path: Path,
+) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    slurm_root = Path(str(integration["slurm_root"]))
+    evaluation_launcher = slurm_root / "run_chatts_studio_evaluation.sbatch"
+    evaluation_launcher.write_text(
+        "#!/usr/bin/env bash\n"
+        "# CHATTS_STUDIO_SBATCH_API=1\n"
+        "# CHATTS_STUDIO_EVALUATION_SBATCH_API=1\n",
+        encoding="utf-8",
+    )
+    integration["slurm_evaluation_sbatch"] = evaluation_launcher.name
+    resolved = resolve_evaluation_requests(
+        {
+            "model_paths": ["/share/models/chatts"],
+            "execution": {"backend": "slurm"},
+        },
+        integration,
+    )[0]
+
+    assert resolved["execution"]["sbatch_path"] == str(evaluation_launcher)
+    assert resolved["config"]["slurm"]["evaluation_host_root"] == str(
+        Path(str(integration["evaluation_root"])).resolve()
+    )
+    with pytest.raises(StudioError, match="standalone evaluation contract"):
+        resolve_evaluation_requests(
+            {
+                "model_paths": ["/share/models/chatts"],
+                "execution": {
+                    "backend": "slurm",
+                    "sbatch_path": "run_chatts_studio_pipeline.sbatch",
+                },
+            },
+            integration,
+        )
+
+
+def test_standalone_slurm_preflight_worker_uses_short_allocation(
+    tmp_path: Path,
+) -> None:
+    integration = _trusted_slurm_integration(tmp_path)
+    jobs = PipelineJobs(tmp_path / "state", None, integration)
+    command = jobs._worker_command(  # noqa: SLF001 - verify frozen worker contract.
+        {
+            "job_id": "1" * 32,
+            "kind": "evaluation_preflight",
+            "execution_backend": "slurm",
+            "execution_cwd": str(tmp_path),
+            "config_path": str(tmp_path / "config.yaml"),
+            "sbatch_path": str(
+                Path(str(integration["slurm_root"]))
+                / "run_chatts_studio_pipeline.sbatch"
+            ),
+            "sbatch_sha256": "a" * 64,
+            "scheduler_stdout_path": str(tmp_path / "slurm-%j.out"),
+            "scheduler_stderr_path": str(tmp_path / "slurm-%j.err"),
+        }
+    )
+
+    assert "--slurm-preflight" in command
 
 
 def test_resolve_pipeline_accepts_user_base_model_path_without_server_default(
@@ -1009,6 +1134,72 @@ def test_pipeline_job_persists_resolved_yaml_and_log(tmp_path: Path) -> None:
     ).hexdigest()
     assert job["config_hash"] == expected_hash
     assert saved_config["pipeline"]["trial_config_hash"] == expected_hash
+
+
+def test_standalone_evaluation_batch_uses_one_durable_docker_fifo(
+    tmp_path: Path,
+) -> None:
+    integration = _standalone_integration(tmp_path)
+    script = Path(str(integration["evaluation_root"])) / "scripts" / "run_eval_only.sh"
+    run_state = tmp_path / "evaluation-state"
+    run_state.mkdir()
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -Eeuo pipefail\n"
+        f"RUN_STATE={shlex.quote(str(run_state))}\n"
+        "printf '%s\\n' \"$(basename \"$CONFIG_FILE\" .yaml)\" >> \"$RUN_STATE/order.txt\"\n"
+        "if mkdir \"$RUN_STATE/first.once\" 2>/dev/null; then\n"
+        "  touch \"$RUN_STATE/first-started\"\n"
+        "  while [[ ! -f \"$RUN_STATE/release-first\" ]]; do sleep 0.02; done\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    resolved = resolve_evaluation_requests(
+        {
+            "model_paths": ["/share/models/a", "/share/models/b"],
+            "execution": {"backend": "docker_host"},
+        },
+        integration,
+    )
+    jobs = PipelineJobs(tmp_path / "evaluation-jobs", None, integration)
+    started = jobs.start_many(resolved)
+    assert started["job_count"] == 2
+    assert len({item["batch_id"] for item in started["jobs"]}) == 1
+    first, second = started["jobs"]
+
+    deadline = time.monotonic() + 5
+    while not (run_state / "first-started").is_file():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert jobs.get(first["job_id"], include_log=False)["status"] == "running"
+    queued = jobs.get(second["job_id"], include_log=False)
+    assert queued["status"] == "queued"
+    assert queued["queue_position"] == 1
+    assert queued["kind"] == "evaluation"
+    assert queued["version"] is None
+    assert queued["diff_from_previous"] is None
+    frozen = yaml.safe_load(Path(queued["config_path"]).read_text(encoding="utf-8"))
+    assert frozen["pipeline"]["task_type"] == "standalone_evaluation"
+    assert frozen["pipeline"]["batch_id"] == started["batch_id"]
+    assert frozen["evaluation"]["model_path"] == "/share/models/b"
+    assert "training" not in frozen
+    assert "评测运行档案" in queued["artifacts"]
+
+    (run_state / "release-first").touch()
+    deadline = time.monotonic() + 8
+    while True:
+        states = [
+            jobs.get(item["job_id"], include_log=False)["status"]
+            for item in started["jobs"]
+        ]
+        if all(state == "completed" for state in states):
+            break
+        assert time.monotonic() < deadline, states
+        time.sleep(0.01)
+    assert (run_state / "order.txt").read_text(encoding="utf-8").splitlines() == [
+        first["job_id"],
+        second["job_id"],
+    ]
 
 
 def test_pipeline_jobs_queue_fifo_freezes_configs_and_continues_after_failure(

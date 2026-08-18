@@ -153,7 +153,9 @@ done
     exit 2
 }
 CHATTS_HOST_CHRONOS2_PATH="${CHATTS_HOST_CHRONOS2_PATH:-$CHATTS_HOST_ROOT/chronos2}"
-CHATTS_EVAL_SIF_IMAGE="${CHATTS_EVAL_SIF_IMAGE:-$CHATTS_SIF_IMAGE}"
+# Evaluation uses the dedicated image next to the training image unless the
+# trusted server configuration provides an explicit alternative.
+CHATTS_EVAL_SIF_IMAGE="${CHATTS_EVAL_SIF_IMAGE:-$(dirname "$CHATTS_SIF_IMAGE")/ragas.sif}"
 CHATTS_CONTAINER_CHRONOS2_PATH="${CHATTS_CONTAINER_CHRONOS2_PATH:-$CHRONOS2_MODEL_PATH}"
 [[ "$CHRONOS2_MODEL_PATH" == "$CHATTS_CONTAINER_CHRONOS2_PATH" ]] || {
     echo "Resolved Chronos-2 path must match CHATTS_CONTAINER_CHRONOS2_PATH" >&2

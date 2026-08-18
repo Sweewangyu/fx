@@ -39,6 +39,10 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 OFFLINE="${OFFLINE:-1}"
 REQUIRE_TRAINING_MARKER="${REQUIRE_TRAINING_MARKER:-1}"
+# Training -> evaluation preflight intentionally permits a model that has not
+# been produced yet.  Standalone evaluation sets this flag to 1 so preflight
+# validates the user-selected checkpoint immediately instead of deferring it.
+REQUIRE_MODEL_ON_PREFLIGHT="${REQUIRE_MODEL_ON_PREFLIGHT:-0}"
 MODEL_COMPLETION_MARKER="${MODEL_COMPLETION_MARKER:-TRAINING_COMPLETE.json}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 
@@ -84,7 +88,9 @@ EXAM_BATCH_SIZE="${EXAM_BATCH_SIZE:-8}"
 EXAM_REQUEST_CHUNK_SIZE="${EXAM_REQUEST_CHUNK_SIZE:-64}"
 EXAM_MAX_CONCEPTS=3
 
-for flag_name in FORCE_EVAL PREFLIGHT_ONLY OFFLINE REQUIRE_TRAINING_MARKER; do
+for flag_name in \
+    FORCE_EVAL PREFLIGHT_ONLY OFFLINE REQUIRE_TRAINING_MARKER \
+    REQUIRE_MODEL_ON_PREFLIGHT; do
     flag_value="${!flag_name}"
     [[ "$flag_value" == "0" || "$flag_value" == "1" ]] || {
         echo "$flag_name must be 0 or 1, got: $flag_value" >&2
@@ -279,7 +285,7 @@ if [[ -f "$MODEL_PATH/config.json" ]]; then
         fi
     fi
     require_model_weights "$MODEL_PATH"
-elif [[ "$PREFLIGHT_ONLY" == "1" ]]; then
+elif [[ "$PREFLIGHT_ONLY" == "1" && "$REQUIRE_MODEL_ON_PREFLIGHT" == "0" ]]; then
     echo "Note: final model does not exist yet; model validation is deferred until training completes: $MODEL_PATH"
 else
     echo "Final model config not found: $MODEL_PATH/config.json" >&2

@@ -10,6 +10,7 @@ const state = {
   activeVersion: null,
   selectedTrainingVersion: null,
   pipelineEnabled: false,
+  standaloneEvaluationEnabled: false,
   modelOutputBaseTemplate: "",
   evaluationOutputBaseTemplate: "",
   jobs: [],
@@ -182,6 +183,7 @@ function renderActionState() {
   $$(".run-button").forEach((button) => { button.disabled = !canRun || state.busy.has(button.dataset.runMode); });
   $("#overview-preflight").disabled = !canRun || state.busy.has("overview-preflight");
   $("#overview-run").disabled = !canRun || state.busy.has("overview-run");
+  renderStandaloneEvaluationState();
 }
 
 function activateTab(name, { focus = false, updateHash = true } = {}) {
@@ -965,6 +967,187 @@ function evaluationPayload() {
   };
 }
 
+function parseStandaloneModelPaths() {
+  const lines = $("#standalone-model-paths").value
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const modelPaths = [];
+  const invalid = [];
+  const seen = new Set();
+  let duplicateCount = 0;
+  for (const path of lines) {
+    if (!path.startsWith("/")) {
+      invalid.push({ path, reason: "不是绝对路径" });
+      continue;
+    }
+    if (path === "/" || path.endsWith("/")) {
+      invalid.push({ path, reason: "必须指向模型目录且末尾不能带 /" });
+      continue;
+    }
+    if (path.split("/").some((part) => part === "." || part === "..")) {
+      invalid.push({ path, reason: "不能包含 . 或 .. 路径段" });
+      continue;
+    }
+    const leading = path.startsWith("//") && !path.startsWith("///") ? "//" : "/";
+    const canonical = `${leading}${path.split("/").filter(Boolean).join("/")}`;
+    if (seen.has(canonical)) {
+      duplicateCount += 1;
+      continue;
+    }
+    seen.add(canonical);
+    modelPaths.push(canonical);
+  }
+  return { modelPaths, invalid, duplicateCount, inputCount: lines.length };
+}
+
+function standaloneEvaluationIntegration() {
+  const pipeline = state.defaults?.pipeline || {};
+  const integration = pipeline.integration || state.defaults?.integration || {};
+  const evaluationOnly = integration.evaluation_only || {};
+  const backend = $("#standalone-eval-backend").value || evaluationOnly.execution_mode || "docker_host";
+  const backendStatus = evaluationOnly.backends?.[backend] || {};
+  const enabled = Boolean(backendStatus.enabled ?? evaluationOnly.enabled);
+  const disabledReasons = Array.isArray(backendStatus.disabled_reasons)
+    ? backendStatus.disabled_reasons
+    : (Array.isArray(evaluationOnly.disabled_reasons) ? evaluationOnly.disabled_reasons : []);
+  return { pipeline, integration, evaluationOnly, backend, backendStatus, enabled, disabledReasons };
+}
+
+function configureStandaloneSlurmLaunchers(integration) {
+  const evaluationOnly = integration.evaluation_only || {};
+  const slurm = evaluationOnly.backends?.slurm || {};
+  const select = $("#standalone-eval-sbatch-path");
+  const previous = select.value;
+  select.replaceChildren();
+  for (const launcher of slurm.launchers || []) {
+    const value = typeof launcher === "string" ? launcher : launcher.relative_path;
+    if (value) select.append(new Option(value, value));
+  }
+  if (!select.options.length) select.append(new Option("没有可用的单独评测 sbatch", ""));
+  const preferred = previous || slurm.default_sbatch;
+  if (preferred && [...select.options].some((option) => option.value === preferred)) select.value = preferred;
+}
+
+function renderStandaloneEvaluationState() {
+  const input = $("#standalone-model-paths");
+  const parsed = parseStandaloneModelPaths();
+  const contract = standaloneEvaluationIntegration();
+  const slurm = contract.backend === "slurm";
+  const maxBatchModels = Number(contract.evaluationOnly.max_batch_models || 64);
+  const tooMany = parsed.modelPaths.length > maxBatchModels;
+  const hasInvalid = parsed.invalid.length > 0;
+  const hasBenchmarks = evaluationPayload().benchmarks.length > 0;
+  const slurmReady = !slurm || Boolean($("#standalone-eval-sbatch-path").value);
+  const canSubmit = contract.enabled
+    && parsed.modelPaths.length > 0
+    && !hasInvalid
+    && !tooMany
+    && hasBenchmarks
+    && slurmReady;
+
+  state.standaloneEvaluationEnabled = contract.enabled;
+  $("#standalone-eval-slurm-field").hidden = !slurm;
+  $("#standalone-model-count").textContent = `${parsed.modelPaths.length} 个模型`;
+  input.setAttribute("aria-invalid", String(hasInvalid || tooMany));
+
+  const notes = [];
+  if (!parsed.inputCount) notes.push("等待输入模型路径");
+  if (hasInvalid) notes.push(`${parsed.invalid.length} 条路径无效：${parsed.invalid.slice(0, 2).map((item) => `${item.path}（${item.reason}）`).join("、")}`);
+  if (tooMany) notes.push(`单批最多支持 ${maxBatchModels} 个模型`);
+  if (parsed.duplicateCount) notes.push(`已忽略 ${parsed.duplicateCount} 条重复路径`);
+  if (parsed.modelPaths.length && !hasInvalid && !tooMany) notes.push(`将创建 ${parsed.modelPaths.length} 个独立任务`);
+  if (!hasBenchmarks) notes.push("请至少选择一个评测套件");
+  if (slurm && !slurmReady) notes.push("请选择单独评测 Slurm 脚本");
+  const summary = $("#standalone-model-summary");
+  summary.textContent = notes.join("；");
+  summary.classList.toggle("error", hasInvalid || tooMany);
+
+  const stateChip = $("#standalone-evaluation-state");
+  stateChip.textContent = contract.enabled ? "服务已就绪" : "需要配置";
+  stateChip.className = `status-chip ${contract.enabled ? "active" : "error"}`;
+  const diagnostic = $("#standalone-evaluation-diagnostic");
+  diagnostic.hidden = contract.enabled;
+  $("#standalone-evaluation-diagnostic-summary").textContent = contract.enabled
+    ? ""
+    : `当前${slurm ? " Slurm" : " Docker"} 单独评测后端尚未就绪：`;
+  const missing = $("#standalone-evaluation-missing");
+  missing.replaceChildren();
+  const reasons = contract.disabledReasons.length
+    ? contract.disabledReasons
+    : ["integration.evaluation_only 未启用或当前后端未配置"];
+  for (const reason of reasons) missing.append(element("li", "", reason));
+
+  const container = contract.evaluationOnly.evaluation_container
+    || contract.integration.evaluation_container
+    || "ragas";
+  $("#standalone-eval-topology").textContent = slurm
+    ? "Dataset Studio → Slurm 队列 → Singularity（ragas.sif）"
+    : `Dataset Studio → Docker FIFO → ${container}（评测）`;
+  const outputBase = state.evaluationOutputBaseTemplate.replace(/\/$/, "");
+  $("#standalone-eval-output-root").value = outputBase
+    ? `${outputBase}/<模型名-路径哈希>/protocol-<服务端计算>`
+    : "由服务端配置";
+
+  $("#standalone-eval-preflight").disabled = !canSubmit || state.busy.has("standalone-eval-preflight");
+  $("#standalone-eval-submit").disabled = !canSubmit || state.busy.has("standalone-eval-submit");
+}
+
+function validateStandaloneEvaluation() {
+  const parsed = parseStandaloneModelPaths();
+  if (!parsed.inputCount) throw new Error("请至少填写一个模型绝对路径");
+  if (parsed.invalid.length) throw new Error(`模型路径无效：${parsed.invalid[0].path}（${parsed.invalid[0].reason}）`);
+  const maxBatchModels = Number(standaloneEvaluationIntegration().evaluationOnly.max_batch_models || 64);
+  if (parsed.modelPaths.length > maxBatchModels) throw new Error(`单批最多支持 ${maxBatchModels} 个模型`);
+  if (!evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
+  const contract = standaloneEvaluationIntegration();
+  if (!contract.enabled) throw new Error("当前单独评测后端尚未就绪，请查看配置诊断");
+  if (contract.backend === "slurm" && !$("#standalone-eval-sbatch-path").value) {
+    throw new Error("请选择可信的单独评测 Slurm sbatch 脚本");
+  }
+  return parsed.modelPaths;
+}
+
+function standaloneEvaluationPayload() {
+  const contract = standaloneEvaluationIntegration();
+  return {
+    model_paths: validateStandaloneEvaluation(),
+    execution: {
+      backend: contract.backend,
+      sbatch_path: contract.backend === "slurm" ? $("#standalone-eval-sbatch-path").value : null,
+    },
+    evaluation: evaluationPayload(),
+  };
+}
+
+async function startStandaloneEvaluation(preflight, button) {
+  let payload;
+  try { payload = standaloneEvaluationPayload(); } catch (error) { showToast(error.message, "error"); return; }
+  const endpoint = preflight ? "/api/evaluations/preflight" : "/api/evaluations";
+  await withBusy(button, preflight ? "提交预检中…" : "批量提交中…", async () => {
+    try {
+      const result = await api(endpoint, { method: "POST", body: JSON.stringify(payload) });
+      const submitted = normalizeCollection(result, "jobs");
+      const submittedIds = new Set(submitted.map(jobId));
+      state.jobs = [...submitted, ...state.jobs.filter((job) => !submittedIds.has(jobId(job)))];
+      if (submitted[0]) state.activeJobId = jobId(submitted[0]);
+      renderJobs();
+      const count = Number(result.job_count || submitted.length || payload.model_paths.length);
+      const queueLabel = payload.execution.backend === "slurm"
+        ? "已提交到 Slurm，后续由调度器排队"
+        : "已加入本地 FIFO，将按提交顺序运行";
+      const actionLabel = preflight ? "预检" : "评测";
+      $("#standalone-evaluation-status").textContent = `批次 ${result.batch_id || "—"}：${count} 个${actionLabel}任务${queueLabel}。`;
+      showToast(`${count} 个${actionLabel}任务${queueLabel}`, "success");
+      activateTab("jobs");
+      await refreshJobs({ quiet: true });
+    } catch (error) {
+      $("#standalone-evaluation-status").textContent = error.message;
+      showToast(error.message, "error");
+    }
+  });
+}
+
 function runPayload(mode) {
   const profile = $("#train-profile").value;
   const backend = $("#execution-backend").value;
@@ -1047,8 +1230,18 @@ function jobType(job) {
     train_stage1: "Stage 1 训练 + 评测",
     train_full: "两阶段训练 + 评测",
     preflight: "Preflight",
+    evaluation: "单独评测",
+    evaluation_preflight: "单独评测 Preflight",
     publish: "发布版本",
   })[value] || value;
+}
+
+function jobTargetLabel(job) {
+  const explicit = job.version || job.data_version || job.model_name || job.derived?.model_name;
+  if (explicit) return String(explicit);
+  const path = job.model_path || job.derived?.model_path;
+  if (!path) return "—";
+  return String(path).split("/").filter(Boolean).at(-1) || String(path);
 }
 
 function formatDate(value) {
@@ -1077,7 +1270,7 @@ function jobRow(job) {
     ? "Docker 排队"
     : jobStatusLabel(job.status);
   const status = element("span", `job-status ${job.status || "unknown"}`, `${statusLabel}${queueSuffix}`);
-  for (const value of [jobType(job), job.version || job.data_version || "—"]) button.append(element("span", "", String(value)));
+  for (const value of [jobType(job), jobTargetLabel(job)]) button.append(element("span", "", String(value)));
   button.append(status, element("span", "", formatDate(job.started_at || job.created_at)), element("span", "", formatDuration(job)));
   return button;
 }
@@ -1094,7 +1287,7 @@ function renderJobs() {
   $("#running-job-count").hidden = running + queued === 0;
   $("#running-job-count").textContent = String(running + queued);
   $("#overview-pipeline").textContent = running || queued ? `${running} 个运行中 · ${queued} 个排队` : (state.jobs[0] ? jobStatusLabel(state.jobs[0].status) : "空闲");
-  $("#overview-job-meta").textContent = state.jobs[0] ? `${jobType(state.jobs[0])} · ${state.jobs[0].version || state.jobs[0].data_version || "—"}` : "没有运行中的任务";
+  $("#overview-job-meta").textContent = state.jobs[0] ? `${jobType(state.jobs[0])} · ${jobTargetLabel(state.jobs[0])}` : "没有运行中的任务";
   renderLaunchSteps();
 }
 
@@ -1108,7 +1301,8 @@ async function refreshJobs({ quiet = false } = {}) {
 
 function renderJobDialog(job) {
   $("#job-dialog-title").textContent = `${jobType(job)} · ${jobStatusLabel(job.status)}`;
-  $("#job-dialog-meta").textContent = `${job.version || job.data_version || "—"} · ${jobId(job)}`;
+  const batchMeta = job.batch_id ? ` · 批次 ${job.batch_id}` : "";
+  $("#job-dialog-meta").textContent = `${jobTargetLabel(job)} · ${jobId(job)}${batchMeta}`;
   $("#job-phase").textContent = job.phase || jobStatusLabel(job.status);
   const total = Number(job.total_rows || job.total || 0);
   const processed = Number(job.processed_rows || job.processed || 0);
@@ -1354,6 +1548,9 @@ function applyDefaults(defaults) {
   $("#train-output-root").value = state.modelOutputBaseTemplate;
   $("#train-profile").value = training.profile || "chronos2-full";
   $("#execution-backend").value = integration.execution_mode || "docker_host";
+  const evaluationOnly = integration.evaluation_only || {};
+  $("#standalone-eval-backend").value = evaluationOnly.execution_mode || integration.execution_mode || "docker_host";
+  configureStandaloneSlurmLaunchers(integration);
   const launchers = integration.backends?.slurm?.launchers || [];
   const sbatchSelect = $("#slurm-sbatch-path");
   sbatchSelect.replaceChildren();
@@ -1499,13 +1696,21 @@ function bindEvents() {
   $("#train-profile").addEventListener("change", refreshTrainingModeUI);
   $("#execution-backend").addEventListener("change", refreshTrainingModeUI);
   $("#slurm-sbatch-path").addEventListener("change", renderActionState);
+  $("#standalone-model-paths").addEventListener("input", renderActionState);
+  $("#standalone-eval-backend").addEventListener("change", renderActionState);
+  $("#standalone-eval-sbatch-path").addEventListener("change", renderActionState);
   $("#base-model-path").addEventListener("input", () => {
     syncModelOutputScale();
     const pipeline = state.defaults?.pipeline || {};
     renderIntegrationStatus(pipeline, pipeline.integration || state.defaults?.integration || {});
     renderActionState();
   });
-  $("#benchmark-suites").addEventListener("change", updateDerivedPaths);
+  $("#benchmark-suites").addEventListener("change", () => {
+    updateDerivedPaths();
+    renderActionState();
+  });
+  $("#standalone-eval-preflight").addEventListener("click", () => startStandaloneEvaluation(true, $("#standalone-eval-preflight")));
+  $("#standalone-eval-submit").addEventListener("click", () => startStandaloneEvaluation(false, $("#standalone-eval-submit")));
   $$(".run-button").forEach((button) => button.addEventListener("click", () => startRun(button.dataset.runMode, button)));
   $("#overview-preflight").addEventListener("click", () => startRun("preflight", $("#overview-preflight")));
   $("#overview-run").addEventListener("click", () => startRun(effectiveRunMode(), $("#overview-run")));

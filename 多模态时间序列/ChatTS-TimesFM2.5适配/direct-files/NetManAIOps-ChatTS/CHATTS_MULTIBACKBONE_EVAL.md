@@ -636,6 +636,24 @@ MAX_SAMPLES=2 bash scripts/run_train_then_eval.sh     # 训练后做四套冒烟
 FORCE_TRAIN=1 FORCE_EVAL=1 bash scripts/run_train_then_eval.sh
 ```
 
+## 单独评测已有模型
+
+Dataset Studio 会为批量输入的每个模型路径生成一份带 SHA256 的不可变配置，并在 Docker
+宿主机调用固定入口：
+
+```bash
+CONFIG_FILE=/absolute/path/<job-id>.yaml bash scripts/run_eval_only.sh
+```
+
+该入口只进入 `ragas` 评测容器，不启动 `chatts` 训练容器。外部模型无需
+`TRAINING_COMPLETE.json`，但即使是预检也必须真实存在 `config.json` 和至少一个非空
+权重文件。同一模型和评测协议的输出目录由共享 `flock` 保护；结果仍必须包含
+`benchmark_status.tsv`、`all_benchmarks_summary.md` 和 `metrics.json` 才算完成。
+
+Slurm 使用独立可信入口 `ChatTS-Training/slurm/run_chatts_studio_evaluation.sbatch`。
+它只运行评测镜像；未显式配置 `CHATTS_EVAL_SIF_IMAGE` 时，自动选择训练镜像同目录下的
+`ragas.sif`。Slurm 调度器负责排队，不会占用训练容器或执行任何训练脚本。
+
 正常重跑具有幂等性：`TRAINING_COMPLETE.json` 与参数一致时复用最终模型；目录存在
 但没有有效完成标记时会停止，不会静默覆盖。只有显式设置 `FORCE_TRAIN=1` 才会删除
 该 seed 对应的 Stage1 临时目录和最终模型目录。

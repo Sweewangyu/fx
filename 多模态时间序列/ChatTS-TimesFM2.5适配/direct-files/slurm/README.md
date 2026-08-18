@@ -54,6 +54,28 @@ same recipe fails clearly before its first `srun`; jobs for different recipe
 hashes remain parallel. The lock is held by file descriptor 9 until the sbatch
 process exits.
 
+## Standalone evaluation allocation
+
+`run_chatts_studio_evaluation.sbatch` is the separate evaluation-only contract.
+It carries both the generic marker and
+`# CHATTS_STUDIO_EVALUATION_SBATCH_API=1`, accepts the same frozen-config/job-ID
+arguments, and never invokes a trainer. Dataset Studio may submit one job per
+model in a batch; Slurm provides the cluster queue while each model/protocol
+output also has a non-blocking shared-filesystem lock against duplicate writers.
+
+The launcher validates the frozen YAML with the shared ChatTS
+`scripts/load_studio_evaluation_config.py`, requires the selected external model
+to contain `config.json` and non-empty weights during real preflight, and runs
+`run_all_chatts_benchmarks.sh` with training-marker checks disabled. By default
+it loads `ragas.sif` beside `CHATTS_SIF_IMAGE`; set the trusted
+`integration.slurm_evaluation_sif_image` only when the image lives elsewhere.
+
+```bash
+sbatch slurm/run_chatts_studio_evaluation.sbatch \
+  /absolute/shared/path/to/<evaluation-job-id>.yaml \
+  <evaluation-job-id>
+```
+
 ## Infrastructure settings
 
 The browser does not control infrastructure paths. Cluster administrators set
@@ -67,7 +89,7 @@ fallbacks for hand-written/legacy jobs.
 | `CHATTS_HOST_ROOT` | `$HOME` |
 | `CHATTS_SIF_IMAGE` | `$CHATTS_HOST_ROOT/chatts_v1.sif` |
 | `CHATTS_EVALUATION_DIR` | resolved `integration.slurm_evaluation_root`, falling back to `integration.evaluation_root` |
-| `CHATTS_EVAL_SIF_IMAGE` | resolved `integration.slurm_evaluation_sif_image`, otherwise `CHATTS_SIF_IMAGE` |
+| `CHATTS_EVAL_SIF_IMAGE` | resolved `integration.slurm_evaluation_sif_image`, otherwise `ragas.sif` beside `CHATTS_SIF_IMAGE` |
 | `CHATTS_HOST_CHRONOS2_PATH` | `$CHATTS_HOST_ROOT/chronos2` |
 | `CHATTS_CONTAINER_TRAINING_DIR` | `/workspace/ChatTS-Training` |
 | `CHATTS_CONTAINER_CHRONOS2_PATH` | resolved YAML's Chronos-2 path |
@@ -120,7 +142,8 @@ artifact is produced.
 
 ```bash
 bash -n slurm/run_chatts_studio_pipeline.sbatch
-python -m pytest -q tests/pipeline/test_studio_slurm_contract.py
+python -m pytest -q tests/pipeline/test_studio_slurm_contract.py \
+  tests/pipeline/test_standalone_evaluation_slurm.py
 ruff check scripts/slurm/load_studio_pipeline_config.py \
   tests/pipeline/test_studio_slurm_contract.py
 ```

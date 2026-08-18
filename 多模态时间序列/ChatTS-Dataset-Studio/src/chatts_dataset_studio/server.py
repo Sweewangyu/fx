@@ -22,7 +22,12 @@ from .models import (
     QUALITY_LEVELS,
     StudioError,
 )
-from .pipeline import PipelineJobs, public_pipeline_defaults, resolve_pipeline_request
+from .pipeline import (
+    PipelineJobs,
+    public_pipeline_defaults,
+    resolve_evaluation_requests,
+    resolve_pipeline_request,
+)
 from .registry_builder import build_registry
 from .training_registry import register_training_version
 from .versioning import (
@@ -484,6 +489,22 @@ class StudioService:
         resolved = resolve_pipeline_request({**payload, "version": version}, entry, self.integration)
         return self.pipeline_jobs.start(resolved, preflight=preflight)
 
+    def start_evaluation_batch(
+        self, payload: dict[str, Any], *, preflight: bool
+    ) -> dict[str, Any]:
+        # Standalone evaluation deliberately does not consult the data-version
+        # ledger or register anything with ChatTS-Training.
+        resolved = resolve_evaluation_requests(payload, self.integration)
+        result = self.pipeline_jobs.start_many(resolved, preflight=preflight)
+        model_paths = payload.get("model_paths")
+        result["requested_model_count"] = (
+            len(model_paths) if isinstance(model_paths, list) else len(resolved)
+        )
+        result["duplicate_model_count"] = result["requested_model_count"] - len(
+            resolved
+        )
+        return result
+
     def list_jobs(self) -> dict[str, Any]:
         with self.lock:
             exports = [dict(job) for job in self.jobs.values()]
@@ -647,6 +668,14 @@ class StudioHandler(BaseHTTPRequestHandler):
                 result = self.server.service.start_pipeline(payload, preflight=True)
             elif parsed.path == "/api/runs":
                 result = self.server.service.start_pipeline(payload, preflight=False)
+            elif parsed.path == "/api/evaluations/preflight":
+                result = self.server.service.start_evaluation_batch(
+                    payload, preflight=True
+                )
+            elif parsed.path == "/api/evaluations":
+                result = self.server.service.start_evaluation_batch(
+                    payload, preflight=False
+                )
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return

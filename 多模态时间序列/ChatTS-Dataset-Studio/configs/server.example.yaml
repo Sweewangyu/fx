@@ -38,17 +38,23 @@ integration:
   training_root: ../../ChatTS-Training
   evaluation_root: ../../ChatTS
   pipeline_script: ../../ChatTS/scripts/run_train_then_eval.sh
+  # 单独评测的 Docker host 入口；省略时自动使用
+  # <evaluation_root>/scripts/run_eval_only.sh。
+  evaluation_pipeline_script: ../../ChatTS/scripts/run_eval_only.sh
 
   # Slurm 只允许选择这个可信目录内、带 CHATTS_STUDIO_SBATCH_API=1 marker 的脚本。
   # state_root 与数据/模型输出必须是计算节点可见的共享文件系统路径。
   slurm_root: ../../ChatTS-Training/slurm
   slurm_sbatch: run_chatts_studio_pipeline.sbatch
+  # 单独评测只接受带 CHATTS_STUDIO_EVALUATION_SBATCH_API=1 标记的脚本。
+  slurm_evaluation_sbatch: run_chatts_studio_evaluation.sbatch
   slurm_poll_seconds: 5
   slurm_accounting_grace_seconds: 120
   # Slurm 计算节点上的宿主机路径；评测项目默认复用 evaluation_root。
   # 如果评测使用另一个 Singularity 镜像或 benchmark 不在 /share，可显式设置。
   # slurm_evaluation_root: /data/hpc/home/yu.wang17/ChatTS
-  # slurm_evaluation_sif_image: /data/hpc/home/yu.wang17/chatts_eval.sif
+  # 默认使用训练镜像同目录下的 ragas.sif，也可以显式覆盖。
+  # slurm_evaluation_sif_image: /data/hpc/home/yu.wang17/ragas.sif
   # slurm_chronos2_host_root: /data/hpc/home/yu.wang17/chronos2
   # slurm_tsrbench_host_root: /share/airesearch/data/finiverse/TSRBench-dataset
   # slurm_tinybench_host_root: /share/airesearch/data/finiverse/tyb

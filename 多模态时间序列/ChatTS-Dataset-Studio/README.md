@@ -219,6 +219,39 @@ CONFIG_FILE=<studio-generated.yaml> bash ../ChatTS/scripts/run_train_then_eval.s
 `best_model_manifest.json` + 非空权重，不会伪造 `TRAINING_COMPLETE.json`。评测完成以
 `metrics.json.status == "pass"` 为准。
 
+### 单独评测与批量模型
+
+“评测”页也可以不启动训练，直接输入一个或多个模型目录（每行一个，单批最多 64 个）。后端
+先校验并去重全部绝对 POSIX 路径，再为每个模型冻结一份独立 YAML 和任务；任一路径非法时整批
+拒绝，不会留下半批任务。同名目录会自动追加模型路径 SHA256 的前 12 位，输出固定为：
+
+```text
+<evaluation_output_base>/<模型目录名>-<路径hash12>/protocol-<协议hash16>/
+```
+
+Docker 单独评测使用 `ChatTS/scripts/run_eval_only.sh`，和训练流水线共用 Studio 的持久 FIFO；
+Slurm 使用 `run_chatts_studio_evaluation.sbatch` 立即提交，页面中的 `PENDING` 就是集群调度队列。
+单独评测不需要数据版本、ChatTS-Training 注册记录或训练完成 marker。兼容旧配置时会从
+`evaluation_root/scripts/run_eval_only.sh` 自动找到 Docker 入口；也可显式配置：
+
+```yaml
+integration:
+  evaluation_pipeline_script: /actual/workspace/ChatTS/scripts/run_eval_only.sh
+  slurm_evaluation_sbatch: run_chatts_studio_evaluation.sbatch
+  # 默认从训练 SIF 所在目录寻找 ragas.sif
+  # slurm_evaluation_sif_image: /actual/images/ragas.sif
+```
+
+对应 API 为 `POST /api/evaluations` 和 `POST /api/evaluations/preflight`：
+
+```json
+{
+  "model_paths": ["/share/models/model-a", "/share/models/model-b"],
+  "execution": {"backend": "slurm"},
+  "evaluation": {"benchmarks": ["tsrbench", "timeseriesexam"]}
+}
+```
+
 ## Slurm sbatch 后端
 
 服务器配置示例：
@@ -229,9 +262,10 @@ integration:
   training_root: /workspace/ChatTS-Training
   slurm_root: /workspace/ChatTS-Training/slurm
   slurm_sbatch: run_chatts_studio_pipeline.sbatch
+  slurm_evaluation_sbatch: run_chatts_studio_evaluation.sbatch
   # 以下是计算节点宿主机路径；评测项目默认复用 evaluation_root。
   slurm_evaluation_root: /actual/workspace/ChatTS
-  # slurm_evaluation_sif_image: /actual/images/chatts-eval.sif
+  # slurm_evaluation_sif_image: /actual/images/ragas.sif
   # slurm_ts_haystack_host_root: /actual/workspace/TS-Haystack
   # slurm_timeseriesexam_host_root: /actual/workspace/TimeSeriesExam
 ```

@@ -459,3 +459,91 @@ def test_version_publish_register_activate_and_pipeline_preflight_api(
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_standalone_batch_evaluation_api_does_not_require_dataset_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("chatts_dataset_studio.pipeline.shutil.which", lambda _: "/bin/docker")
+    evaluation_root = tmp_path / "ChatTS"
+    evaluation_script = evaluation_root / "scripts" / "run_eval_only.sh"
+    evaluation_script.parent.mkdir(parents=True)
+    evaluation_script.write_text(
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\ntest -f \"$CONFIG_FILE\"\n",
+        encoding="utf-8",
+    )
+    integration = {
+        "execution_mode": "docker_host",
+        "evaluation_root": str(evaluation_root),
+        # Deliberately omit evaluation_pipeline_script: the compatibility
+        # fallback resolves it under evaluation_root/scripts.
+        "eval_project_root": "/workspace/ChatTS/ChatTS-main",
+        "evaluation_script": (
+            "/workspace/ChatTS/ChatTS-main/scripts/run_all_chatts_benchmarks.sh"
+        ),
+        "evaluation_container": "ragas",
+        "evaluation_output_base": "/share/evaluation/all-benchmarks",
+        "eval_chronos2_model_path": "/workspace/chronos2",
+        "tsrbench_root": "/share/TSRBench-dataset",
+        "tinybench_dataset_root": "/share/tyb",
+        "ts_haystack_root": "/workspace/TS-Haystack",
+        "timeseriesexam_root": "/workspace/TimeSeriesExam",
+        "timeseriesexam_data_file": "/workspace/TimeSeriesExam/output/qa.json",
+    }
+    service = StudioService(
+        {
+            "state_root": str(tmp_path / "state"),
+            "registry_auto_build": False,
+            "integration": integration,
+        }
+    )
+    server = StudioHTTPServer(("127.0.0.1", 0), service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        status, defaults = _json_request(base_url, "/api/defaults")
+        assert status == 200
+        evaluation_status = defaults["pipeline"]["integration"]["evaluation_only"]
+        assert evaluation_status["enabled"] is True
+        assert evaluation_status["max_batch_models"] == 64
+
+        status, batch = _json_request(
+            base_url,
+            "/api/evaluations/preflight",
+            {
+                "model_paths": ["/share/models/a", "/share/models/b"],
+                "evaluation": {"benchmarks": ["tsrbench"]},
+                "execution": {"backend": "docker_host"},
+            },
+        )
+        assert status == 200
+        assert batch["job_count"] == 2
+        assert {item["batch_id"] for item in batch["jobs"]} == {batch["batch_id"]}
+        deadline = time.monotonic() + 5
+        while True:
+            terminal = []
+            for item in batch["jobs"]:
+                status, job = _json_request(
+                    base_url, f"/api/jobs/{item['job_id']}"
+                )
+                assert status == 200
+                terminal.append(job["status"])
+            if terminal == ["completed", "completed"]:
+                break
+            assert time.monotonic() < deadline, terminal
+            time.sleep(0.01)
+
+        before = len(service.pipeline_jobs.list())
+        status, error = _json_request(
+            base_url,
+            "/api/evaluations",
+            {"model_paths": ["/share/models/valid", "relative/invalid"]},
+        )
+        assert status == 400
+        assert "absolute POSIX path" in error["error"]
+        assert len(service.pipeline_jobs.list()) == before
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)

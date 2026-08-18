@@ -330,6 +330,7 @@ def test_sbatch_passes_training_then_evaluation_contract_to_singularity(
 
     image = tmp_path / "chatts.sif"
     image.write_bytes(b"mock-sif")
+    (tmp_path / "ragas.sif").write_bytes(b"mock-evaluation-sif")
     chronos = tmp_path / "chronos2"
     shared = tmp_path / "share"
     job_tmp = tmp_path / "job-tmp"
@@ -410,6 +411,8 @@ def test_sbatch_passes_training_then_evaluation_contract_to_singularity(
     assert "Config file SHA256:" in completed.stdout
     calls = argv_text.split("=== CALL ===")[1:]
     assert len(calls) == 2
+    assert str(image) in calls[0]
+    assert str(tmp_path / "ragas.sif") in calls[1]
     assert "HF_HUB_OFFLINE=1" in calls[0]
     assert "TRANSFORMERS_OFFLINE=1" in calls[0]
     assert "HF_HUB_OFFLINE=0" in calls[1]
@@ -451,6 +454,7 @@ def test_sbatch_training_failure_blocks_evaluation_step(tmp_path: Path) -> None:
 
     image = tmp_path / "chatts.sif"
     image.write_bytes(b"mock-sif")
+    (tmp_path / "ragas.sif").write_bytes(b"mock-evaluation-sif")
     chronos = tmp_path / "chronos2"
     shared = tmp_path / "share"
     eval_repo = tmp_path / "ChatTS"
@@ -528,6 +532,7 @@ def test_sbatch_nonblocking_recipe_lock_rejects_concurrent_writer(
 
     image = tmp_path / "chatts.sif"
     image.write_bytes(b"mock-sif")
+    (tmp_path / "ragas.sif").write_bytes(b"mock-evaluation-sif")
     chronos = tmp_path / "chronos2"
     shared = tmp_path / "share"
     eval_repo = tmp_path / "ChatTS"
