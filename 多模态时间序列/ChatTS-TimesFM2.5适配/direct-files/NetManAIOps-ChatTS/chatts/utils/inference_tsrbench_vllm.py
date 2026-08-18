@@ -25,6 +25,12 @@ import numpy as np
 # processor, causing a fallback to TransformersForCausalLM and a registry
 # KeyError during WorkerProc initialization.
 import chatts.vllm.chatts_vllm as _chatts_vllm  # noqa: F401,E402
+from chatts.utils.tsrbench_trace import (
+    analyze_official_response,
+    ground_truth,
+    sample_metadata,
+    summarize_series,
+)
 
 
 TASK_PATHS = {
@@ -427,11 +433,7 @@ def canonicalize_response(
 
 
 def _is_valid_official_response(response: str | None) -> bool:
-    if not response:
-        return False
-    think_match = re.search(r"<think>(.*?)</think>", response, re.DOTALL)
-    answer_match = re.search(r"<answer>\s*([A-G])\s*</answer>", response, re.DOTALL)
-    return bool(think_match and think_match.group(1).strip() and answer_match)
+    return bool(analyze_official_response(response)["official_valid"])
 
 
 def apply_chat_template(
@@ -492,6 +494,40 @@ def _atomic_dump(rows: list[dict[str, Any]], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_dump_jsonl(rows: Iterable[dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(temporary, path)
+
+
+def _load_trace(path: Path) -> dict[tuple[str, int], dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    records: dict[tuple[str, int], dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                records[(str(row["dataset"]), int(row["idx"]))] = row
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid trace JSONL at {path}:{line_number}: {exc}"
+                ) from exc
+    return records
+
+
+def _write_trace(
+    records: dict[tuple[str, int], dict[str, Any]], path: Path
+) -> None:
+    ordered = [records[key] for key in sorted(records)]
+    _atomic_dump_jsonl(ordered, path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ChatTS vLLM inference on TSRBench")
     parser.add_argument("--model-path", required=True)
@@ -517,6 +553,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-mm-per-prompt", type=int, default=50)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument(
+        "--sample-indices",
+        nargs="+",
+        type=int,
+        help="Evaluate these original zero-based row indices instead of the first N rows.",
+    )
+    parser.add_argument(
+        "--trace-output",
+        help="Optional JSONL path containing every retry and its parse diagnostics.",
+    )
+    parser.add_argument(
         "--prompt-mode",
         choices=PROMPT_MODES,
         default="answer_only",
@@ -539,7 +585,11 @@ def generate_with_retries(
     *,
     prompt_mode: str,
     max_retries: int,
+    attempt_traces: list[list[dict[str, Any]]] | None = None,
+    trace_labels: list[str] | None = None,
 ) -> list[str | None]:
+    if trace_labels is not None and len(trace_labels) != len(prompts):
+        raise ValueError("trace_labels must have one label per prompt")
     responses: list[str | None] = [None] * len(prompts)
     remaining = list(range(len(prompts)))
     total_attempts = max(1, max_retries)
@@ -553,6 +603,39 @@ def generate_with_retries(
         )
         for index, response in zip(remaining, generated):
             responses[index] = response
+            if attempt_traces is not None or trace_labels is not None:
+                if prompt_mode == "official":
+                    diagnostics = analyze_official_response(response)
+                else:
+                    answer = extract_answer(response)
+                    diagnostics = {
+                        "official_valid": None,
+                        "parsed_answer": answer,
+                        "reasoning_path": None,
+                        "invalid_reasons": [] if answer else ["unparseable_answer"],
+                        "response_chars": len(response or ""),
+                    }
+            if attempt_traces is not None:
+                attempt_traces[index].append(
+                    {
+                        "attempt": attempt + 1,
+                        "raw_response": response or "",
+                        **diagnostics,
+                    }
+                )
+            if trace_labels is not None:
+                status = "VALID" if not diagnostics["invalid_reasons"] else "INVALID"
+                reasons = ", ".join(diagnostics["invalid_reasons"]) or "none"
+                print("\n" + "=" * 88, flush=True)
+                print(
+                    f"[TSRBench trace] {trace_labels[index]} | "
+                    f"attempt {attempt + 1}/{total_attempts} | {status} | "
+                    f"answer={diagnostics['parsed_answer']} | reasons={reasons}",
+                    flush=True,
+                )
+                print("-" * 88, flush=True)
+                print(response or "<EMPTY RESPONSE>", flush=True)
+                print("=" * 88, flush=True)
 
         if prompt_mode == "official":
             remaining = [
@@ -584,6 +667,8 @@ def main() -> None:
         raise ValueError("--request-chunk-size must be positive")
     if args.seed < 0:
         raise ValueError("--seed must be non-negative")
+    if args.sample_indices and any(index < 0 for index in args.sample_indices):
+        raise ValueError("--sample-indices values must be non-negative")
     if (
         args.max_retries < 0
         or args.max_input_tokens < 0
@@ -594,6 +679,10 @@ def main() -> None:
     datasets = discover_dataset_files(Path(args.dataset_root), args.datasets)
     model_name = _safe_model_name(args.model_path, args.model_name)
     output_root = Path(args.output_root).resolve()
+    trace_path = Path(args.trace_output).resolve() if args.trace_output else None
+    trace_records = (
+        {} if args.force or trace_path is None else _load_trace(trace_path)
+    )
 
     from chatts.utils.llm_utils import LLMClient
     from transformers import AutoConfig
@@ -631,18 +720,29 @@ def main() -> None:
         client.wait_for_ready()
         for dataset_name, dataset_path in datasets:
             rows = read_jsonl(dataset_path)
-            if args.max_samples > 0:
-                rows = rows[: args.max_samples]
+            if args.sample_indices:
+                selected_indices = list(dict.fromkeys(args.sample_indices))
+                out_of_range = [index for index in selected_indices if index >= len(rows)]
+                if out_of_range:
+                    raise IndexError(
+                        f"{dataset_name} has {len(rows)} rows; invalid sample indices: "
+                        + ", ".join(map(str, out_of_range))
+                    )
+            elif args.max_samples > 0:
+                selected_indices = list(range(min(args.max_samples, len(rows))))
+            else:
+                selected_indices = list(range(len(rows)))
 
             result_dir = output_root / f"{dataset_name}_{model_name}"
             result_path = result_dir / "generated_answer.json"
             completed = (
                 {} if args.force else _load_existing(result_path, args.prompt_mode)
             )
-            pending = [index for index in range(len(rows)) if index not in completed]
+            pending = [index for index in selected_indices if index not in completed]
+            completed_selected = sum(index in completed for index in selected_indices)
             print(
-                f"[TSRBench] {dataset_name}: total={len(rows)}, "
-                f"completed={len(completed)}, pending={len(pending)}"
+                f"[TSRBench] {dataset_name}: selected={len(selected_indices)}/"
+                f"{len(rows)}, completed={completed_selected}, pending={len(pending)}"
             )
 
             for start in range(0, len(pending), args.request_chunk_size):
@@ -650,6 +750,8 @@ def main() -> None:
                 prompts: list[str] = []
                 series_batch: list[list[np.ndarray]] = []
                 valid_indices: list[int] = []
+                raw_trace_prompts: dict[int, str] = {}
+                trace_series: dict[int, list[dict[str, Any]]] = {}
 
                 for index in indices:
                     try:
@@ -662,10 +764,32 @@ def main() -> None:
                             )
                     except Exception as exc:
                         print(f"[TSRBench] {dataset_name}[{index}] skipped: {exc}")
+                        if trace_path is not None:
+                            truth = ground_truth(rows[index], dataset_name)
+                            trace_records[(dataset_name, index)] = {
+                                "dataset": dataset_name,
+                                "dataset_path": str(dataset_path),
+                                "idx": index,
+                                "model": model_name,
+                                "prompt_mode": args.prompt_mode,
+                                "source_sample": sample_metadata(rows[index]),
+                                "ground_truth": truth,
+                                "final_answer": None,
+                                "final_valid": False,
+                                "correct": None,
+                                "attempts": [],
+                                "error": f"PROMPT_PREPARATION_FAILED: {exc}",
+                            }
+                            _write_trace(trace_records, trace_path)
                         continue
                     prompts.append(prompt)
                     series_batch.append(series)
                     valid_indices.append(index)
+                    raw_trace_prompts[index] = prompt
+                    trace_series[index] = [
+                        {"series_index": series_index, **summarize_series(values)}
+                        for series_index, values in enumerate(series)
+                    ]
 
                 if not prompts:
                     continue
@@ -679,23 +803,36 @@ def main() -> None:
                     )
                     for prompt in prompts
                 ]
+                input_token_counts: list[int] = []
+                processed_token_counts: list[int] = []
                 if (
-                    args.max_input_tokens > 0
+                    trace_path is not None
+                    or args.max_input_tokens > 0
                     or args.max_processed_input_tokens > 0
                 ):
-                    kept = []
-                    for position, templated_prompt in enumerate(templated_prompts):
-                        input_tokens = len(
+                    input_token_counts = [
+                        len(
                             client.tokenizer.encode(
                                 templated_prompt, add_special_tokens=False
                             )
                         )
-                        processed_tokens = estimate_vllm_prompt_tokens(
+                        for templated_prompt in templated_prompts
+                    ]
+                    processed_token_counts = [
+                        estimate_vllm_prompt_tokens(
                             client.tokenizer,
                             templated_prompt,
                             series_batch[position],
                             ts_patch_size,
                         )
+                        for position, templated_prompt in enumerate(templated_prompts)
+                    ]
+
+                if args.max_input_tokens > 0 or args.max_processed_input_tokens > 0:
+                    kept = []
+                    for position, templated_prompt in enumerate(templated_prompts):
+                        input_tokens = input_token_counts[position]
+                        processed_tokens = processed_token_counts[position]
                         reason = None
                         if (
                             args.max_input_tokens > 0
@@ -736,17 +873,47 @@ def main() -> None:
                                 "processed_input_tokens": processed_tokens,
                                 "error": reason,
                             }
+                            if trace_path is not None:
+                                truth = ground_truth(rows[index], dataset_name)
+                                trace_records[(dataset_name, index)] = {
+                                    "dataset": dataset_name,
+                                    "dataset_path": str(dataset_path),
+                                    "idx": index,
+                                    "model": model_name,
+                                    "prompt_mode": args.prompt_mode,
+                                    "source_sample": sample_metadata(rows[index]),
+                                    "raw_prompt": raw_trace_prompts[index],
+                                    "templated_prompt": templated_prompt,
+                                    "input_tokens": input_tokens,
+                                    "processed_input_tokens": processed_tokens,
+                                    "time_series": trace_series[index],
+                                    "ground_truth": truth,
+                                    "final_answer": None,
+                                    "final_valid": False,
+                                    "correct": None,
+                                    "attempts": [],
+                                    "error": reason,
+                                }
                         else:
                             kept.append(position)
                     prompts = [prompts[position] for position in kept]
                     templated_prompts = [templated_prompts[position] for position in kept]
                     series_batch = [series_batch[position] for position in kept]
                     valid_indices = [valid_indices[position] for position in kept]
+                    input_token_counts = [input_token_counts[position] for position in kept]
+                    processed_token_counts = [
+                        processed_token_counts[position] for position in kept
+                    ]
                     if not prompts:
                         ordered = [completed[index] for index in sorted(completed)]
                         _atomic_dump(ordered, result_path)
+                        if trace_path is not None:
+                            _write_trace(trace_records, trace_path)
                         continue
 
+                attempt_traces: list[list[dict[str, Any]]] = [
+                    [] for _ in templated_prompts
+                ]
                 responses = generate_with_retries(
                     client,
                     templated_prompts,
@@ -754,9 +921,15 @@ def main() -> None:
                     sampling_params,
                     prompt_mode=args.prompt_mode,
                     max_retries=args.max_retries,
+                    attempt_traces=attempt_traces if trace_path is not None else None,
+                    trace_labels=(
+                        [f"{dataset_name}[{index}]" for index in valid_indices]
+                        if trace_path is not None
+                        else None
+                    ),
                 )
-                for index, prompt, templated_prompt, response in zip(
-                    valid_indices, prompts, templated_prompts, responses
+                for position, (index, prompt, templated_prompt, response) in enumerate(
+                    zip(valid_indices, prompts, templated_prompts, responses)
                 ):
                     canonical_response, parsed_answer, reasoning_path = canonicalize_response(
                         response, args.prompt_mode
@@ -774,13 +947,62 @@ def main() -> None:
                     if reasoning_path:
                         result["reasoning_path"] = reasoning_path
                     completed[index] = result
+                    if trace_path is not None:
+                        for attempt in attempt_traces[position]:
+                            attempt["output_tokens"] = len(
+                                client.tokenizer.encode(
+                                    attempt["raw_response"], add_special_tokens=False
+                                )
+                            )
+                        truth = ground_truth(rows[index], dataset_name)
+                        final_valid = (
+                            _is_valid_official_response(response)
+                            if args.prompt_mode == "official"
+                            else parsed_answer is not None
+                        )
+                        trace_records[(dataset_name, index)] = {
+                            "dataset": dataset_name,
+                            "dataset_path": str(dataset_path),
+                            "idx": index,
+                            "model": model_name,
+                            "prompt_mode": args.prompt_mode,
+                            "source_sample": sample_metadata(rows[index]),
+                            "raw_prompt": prompt,
+                            "templated_prompt": templated_prompt,
+                            "input_tokens": input_token_counts[position],
+                            "processed_input_tokens": processed_token_counts[position],
+                            "time_series": trace_series[index],
+                            "sampling": {
+                                "max_new_tokens": args.max_new_tokens,
+                                "temperature": args.temperature,
+                                "top_p": 1.0,
+                                "seed": args.seed,
+                                "max_total_attempts": max(1, args.max_retries),
+                                "stop": stop_strings,
+                            },
+                            "ground_truth": truth,
+                            "attempts": attempt_traces[position],
+                            "final_raw_response": response or "",
+                            "final_answer": parsed_answer,
+                            "final_reasoning_path": reasoning_path,
+                            "final_valid": final_valid,
+                            "correct": (
+                                parsed_answer == truth
+                                if parsed_answer is not None and truth is not None
+                                else None
+                            ),
+                        }
 
                 ordered = [completed[index] for index in sorted(completed)]
                 _atomic_dump(ordered, result_path)
+                if trace_path is not None:
+                    _write_trace(trace_records, trace_path)
                 print(
-                    f"[TSRBench] {dataset_name}: saved {len(ordered)}/{len(rows)} "
+                    f"[TSRBench] {dataset_name}: saved selected results "
                     f"to {result_path}"
                 )
+                if trace_path is not None:
+                    print(f"[TSRBench] retry trace: {trace_path}")
     finally:
         client.kill()
 

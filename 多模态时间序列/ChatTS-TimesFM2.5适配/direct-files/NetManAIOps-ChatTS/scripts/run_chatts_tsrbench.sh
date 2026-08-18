@@ -19,7 +19,10 @@ NUM_GPUS="${NUM_GPUS:-8}"
 NUM_GPUS_PER_PROCESS="${NUM_GPUS_PER_PROCESS:-2}"
 REQUEST_CHUNK_SIZE="${REQUEST_CHUNK_SIZE:-128}"
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
+SAMPLE_INDICES="${SAMPLE_INDICES:-}"
+TRACE_OUTPUT="${TRACE_OUTPUT:-}"
 FORCE_INFERENCE="${FORCE_INFERENCE:-0}"
+RUN_EVALUATION="${RUN_EVALUATION:-1}"
 SEED="${SEED:-42}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
@@ -152,6 +155,13 @@ fi
 if [[ "$ENABLE_THINKING" == "1" ]]; then
     INFER_ARGS+=(--enable-thinking)
 fi
+if [[ -n "$SAMPLE_INDICES" ]]; then
+    read -r -a SAMPLE_INDEX_ARGS <<< "$SAMPLE_INDICES"
+    INFER_ARGS+=(--sample-indices "${SAMPLE_INDEX_ARGS[@]}")
+fi
+if [[ -n "$TRACE_OUTPUT" ]]; then
+    INFER_ARGS+=(--trace-output "$TRACE_OUTPUT")
+fi
 
 echo "============================================================"
 echo " ChatTS x TSRBench (vLLM time-series embedding modality)"
@@ -168,6 +178,10 @@ echo " Max processed input: $MAX_PROCESSED_INPUT_TOKENS"
 echo " Max new tokens: $MAX_NEW_TOKENS"
 echo " Temperature:  $TEMPERATURE"
 echo " Seed:         $SEED"
+echo " Samples:      ${SAMPLE_INDICES:-first ${MAX_SAMPLES:-0} (0 means all)}"
+if [[ -n "$TRACE_OUTPUT" ]]; then
+    echo " Retry trace:  $TRACE_OUTPUT"
+fi
 if [[ "$PROMPT_MODE" == "official" ]]; then
     echo " Thinking:     enabled by TSRBench <think>/<answer> prompt"
 else
@@ -178,8 +192,10 @@ echo "============================================================"
 cd "$PROJECT_ROOT"
 "$PYTHON_BIN" -m chatts.utils.inference_tsrbench_vllm "${INFER_ARGS[@]}"
 
-"$PYTHON_BIN" scripts/evaluate_tsrbench.py \
-    --dataset-root "$DATASET_ROOT" \
-    --results-root "$OUTPUT_ROOT" \
-    --model-name "$MODEL_NAME" \
-    --datasets "${DATASET_ARGS[@]}"
+if [[ "$RUN_EVALUATION" == "1" ]]; then
+    "$PYTHON_BIN" scripts/evaluate_tsrbench.py \
+        --dataset-root "$DATASET_ROOT" \
+        --results-root "$OUTPUT_ROOT" \
+        --model-name "$MODEL_NAME" \
+        --datasets "${DATASET_ARGS[@]}"
+fi
