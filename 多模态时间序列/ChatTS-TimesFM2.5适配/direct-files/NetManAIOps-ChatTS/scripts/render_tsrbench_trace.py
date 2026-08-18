@@ -49,7 +49,7 @@ def render(rows: list[dict[str, Any]], source: Path) -> str:
     correct = sum(row.get("correct") is True for row in scored)
 
     lines = [
-        "# ChatTS × TSRBench official-prompt inference trace",
+        "# ChatTS × TSRBench structured-reasoning inference trace",
         "",
         f"Trace source: `{source}`",
         "",
@@ -121,7 +121,10 @@ def render(rows: list[dict[str, Any]], source: Path) -> str:
         if not attempts:
             lines.extend(["### Attempts", "", "No generation attempt was made.", ""])
         for attempt in attempts:
-            status = "valid" if attempt.get("official_valid") else "invalid"
+            format_valid = attempt.get(
+                "format_valid", attempt.get("official_valid")
+            )
+            status = "valid" if format_valid else "invalid"
             reasons = attempt.get("invalid_reasons") or []
             reason_text = ", ".join(str(reason) for reason in reasons) or "none"
             lines.extend(

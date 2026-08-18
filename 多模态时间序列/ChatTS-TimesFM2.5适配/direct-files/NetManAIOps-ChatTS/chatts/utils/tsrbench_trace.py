@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Iterable
 
@@ -44,6 +45,7 @@ def analyze_official_response(response: str | None) -> dict[str, Any]:
 
     valid = bool(think_match and reasoning_path and answer_match)
     return {
+        "format_valid": valid,
         "official_valid": valid,
         "parsed_answer": answer,
         "reasoning_path": reasoning_path,
@@ -52,6 +54,57 @@ def analyze_official_response(response: str | None) -> dict[str, Any]:
         "has_think_close": think_close,
         "has_answer_open": answer_open,
         "has_answer_close": answer_close,
+        "response_chars": len(raw),
+    }
+
+
+def analyze_json_reasoning_response(response: str | None) -> dict[str, Any]:
+    """Validate a strict ``{"reason": ..., "answer": ...}`` response."""
+    raw = response or ""
+    reasons: list[str] = []
+    parsed: Any = None
+    if not raw.strip():
+        reasons.append("empty_response")
+    else:
+        try:
+            parsed = json.loads(raw.strip())
+        except json.JSONDecodeError as exc:
+            reasons.append(f"invalid_json:{exc.msg}")
+
+    reason: str | None = None
+    answer: str | None = None
+    if parsed is not None:
+        if not isinstance(parsed, dict):
+            reasons.append("json_root_is_not_object")
+        else:
+            extra_keys = sorted(set(parsed) - {"reason", "answer"})
+            missing_keys = sorted({"reason", "answer"} - set(parsed))
+            if missing_keys:
+                reasons.append("missing_keys:" + ",".join(missing_keys))
+            if extra_keys:
+                reasons.append("extra_keys:" + ",".join(extra_keys))
+
+            raw_reason = parsed.get("reason")
+            if isinstance(raw_reason, str) and raw_reason.strip():
+                reason = raw_reason.strip()
+            else:
+                reasons.append("reason_must_be_nonempty_string")
+
+            raw_answer = parsed.get("answer")
+            if isinstance(raw_answer, str) and re.fullmatch(
+                r"[A-G]", raw_answer.strip()
+            ):
+                answer = raw_answer.strip()
+            else:
+                reasons.append("answer_must_be_one_uppercase_letter_A_to_G")
+
+    valid = not reasons and reason is not None and answer is not None
+    return {
+        "format_valid": valid,
+        "official_valid": None,
+        "parsed_answer": answer,
+        "reasoning_path": reason,
+        "invalid_reasons": [] if valid else reasons,
         "response_chars": len(raw),
     }
 

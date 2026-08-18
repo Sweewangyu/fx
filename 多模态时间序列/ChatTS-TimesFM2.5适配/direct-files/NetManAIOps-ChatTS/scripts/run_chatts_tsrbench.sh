@@ -39,6 +39,17 @@ case "$PROMPT_MODE" in
         CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-12288}"
         ENABLE_THINKING="${ENABLE_THINKING:-0}"
         ;;
+    json_reasoning)
+        # Structured reasoning without Qwen's native hidden-thinking wrapper.
+        # A deterministic single attempt makes prompt compliance easy to audit.
+        BATCH_SIZE="${BATCH_SIZE:-1}"
+        MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+        TEMPERATURE="${TEMPERATURE:-0.0}"
+        MAX_RETRIES="${MAX_RETRIES:-1}"
+        MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-8000}"
+        CHATTS_VLLM_MAX_MODEL_LEN="${CHATTS_VLLM_MAX_MODEL_LEN:-12288}"
+        ENABLE_THINKING="${ENABLE_THINKING:-0}"
+        ;;
     answer_only)
         BATCH_SIZE="${BATCH_SIZE:-16}"
         MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8}"
@@ -49,7 +60,7 @@ case "$PROMPT_MODE" in
         ENABLE_THINKING="${ENABLE_THINKING:-0}"
         ;;
     *)
-        echo "PROMPT_MODE must be answer_only or official, got: $PROMPT_MODE" >&2
+        echo "PROMPT_MODE must be answer_only, official, or json_reasoning; got: $PROMPT_MODE" >&2
         exit 1
         ;;
 esac
@@ -184,6 +195,8 @@ if [[ -n "$TRACE_OUTPUT" ]]; then
 fi
 if [[ "$PROMPT_MODE" == "official" ]]; then
     echo " Thinking:     enabled by TSRBench <think>/<answer> prompt"
+elif [[ "$PROMPT_MODE" == "json_reasoning" ]]; then
+    echo " Thinking:     explicit JSON reason field"
 else
     echo " Thinking:     $([[ "$ENABLE_THINKING" == "1" ]] && echo enabled || echo disabled)"
 fi

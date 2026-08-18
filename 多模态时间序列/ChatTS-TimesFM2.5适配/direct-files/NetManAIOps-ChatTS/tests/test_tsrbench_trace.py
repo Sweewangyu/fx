@@ -4,7 +4,11 @@ import importlib.util
 import json
 from pathlib import Path
 
-from chatts.utils.tsrbench_trace import analyze_official_response, summarize_series
+from chatts.utils.tsrbench_trace import (
+    analyze_json_reasoning_response,
+    analyze_official_response,
+    summarize_series,
+)
 
 
 def _load_renderer():
@@ -43,6 +47,22 @@ def test_series_summary_is_compact() -> None:
     assert summary["head"] == [0.0, 1.0]
     assert summary["tail"] == [8.0, 9.0]
     assert summary["mean"] == 4.5
+
+
+def test_json_reasoning_requires_strict_valid_json() -> None:
+    valid = analyze_json_reasoning_response(
+        '{"reason":"Humidity is rising.","answer":"B"}'
+    )
+    assert valid["format_valid"] is True
+    assert valid["parsed_answer"] == "B"
+    assert valid["reasoning_path"] == "Humidity is rising."
+
+    bare = analyze_json_reasoning_response("B")
+    assert bare["format_valid"] is False
+    assert any(reason.startswith("invalid_json:") for reason in bare["invalid_reasons"])
+
+    pseudo_json = analyze_json_reasoning_response("{reason: x, answer: B}")
+    assert pseudo_json["format_valid"] is False
 
 
 def test_renderer_shows_every_attempt(tmp_path: Path) -> None:

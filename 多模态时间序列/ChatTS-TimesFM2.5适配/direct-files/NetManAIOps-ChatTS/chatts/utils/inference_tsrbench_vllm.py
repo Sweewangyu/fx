@@ -26,6 +26,7 @@ import numpy as np
 # KeyError during WorkerProc initialization.
 import chatts.vllm.chatts_vllm as _chatts_vllm  # noqa: F401,E402
 from chatts.utils.tsrbench_trace import (
+    analyze_json_reasoning_response,
     analyze_official_response,
     ground_truth,
     sample_metadata,
@@ -54,18 +55,34 @@ TASK_ALIASES = {
     "pattern_decision": "qualitative_decision",
 }
 
-PROMPT_MODES = ("answer_only", "official")
+PROMPT_MODES = ("answer_only", "official", "json_reasoning")
 
 ANSWER_ONLY_INSTRUCTION = (
     "\n\nReturn exactly one uppercase option letter (A-G) and no other text."
 )
 
+JSON_REASONING_INSTRUCTION = (
+    "\n\nIMPORTANT OUTPUT CONTRACT:\n"
+    "Return exactly one valid JSON object with exactly two keys, and no Markdown "
+    "or surrounding text:\n"
+    '{"reason":"Briefly explain the time-series evidence for your choice.",'
+    '"answer":"A"}\n'
+    'The value of "reason" must be a non-empty string. The value of "answer" '
+    "must be exactly one uppercase option letter from A to G. Do not return only "
+    "the answer letter."
+)
+
 
 def _official_answer_instruction(choice_text: str) -> str:
     """The answer instruction used by TSRBench's official ChatTS runner."""
+    choices = (
+        " Select from the options below:\n" + choice_text + "\n"
+        if choice_text
+        else "\n"
+    )
     return (
-        " Select from the options below:\n" + choice_text
-        + "\nOutput your reasoning process in <think> tags and final answer "
+        choices
+        + "Output your reasoning process in <think> tags and final answer "
         "as a single letter in <answer> tags. Format:\n"
         "<think>Your reasoning here (less than 2048 tokens)</think>\n"
         "<answer>A</answer>"
@@ -154,7 +171,27 @@ def _format_choices_official(choices: Any) -> str:
         return "\n".join(
             f"{labels[index]}. {value}" for index, value in enumerate(choices)
         )
-    return str(choices)
+    return "" if choices is None else str(choices)
+
+
+def _remove_conflicting_output_instructions(question: str) -> str:
+    """Remove answer-only boilerplate that conflicts with structured output."""
+    question = re.sub(
+        r"\s*Please answer the question and provide the correct option letter,\s*"
+        r"e\.g\.,\s*A\),\s*B\),\s*C\),\s*D\),\s*and option content at the "
+        r"beginning of your answer\.\s*",
+        " ",
+        question,
+        flags=re.IGNORECASE,
+    )
+    question = re.sub(
+        r"\s*You must start response from [A-G]\)"
+        r"(?:\s+or\s+[A-G]\))*\s*$",
+        "",
+        question,
+        flags=re.IGNORECASE,
+    )
+    return question.strip()
 
 
 def _question_already_has_choices(question: str, choices: Any) -> bool:
@@ -256,12 +293,21 @@ def _standard_prompt(
         raise ValueError("No numeric time series remained after preprocessing")
 
     question = str(sample["question"])
+    if prompt_mode in {"official", "json_reasoning"}:
+        question = _remove_conflicting_output_instructions(question)
     if prompt_mode == "official":
-        # Keep this deliberately equivalent to TSRBench's build_prompt_standard
-        # / build_prompt_temporal implementation.
-        question += " Here are the time series"
-        for name in names:
-            question += f" '{name}': <ts><ts/>. "
+        # Current Hugging Face perception data already contains placeholders,
+        # while older TSRBench tasks expect the runner to append them.
+        placeholder_count = question.count("<ts><ts/>")
+        if placeholder_count == 0:
+            question += " Here are the time series"
+            for name in names:
+                question += f" '{name}': <ts><ts/>. "
+        elif placeholder_count != len(series):
+            raise ValueError(
+                f"Prompt has {placeholder_count} <ts><ts/> placeholders but "
+                f"sample has {len(series)} series"
+            )
         question += _official_answer_instruction(
             _format_choices_official(sample.get("choices"))
         )
@@ -278,7 +324,12 @@ def _standard_prompt(
             f"Prompt has {placeholder_count} <ts><ts/> placeholders but sample has {len(series)} series"
         )
 
-    return question + ANSWER_ONLY_INSTRUCTION, series
+    instruction = (
+        JSON_REASONING_INSTRUCTION
+        if prompt_mode == "json_reasoning"
+        else ANSWER_ONLY_INSTRUCTION
+    )
+    return question + instruction, series
 
 
 def _abductive_prompt(
@@ -362,7 +413,11 @@ def _abductive_prompt(
             "\n\nNumeric time-series inputs around the missing event:\n"
             "- Team A win probability: <ts><ts/>\n"
             "- Team B win probability: <ts><ts/>"
-            + ANSWER_ONLY_INSTRUCTION
+        )
+        question += (
+            JSON_REASONING_INSTRUCTION
+            if prompt_mode == "json_reasoning"
+            else ANSWER_ONLY_INSTRUCTION
         )
     return question, [
         _as_1d_series(team_a, label="Team A win probability"),
@@ -419,6 +474,13 @@ def canonicalize_response(
 ) -> tuple[str, str | None, str | None]:
     """Return saved response, parsed answer, and optional reasoning path."""
     raw = response or ""
+    if prompt_mode == "json_reasoning":
+        diagnostics = analyze_json_reasoning_response(raw)
+        return (
+            raw,
+            diagnostics["parsed_answer"],
+            diagnostics["reasoning_path"],
+        )
     answer = extract_answer(raw)
     if answer is None:
         return raw, None, None
@@ -566,7 +628,10 @@ def parse_args() -> argparse.Namespace:
         "--prompt-mode",
         choices=PROMPT_MODES,
         default="answer_only",
-        help="answer_only disables reasoning; official reproduces TSRBench's ChatTS XML prompt.",
+        help=(
+            "answer_only returns a letter; official uses TSRBench XML; "
+            "json_reasoning returns strict reason/answer JSON."
+        ),
     )
     parser.add_argument(
         "--enable-thinking",
@@ -606,10 +671,13 @@ def generate_with_retries(
             if attempt_traces is not None or trace_labels is not None:
                 if prompt_mode == "official":
                     diagnostics = analyze_official_response(response)
+                elif prompt_mode == "json_reasoning":
+                    diagnostics = analyze_json_reasoning_response(response)
                 else:
                     answer = extract_answer(response)
                     diagnostics = {
                         "official_valid": None,
+                        "format_valid": answer is not None,
                         "parsed_answer": answer,
                         "reasoning_path": None,
                         "invalid_reasons": [] if answer else ["unparseable_answer"],
@@ -641,6 +709,12 @@ def generate_with_retries(
             remaining = [
                 index for index in remaining
                 if not _is_valid_official_response(responses[index])
+            ]
+        elif prompt_mode == "json_reasoning":
+            remaining = [
+                index
+                for index in remaining
+                if not analyze_json_reasoning_response(responses[index])["format_valid"]
             ]
         else:
             remaining = [
@@ -958,7 +1032,13 @@ def main() -> None:
                         final_valid = (
                             _is_valid_official_response(response)
                             if args.prompt_mode == "official"
-                            else parsed_answer is not None
+                            else (
+                                analyze_json_reasoning_response(response)[
+                                    "format_valid"
+                                ]
+                                if args.prompt_mode == "json_reasoning"
+                                else parsed_answer is not None
+                            )
                         )
                         trace_records[(dataset_name, index)] = {
                             "dataset": dataset_name,

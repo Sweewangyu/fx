@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Small official-prompt diagnostic run. It preserves every invalid retry and
-# the final valid/invalid response without changing the benchmark protocol.
+# Small structured-reasoning diagnostic run. It preserves every invalid retry
+# and the final valid/invalid response without changing answer scoring.
 
 PROJECT_ROOT="${PROJECT_ROOT:-/workspace/ChatTS/ChatTS-main}"
 TSRBENCH_ROOT="${TSRBENCH_ROOT:-/workspace/TSRBench}"
@@ -23,7 +23,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 export PROJECT_ROOT TSRBENCH_ROOT MODEL_PATH MODEL_NAME DATASETS
 export MAX_SAMPLES SAMPLE_INDICES OUTPUT_ROOT TRACE_OUTPUT PYTHON_BIN
-export PROMPT_MODE="official"
+export PROMPT_MODE="${PROMPT_MODE:-json_reasoning}"
 export FORCE_INFERENCE="${FORCE_INFERENCE:-1}"
 # Full-benchmark strict accuracy is misleading for a five-row subset; the
 # generated Markdown report calculates correctness only over the traced rows.
@@ -31,10 +31,6 @@ export RUN_EVALUATION="${RUN_EVALUATION:-0}"
 export NUM_GPUS="${NUM_GPUS:-2}"
 export NUM_GPUS_PER_PROCESS="${NUM_GPUS_PER_PROCESS:-2}"
 export REQUEST_CHUNK_SIZE="${REQUEST_CHUNK_SIZE:-1}"
-export BATCH_SIZE="${BATCH_SIZE:-1}"
-export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
-export TEMPERATURE="${TEMPERATURE:-1.0}"
-export MAX_RETRIES="${MAX_RETRIES:-10}"
 export SEED="${SEED:-42}"
 
 mkdir -p "$TRACE_RUN_ROOT"
