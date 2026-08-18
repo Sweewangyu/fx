@@ -166,6 +166,17 @@ def assignments(stdout: str) -> dict[str, str]:
     return dict(line.split("=", 1) for line in stdout.splitlines())
 
 
+def replace_protocol_identity(payload: dict[str, Any], protocol_hash: str) -> None:
+    evaluation = payload["evaluation"]
+    previous_id = f"protocol-{evaluation['protocol_hash'][:16]}"
+    protocol_id = f"protocol-{protocol_hash[:16]}"
+    evaluation["protocol_hash"] = protocol_hash
+    evaluation["output_root"] = evaluation["output_root"].replace(
+        previous_id, protocol_id
+    )
+    evaluation["run_id"] = evaluation["run_id"].replace(previous_id, protocol_id)
+
+
 def test_loader_emits_full_frozen_training_contract(tmp_path: Path) -> None:
     job_id = "1" * 32
     config = tmp_path / "resolved.yaml"
@@ -195,6 +206,44 @@ def test_loader_emits_full_frozen_training_contract(tmp_path: Path) -> None:
     assert values["BENCHMARKS"] == "tsrbench,timeseriesexam"
     assert values["CHATTS_EVALUATION_DIR"] == "/host/ChatTS"
     assert "STAGE1_OUT" not in values
+
+
+def test_loader_accepts_and_freezes_json_reasoning_prompt_mode(tmp_path: Path) -> None:
+    job_id = "9" * 32
+    config = tmp_path / "json-reasoning.yaml"
+    payload = frozen_payload(job_id=job_id)
+    payload["evaluation"].update(
+        {
+            "tsr_prompt_mode": "json_reasoning",
+            "tsr_max_new_tokens": 256,
+            "tsr_batch_size": 1,
+        }
+    )
+    replace_protocol_identity(payload, "e" * 64)
+    del payload["pipeline"]["trial_config_hash"]
+    payload["pipeline"]["trial_config_hash"] = canonical_hash(payload)
+    frozen_hash = payload["pipeline"]["trial_config_hash"]
+    write_payload(config, payload)
+
+    completed = load_environment(config, job_id)
+
+    assert completed.returncode == 0, completed.stderr
+    values = assignments(completed.stdout)
+    assert values["TSR_PROMPT_MODE"] == "json_reasoning"
+    assert values["TSR_MAX_NEW_TOKENS"] == "256"
+    assert values["TSR_BATCH_SIZE"] == "1"
+    assert values["EVAL_PROTOCOL_HASH"] == "e" * 64
+    assert values["EVAL_OUTPUT_ROOT"].endswith("/protocol-eeeeeeeeeeeeeeee")
+    assert values["TRIAL_CONFIG_HASH"] == frozen_hash
+
+    # Prompt mode is part of the immutable resolved YAML. Mutating it after
+    # Studio freezes the job must fail before Slurm starts either container.
+    tampered = json.loads(json.dumps(payload))
+    tampered["evaluation"]["tsr_prompt_mode"] = "official"
+    write_payload(config, tampered)
+    rejected = load_environment(config, job_id)
+    assert rejected.returncode != 0
+    assert "trial_config_hash does not match" in rejected.stderr
 
 
 def test_stage1_mode_saves_directly_to_recipe_final_model(tmp_path: Path) -> None:
@@ -289,6 +338,18 @@ def test_loader_rejects_wrong_marker_unknown_eval_field_and_invalid_protocol(
     assert result.returncode != 0
     assert "must end in the frozen protocol id" in result.stderr
 
+    invalid_prompt = frozen_payload(job_id=job_id)
+    invalid_prompt["evaluation"]["tsr_prompt_mode"] = "free_form_reasoning"
+    del invalid_prompt["pipeline"]["trial_config_hash"]
+    invalid_prompt["pipeline"]["trial_config_hash"] = canonical_hash(invalid_prompt)
+    write_payload(config, invalid_prompt)
+    result = load_environment(config, job_id)
+    assert result.returncode != 0
+    assert (
+        "evaluation.tsr_prompt_mode must be answer_only, official, or json_reasoning"
+        in result.stderr
+    )
+
 
 @pytest.mark.parametrize(
     ("mode", "marker", "preflight"),
@@ -348,6 +409,15 @@ def test_sbatch_passes_training_then_evaluation_contract_to_singularity(
     timeseriesexam.mkdir()
 
     payload = frozen_payload(mode=mode, job_id=job_id)
+    if mode == "full" and not preflight:
+        payload["evaluation"].update(
+            {
+                "tsr_prompt_mode": "json_reasoning",
+                "tsr_max_new_tokens": 256,
+                "tsr_batch_size": 1,
+            }
+        )
+        replace_protocol_identity(payload, "e" * 64)
     payload["pipeline"]["offline"] = False
     payload["pipeline"]["preflight_only"] = preflight
     payload["slurm"].update(
@@ -407,7 +477,14 @@ def test_sbatch_passes_training_then_evaluation_contract_to_singularity(
     assert argv_text.count("=== CALL ===") == 2
     assert f"MODEL_COMPLETION_MARKER={marker}" in argv_text
     assert f"PREFLIGHT_ONLY={int(preflight)}" in argv_text
-    assert "EVAL_PROTOCOL_HASH=" + "d" * 64 in argv_text
+    expected_prompt_mode = (
+        "json_reasoning" if mode == "full" and not preflight else "answer_only"
+    )
+    expected_protocol_hash = (
+        "e" * 64 if expected_prompt_mode == "json_reasoning" else "d" * 64
+    )
+    assert f"EVAL_PROTOCOL_HASH={expected_protocol_hash}" in argv_text
+    assert f"TSR_PROMPT_MODE={expected_prompt_mode}" in argv_text
     assert "Config file SHA256:" in completed.stdout
     calls = argv_text.split("=== CALL ===")[1:]
     assert len(calls) == 2

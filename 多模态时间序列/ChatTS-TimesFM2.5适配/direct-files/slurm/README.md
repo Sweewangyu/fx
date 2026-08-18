@@ -31,6 +31,10 @@ the launcher verifies:
 - all Stage1 and Stage2 values are present and only whitelisted fields are used;
 - the complete evaluation protocol is present, its protocol hash is valid, and no
   unknown evaluation field is silently ignored;
+- TSRBench prompt mode is one of `answer_only`, `official`, or
+  `json_reasoning`; the selected mode and its token/batch settings remain part
+  of the immutable resolved configuration and are passed unchanged as
+  `TSR_PROMPT_MODE` to the evaluation container;
 - the evaluation model exactly equals the resolved final training model, with
   `STAGE1_COMPLETE.json` for Stage1-only or `TRAINING_COMPLETE.json` for full;
 - the selected mode is `full` or `stage1`.
@@ -45,7 +49,9 @@ benchmarks in a second `srun` step inside the same sbatch allocation. A training
 or marker/weight validation failure prevents that evaluation step from starting.
 The evaluation output directory is scoped by
 `protocol-<evaluation.protocol_hash[:16]>`, so different benchmark protocols do
-not overwrite each other. The evaluation container's Hugging Face offline flags
+not overwrite each other. Changing `tsr_prompt_mode` produces a different
+Studio protocol hash/output scope, while post-freeze changes are rejected by
+the complete `pipeline.trial_config_hash`. The evaluation container's Hugging Face offline flags
 strictly follow the frozen `pipeline.offline` value.
 
 At compute-node startup the launcher takes a non-blocking shared-filesystem

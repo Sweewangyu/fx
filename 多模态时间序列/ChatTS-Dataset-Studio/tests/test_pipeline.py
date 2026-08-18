@@ -516,6 +516,63 @@ def test_evaluation_changes_protocol_and_config_but_never_training_recipe(
     ]
 
 
+@pytest.mark.parametrize(
+    ("prompt_mode", "max_new_tokens", "batch_size"),
+    [
+        ("answer_only", 8, 16),
+        ("official", 512, 1),
+        ("json_reasoning", 256, 1),
+    ],
+)
+def test_tsr_prompt_modes_use_protocol_defaults(
+    tmp_path: Path,
+    prompt_mode: str,
+    max_new_tokens: int,
+    batch_size: int,
+) -> None:
+    resolved = resolve_pipeline_request(
+        {"evaluation": {"tsr_prompt_mode": prompt_mode}},
+        _version(tmp_path),
+        _integration(tmp_path),
+    )
+
+    evaluation = resolved["config"]["evaluation"]
+    assert evaluation["tsr_prompt_mode"] == prompt_mode
+    assert evaluation["tsr_max_new_tokens"] == max_new_tokens
+    assert evaluation["tsr_batch_size"] == batch_size
+
+
+def test_json_reasoning_explicit_resource_override_is_preserved(tmp_path: Path) -> None:
+    resolved = resolve_evaluation_requests(
+        {
+            "model_paths": ["/share/models/json-reasoning"],
+            "evaluation": {
+                "tsr_prompt_mode": "json_reasoning",
+                "tsr_max_new_tokens": 384,
+                "tsr_batch_size": 2,
+            },
+        },
+        _standalone_integration(tmp_path),
+    )[0]
+
+    evaluation = resolved["config"]["evaluation"]
+    assert evaluation["tsr_prompt_mode"] == "json_reasoning"
+    assert evaluation["tsr_max_new_tokens"] == 384
+    assert evaluation["tsr_batch_size"] == 2
+
+
+@pytest.mark.parametrize("prompt_mode", ["free_form", None, []])
+def test_unknown_tsr_prompt_mode_is_rejected(
+    tmp_path: Path, prompt_mode: object
+) -> None:
+    with pytest.raises(StudioError, match="json_reasoning"):
+        resolve_pipeline_request(
+            {"evaluation": {"tsr_prompt_mode": prompt_mode}},
+            _version(tmp_path),
+            _integration(tmp_path),
+        )
+
+
 def test_client_protocol_hash_is_only_an_expected_server_hash(tmp_path: Path) -> None:
     integration = _integration(tmp_path)
     version = _version(tmp_path)

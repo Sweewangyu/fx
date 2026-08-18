@@ -37,9 +37,11 @@ from pathlib import Path
 suite, output_root, model_name = sys.argv[1:4]
 keys = {
     "tsrbench": [
-        "TS_ENCODER_TYPE", "CHATTS_TS_ENCODER_TYPE", "TEMPERATURE",
-        "MAX_RETRIES", "MAX_INPUT_TOKENS", "HF_HUB_OFFLINE",
-        "TRANSFORMERS_OFFLINE",
+        "TS_ENCODER_TYPE", "CHATTS_TS_ENCODER_TYPE", "PROMPT_MODE",
+        "CHATTS_VLLM_MAX_MODEL_LEN", "MAX_NEW_TOKENS",
+        "MAX_PROCESSED_INPUT_TOKENS", "BATCH_SIZE", "REQUEST_CHUNK_SIZE",
+        "TEMPERATURE", "MAX_RETRIES", "MAX_INPUT_TOKENS",
+        "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE",
     ],
     "tinybenchmarks": [
         "CHATTS_TS_ENCODER_TYPE", "SUMMARY_ONLY", "DTYPE",
@@ -103,6 +105,7 @@ summary.write_text(json.dumps(payload) + "\\n", encoding="utf-8")
     for name in (
         "llm_utils.py",
         "inference_tsrbench_vllm.py",
+        "tsrbench_trace.py",
         "inference_tinybenchmarks_mcq_vllm.py",
         "inference_ts_haystack_vllm.py",
         "inference_timeseriesexam_vllm.py",
@@ -112,7 +115,12 @@ summary.write_text(json.dumps(payload) + "\\n", encoding="utf-8")
     return project
 
 
-def _run_fixture(root: Path, *, prompt_mode: str = "answer_only") -> tuple[dict[str, dict[str, str | None]], Path]:
+def _run_fixture(
+    root: Path,
+    *,
+    prompt_mode: str = "answer_only",
+    overrides: dict[str, str] | None = None,
+) -> tuple[dict[str, dict[str, str | None]], Path]:
     project = _fake_project(root)
     model = root / "model"
     chronos = root / "chronos2"
@@ -145,6 +153,13 @@ def _run_fixture(root: Path, *, prompt_mode: str = "answer_only") -> tuple[dict[
     _write(exam_data, "[]\n")
 
     environment = os.environ.copy()
+    for name in (
+        "TSR_MAX_MODEL_LEN",
+        "TSR_MAX_NEW_TOKENS",
+        "TSR_BATCH_SIZE",
+        "TSR_REQUEST_CHUNK_SIZE",
+    ):
+        environment.pop(name, None)
     environment.update(
         {
             "PROJECT_ROOT": str(project),
@@ -188,6 +203,7 @@ def _run_fixture(root: Path, *, prompt_mode: str = "answer_only") -> tuple[dict[
             "TRANSFORMERS_OFFLINE": "1",
         }
     )
+    environment.update(overrides or {})
     completed = subprocess.run(
         ["bash", str(RUNNER)],
         env=environment,
@@ -213,6 +229,12 @@ def test_top_level_runner_closes_polluted_child_environment(tmp_path: Path) -> N
         "suite": "tsrbench",
         "TS_ENCODER_TYPE": "chronos2",
         "CHATTS_TS_ENCODER_TYPE": "chronos2",
+        "PROMPT_MODE": "answer_only",
+        "CHATTS_VLLM_MAX_MODEL_LEN": "12288",
+        "MAX_NEW_TOKENS": "8",
+        "MAX_PROCESSED_INPUT_TOKENS": "12280",
+        "BATCH_SIZE": "16",
+        "REQUEST_CHUNK_SIZE": "128",
         "TEMPERATURE": "0.0",
         "MAX_RETRIES": "0",
         "MAX_INPUT_TOKENS": "0",
@@ -242,10 +264,15 @@ def test_top_level_runner_closes_polluted_child_environment(tmp_path: Path) -> N
     assert "forgetting_threshold_pp=5.0" in tiny_manifest["protocol_items"]
 
 
-def test_tsr_declared_prompt_changes_fixed_protocol_fingerprint(tmp_path: Path) -> None:
+def test_tsr_modes_keep_their_native_defaults_and_distinct_fingerprints(
+    tmp_path: Path,
+) -> None:
     answer_events, answer_output = _run_fixture(tmp_path / "answer")
     official_events, official_output = _run_fixture(
         tmp_path / "official", prompt_mode="official"
+    )
+    json_events, json_output = _run_fixture(
+        tmp_path / "json", prompt_mode="json_reasoning"
     )
 
     answer_manifest = json.loads(
@@ -258,14 +285,82 @@ def test_tsr_declared_prompt_changes_fixed_protocol_fingerprint(tmp_path: Path) 
             encoding="utf-8"
         )
     )
-    assert answer_manifest["protocol_fingerprint"] != official_manifest[
-        "protocol_fingerprint"
-    ]
+    json_manifest = json.loads(
+        (json_output / "tsrbench" / ".chatts_benchmark_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    fingerprints = {
+        answer_manifest["protocol_fingerprint"],
+        official_manifest["protocol_fingerprint"],
+        json_manifest["protocol_fingerprint"],
+    }
+    assert len(fingerprints) == 3
+    assert any(
+        path.endswith("/chatts/utils/tsrbench_trace.py")
+        for path in json_manifest["protocol_files"]
+    )
+    assert answer_events["tsrbench"]["MAX_NEW_TOKENS"] == "8"
+    assert answer_events["tsrbench"]["BATCH_SIZE"] == "16"
     assert answer_events["tsrbench"]["TEMPERATURE"] == "0.0"
     assert answer_events["tsrbench"]["MAX_RETRIES"] == "0"
+    assert answer_events["tsrbench"]["MAX_INPUT_TOKENS"] == "0"
+    assert official_events["tsrbench"]["MAX_NEW_TOKENS"] == "512"
+    assert official_events["tsrbench"]["BATCH_SIZE"] == "1"
     assert official_events["tsrbench"]["TEMPERATURE"] == "1.0"
     assert official_events["tsrbench"]["MAX_RETRIES"] == "10"
     assert official_events["tsrbench"]["MAX_INPUT_TOKENS"] == "8000"
+    assert json_events["tsrbench"]["MAX_NEW_TOKENS"] == "256"
+    assert json_events["tsrbench"]["BATCH_SIZE"] == "1"
+    assert json_events["tsrbench"]["TEMPERATURE"] == "0.0"
+    assert json_events["tsrbench"]["MAX_RETRIES"] == "1"
+    assert json_events["tsrbench"]["MAX_INPUT_TOKENS"] == "8000"
+    for manifest, expected in (
+        (answer_manifest, {"max_new_tokens=8", "batch_size=16"}),
+        (official_manifest, {"max_new_tokens=512", "batch_size=1"}),
+        (json_manifest, {"max_new_tokens=256", "batch_size=1"}),
+    ):
+        assert expected <= set(manifest["protocol_items"])
+
+
+def test_tsr_json_mode_preserves_explicit_capacity_overrides(tmp_path: Path) -> None:
+    events, output = _run_fixture(
+        tmp_path,
+        prompt_mode="json_reasoning",
+        overrides={
+            "TSR_MAX_MODEL_LEN": "13000",
+            "TSR_MAX_NEW_TOKENS": "300",
+            "TSR_BATCH_SIZE": "2",
+            "TSR_REQUEST_CHUNK_SIZE": "17",
+        },
+    )
+
+    event = events["tsrbench"]
+    assert event["CHATTS_VLLM_MAX_MODEL_LEN"] == "13000"
+    assert event["MAX_NEW_TOKENS"] == "300"
+    assert event["MAX_PROCESSED_INPUT_TOKENS"] == "12700"
+    assert event["BATCH_SIZE"] == "2"
+    assert event["REQUEST_CHUNK_SIZE"] == "17"
+    assert event["TEMPERATURE"] == "0.0"
+    assert event["MAX_RETRIES"] == "1"
+    assert event["MAX_INPUT_TOKENS"] == "8000"
+
+    manifest = json.loads(
+        (output / "tsrbench" / ".chatts_benchmark_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {
+        "prompt_mode=json_reasoning",
+        "max_model_len=13000",
+        "max_new_tokens=300",
+        "max_processed_input_tokens=12700",
+        "batch_size=2",
+        "request_chunk_size=17",
+        "temperature=0.0",
+        "max_retries=1",
+        "max_input_tokens=8000",
+    } <= set(manifest["protocol_items"])
 
 
 def test_standalone_preflight_requires_selected_model_immediately(tmp_path: Path) -> None:

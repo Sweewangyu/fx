@@ -289,6 +289,23 @@ bash scripts/run_chatts_tsrbench.sh
 thinking 是 TSRBench 用户 prompt 明确要求的推理，不是额外开启 Qwen3 chat
 template 的 thinking 开关。
 
+需要可机器审计的简短推理时，可以使用 `PROMPT_MODE=json_reasoning`。该模式要求
+严格输出 `{"reason":"...","answer":"A"}`，默认
+`max_new_tokens=256`、`batch_size=1`、`temperature=0.0`、输入上限 `8000`、
+一次格式重试，并继续关闭 Qwen3 原生 thinking。总评测脚本使用相同的
+`TSR_PROMPT_MODE=json_reasoning`；三种模式的默认值如下：
+
+| 模式 | max new tokens | batch | temperature | retries | input cutoff |
+|---|---:|---:|---:|---:|---:|
+| `answer_only` | 8 | 16 | 0.0 | 0 | 0 |
+| `official` | 512 | 1 | 1.0 | 10 | 8000 |
+| `json_reasoning` | 256 | 1 | 0.0 | 1 | 8000 |
+
+`TSR_MAX_MODEL_LEN`、`TSR_MAX_NEW_TOKENS`、`TSR_BATCH_SIZE` 和
+`TSR_REQUEST_CHUNK_SIZE` 仍可显式覆盖。最终采用的值、JSON 校验器代码以及
+temperature/retry/input cutoff 都进入 protocol fingerprint，因而不会错误复用其他
+prompt 模式或旧校验器产生的缓存。
+
 推理和评测解析器均接受“第一行是单个选项字母、后面带解释”的历史输出。因此旧的
 `generated_answer.json` 不需要重跑；更新 `scripts/evaluate_tsrbench.py` 后直接
 重新执行评测即可恢复这类答案。
@@ -524,7 +541,8 @@ vLLM worker；tinyBenchmarks 使用单个 8 卡 tensor-parallel 引擎。某套�
 四套评测统一使用 `seed=42`；TSRBench 与 tinyBenchmarks 已补齐 vLLM engine 和
 SamplingParams 的 seed，TS-Haystack 与 TimeSeriesExam 沿用各自已有的 seed 参数。
 总控还会覆盖容器残留的通用环境变量：TSRBench 的 temperature/retry/input cutoff
-由 `TSR_PROMPT_MODE` 唯一决定，tinyBenchmarks 固定 `SUMMARY_ONLY=0`、`dtype=auto`
+由 `TSR_PROMPT_MODE`（`answer_only`、`official` 或 `json_reasoning`）唯一决定，
+tinyBenchmarks 固定 `SUMMARY_ONLY=0`、`dtype=auto`
 和严格数据量检查，TimeSeriesExam 固定 3 个 concepts；这些值都进入 suite protocol
 fingerprint。`OFFLINE=0/1` 也会显式写成 Hugging Face 的 `0/1`，不会继承上一次任务。
 通常只需确认 TS-Haystack、TimeSeriesExam 和 Chronos-2 的本地路径：

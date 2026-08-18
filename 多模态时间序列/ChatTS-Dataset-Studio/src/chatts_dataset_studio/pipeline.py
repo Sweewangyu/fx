@@ -94,6 +94,32 @@ EVALUATION_DEFAULTS: dict[str, Any] = {
     "exam_request_chunk_size": 64,
 }
 
+# Keep these mode-dependent defaults aligned with ChatTS'
+# scripts/run_chatts_tsrbench.sh.  API callers may still override any of the
+# exposed resource controls explicitly, while selecting only a prompt mode
+# gets the protocol intended by that mode instead of answer_only's 8-token
+# budget.
+TSR_PROMPT_DEFAULTS: dict[str, dict[str, int]] = {
+    "answer_only": {
+        "tsr_max_model_len": 12288,
+        "tsr_max_new_tokens": 8,
+        "tsr_batch_size": 16,
+        "tsr_request_chunk_size": 128,
+    },
+    "official": {
+        "tsr_max_model_len": 12288,
+        "tsr_max_new_tokens": 512,
+        "tsr_batch_size": 1,
+        "tsr_request_chunk_size": 128,
+    },
+    "json_reasoning": {
+        "tsr_max_model_len": 12288,
+        "tsr_max_new_tokens": 256,
+        "tsr_batch_size": 1,
+        "tsr_request_chunk_size": 128,
+    },
+}
+
 _STAGE_KEYS = frozenset(STAGE_DEFAULTS["stage1"])
 _TRAINING_KEYS = frozenset(
     {
@@ -474,7 +500,19 @@ def _with_model_scale(template: str, scale: str | None) -> str:
 
 def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) -> dict[str, Any]:
     _reject_unknown(request, _EVALUATION_KEYS, "evaluation")
-    values = {**EVALUATION_DEFAULTS, **request}
+    prompt_mode = request.get(
+        "tsr_prompt_mode", EVALUATION_DEFAULTS["tsr_prompt_mode"]
+    )
+    if not isinstance(prompt_mode, str) or prompt_mode not in TSR_PROMPT_DEFAULTS:
+        raise StudioError(
+            "evaluation.tsr_prompt_mode must be answer_only, official, or "
+            "json_reasoning"
+        )
+    values = {
+        **EVALUATION_DEFAULTS,
+        **TSR_PROMPT_DEFAULTS[prompt_mode],
+        **request,
+    }
     roots = {
         "project_root": _fixed_value(request, "project_root", integration, "eval_project_root"),
         "script": integration.get("evaluation_script"),
@@ -580,8 +618,14 @@ def _resolve_evaluation(request: dict[str, Any], integration: dict[str, Any]) ->
         raise StudioError(
             "evaluation.tiny_data_partition must be all, search-dev, or final-test"
         )
-    if result["tsr_prompt_mode"] not in ("answer_only", "official"):
-        raise StudioError("evaluation.tsr_prompt_mode must be answer_only or official")
+    if (
+        not isinstance(result["tsr_prompt_mode"], str)
+        or result["tsr_prompt_mode"] not in TSR_PROMPT_DEFAULTS
+    ):
+        raise StudioError(
+            "evaluation.tsr_prompt_mode must be answer_only, official, or "
+            "json_reasoning"
+        )
     for prefix in ("tsr", "haystack", "exam"):
         if result[f"{prefix}_max_model_len"] <= result[f"{prefix}_max_new_tokens"]:
             raise StudioError(

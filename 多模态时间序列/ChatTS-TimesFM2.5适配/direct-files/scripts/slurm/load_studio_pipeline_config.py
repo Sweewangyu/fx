@@ -486,8 +486,15 @@ def validate_evaluation(
         raise ValueError("evaluation.haystack_split is invalid")
     if evaluation["tiny_data_partition"] not in {"all", "search-dev", "final-test"}:
         raise ValueError("evaluation.tiny_data_partition is invalid")
-    if evaluation["tsr_prompt_mode"] not in {"answer_only", "official"}:
-        raise ValueError("evaluation.tsr_prompt_mode is invalid")
+    if evaluation["tsr_prompt_mode"] not in {
+        "answer_only",
+        "official",
+        "json_reasoning",
+    }:
+        raise ValueError(
+            "evaluation.tsr_prompt_mode must be answer_only, official, or "
+            "json_reasoning"
+        )
 
     integer_fields = (
         "tiny_partition_seed",

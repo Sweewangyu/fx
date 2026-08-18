@@ -98,12 +98,14 @@ evaluation:
   haystack_split: test
   tiny_data_partition: all
   tiny_partition_seed: 42
-  # Safe advanced controls. These are the historical runner defaults; omitting
-  # them keeps old configuration files fully backward compatible.
+  # TSRBench modes: answer_only, official, json_reasoning.  max_new_tokens and
+  # batch_size are intentionally omitted so each mode receives its native
+  # defaults: answer=(8,16), official=(512,1), json=(256,1).  Uncomment either
+  # field to override it explicitly.
   tsr_prompt_mode: answer_only
   tsr_max_model_len: 12288
-  tsr_max_new_tokens: 8
-  tsr_batch_size: 16
+  # tsr_max_new_tokens: 8
+  # tsr_batch_size: 16
   tsr_request_chunk_size: 128
   tiny_max_model_len: 6000
   tiny_request_chunk_size: 16

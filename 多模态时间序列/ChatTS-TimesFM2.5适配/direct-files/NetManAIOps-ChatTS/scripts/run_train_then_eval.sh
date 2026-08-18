@@ -82,9 +82,25 @@ TRIAL_CONFIG_HASH="${TRIAL_CONFIG_HASH:-}"
 # exactly the same evaluation protocol.
 TSR_PROMPT_MODE="${TSR_PROMPT_MODE:-answer_only}"
 TSR_MAX_MODEL_LEN="${TSR_MAX_MODEL_LEN:-12288}"
-TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-8}"
-TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-16}"
 TSR_REQUEST_CHUNK_SIZE="${TSR_REQUEST_CHUNK_SIZE:-128}"
+case "$TSR_PROMPT_MODE" in
+    official)
+        TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-512}"
+        TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-1}"
+        ;;
+    json_reasoning)
+        TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-256}"
+        TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-1}"
+        ;;
+    answer_only)
+        TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-8}"
+        TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-16}"
+        ;;
+    *)
+        echo "TSR_PROMPT_MODE must be answer_only, official, or json_reasoning." >&2
+        exit 2
+        ;;
+esac
 TINY_MAX_MODEL_LEN="${TINY_MAX_MODEL_LEN:-6000}"
 TINY_REQUEST_CHUNK_SIZE="${TINY_REQUEST_CHUNK_SIZE:-16}"
 TINY_GPU_MEMORY_UTILIZATION="${TINY_GPU_MEMORY_UTILIZATION:-0.70}"
@@ -205,11 +221,6 @@ case "$TINY_DATA_PARTITION" in
     all|search-dev|final-test) ;;
     *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
 esac
-case "$TSR_PROMPT_MODE" in
-    answer_only|official) ;;
-    *) echo "TSR_PROMPT_MODE must be answer_only or official." >&2; exit 2 ;;
-esac
-
 for parameter_name in \
     TSR_MAX_MODEL_LEN TSR_MAX_NEW_TOKENS TSR_BATCH_SIZE TSR_REQUEST_CHUNK_SIZE \
     TINY_MAX_MODEL_LEN TINY_REQUEST_CHUNK_SIZE \

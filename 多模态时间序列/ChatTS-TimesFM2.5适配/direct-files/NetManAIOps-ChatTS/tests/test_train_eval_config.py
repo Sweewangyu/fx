@@ -415,6 +415,21 @@ def test_host_legacy_config_retains_advanced_evaluation_defaults(tmp_path: Path)
     }
 
 
+def test_host_json_reasoning_uses_native_defaults(tmp_path: Path) -> None:
+    events = _run_host_pipeline(
+        tmp_path,
+        "",
+        "tsr_prompt_mode: json_reasoning",
+    )
+
+    evaluation = events[1]
+    assert evaluation["TSR_PROMPT_MODE"] == "json_reasoning"
+    assert evaluation["TSR_MAX_MODEL_LEN"] == "12288"
+    assert evaluation["TSR_MAX_NEW_TOKENS"] == "256"
+    assert evaluation["TSR_BATCH_SIZE"] == "1"
+    assert evaluation["TSR_REQUEST_CHUNK_SIZE"] == "128"
+
+
 def test_host_stage1_mode_saves_weights_then_evaluates_same_checkpoint(
     tmp_path: Path,
 ) -> None:

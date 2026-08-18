@@ -234,6 +234,11 @@ Slurm 使用 `run_chatts_studio_evaluation.sbatch` 立即提交，页面中的 `
 单独评测不需要数据版本、ChatTS-Training 注册记录或训练完成 marker。兼容旧配置时会从
 `evaluation_root/scripts/run_eval_only.sh` 自动找到 Docker 入口；也可显式配置：
 
+TSRBench prompt 可选 `answer_only`、`official` 和 `json_reasoning`。选择
+`json_reasoning` 时页面会使用 256 个生成 token、batch size 1 的推荐值，并把模式及实际资源参数
+一起写入协议哈希；其严格输出格式为 `{"reason":"...","answer":"A"}`。训练后评测与单独评测、
+Docker 与 Slurm 使用同一套设置。
+
 ```yaml
 integration:
   evaluation_pipeline_script: /actual/workspace/ChatTS/scripts/run_eval_only.sh

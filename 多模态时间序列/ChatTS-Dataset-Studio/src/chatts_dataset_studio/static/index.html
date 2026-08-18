@@ -317,7 +317,7 @@
             <label class="field"><span>Tiny partition</span><select id="tiny-partition"><option value="all">all</option><option value="search-dev">search-dev</option><option value="final-test">final-test</option></select></label>
             <label class="field"><span>Tiny seed</span><input id="tiny-seed" type="number" min="0" value="42"></label>
             <label class="field check-field"><input id="force-eval" type="checkbox"><span>强制重新评测</span></label>
-            <label class="field"><span>TSR prompt</span><select id="tsr-prompt-mode"><option value="answer_only">answer_only</option><option value="official">official</option></select></label>
+            <label class="field"><span>TSR prompt</span><select id="tsr-prompt-mode"><option value="answer_only">answer_only</option><option value="official">official</option><option value="json_reasoning">json_reasoning</option></select><small class="field-help">json_reasoning 要求严格输出 {"reason":"...","answer":"A"}。</small></label>
             <label class="field"><span>期望协议 Hash（可留空）</span><input id="eval-protocol-hash" type="text" maxlength="64" placeholder="服务端自动计算" spellcheck="false"><small class="field-help">填写时只用于一致性校验，不能覆盖服务端计算结果。</small></label>
             <label class="field"><span>TSR 最大长度</span><input id="tsr-max-model-len" type="number" min="1" value="12288"></label>
             <label class="field"><span>TSR 新 token</span><input id="tsr-max-new-tokens" type="number" min="1" value="8"></label>

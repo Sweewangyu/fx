@@ -55,18 +55,34 @@ TS_GPUS_PER_PROCESS="${TS_GPUS_PER_PROCESS:-2}"
 
 TSR_PROMPT_MODE="${TSR_PROMPT_MODE:-answer_only}"
 TSR_MAX_MODEL_LEN="${TSR_MAX_MODEL_LEN:-12288}"
-TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-8}"
-TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-16}"
 TSR_REQUEST_CHUNK_SIZE="${TSR_REQUEST_CHUNK_SIZE:-128}"
-if [[ "$TSR_PROMPT_MODE" == "official" ]]; then
-    TSR_TEMPERATURE=1.0
-    TSR_MAX_RETRIES=10
-    TSR_MAX_INPUT_TOKENS=8000
-else
-    TSR_TEMPERATURE=0.0
-    TSR_MAX_RETRIES=0
-    TSR_MAX_INPUT_TOKENS=0
-fi
+case "$TSR_PROMPT_MODE" in
+    official)
+        TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-512}"
+        TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-1}"
+        TSR_TEMPERATURE=1.0
+        TSR_MAX_RETRIES=10
+        TSR_MAX_INPUT_TOKENS=8000
+        ;;
+    json_reasoning)
+        TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-256}"
+        TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-1}"
+        TSR_TEMPERATURE=0.0
+        TSR_MAX_RETRIES=1
+        TSR_MAX_INPUT_TOKENS=8000
+        ;;
+    answer_only)
+        TSR_MAX_NEW_TOKENS="${TSR_MAX_NEW_TOKENS:-8}"
+        TSR_BATCH_SIZE="${TSR_BATCH_SIZE:-16}"
+        TSR_TEMPERATURE=0.0
+        TSR_MAX_RETRIES=0
+        TSR_MAX_INPUT_TOKENS=0
+        ;;
+    *)
+        echo "TSR_PROMPT_MODE must be answer_only, official, or json_reasoning." >&2
+        exit 2
+        ;;
+esac
 
 TINY_MAX_MODEL_LEN="${TINY_MAX_MODEL_LEN:-6000}"
 TINY_REQUEST_CHUNK_SIZE="${TINY_REQUEST_CHUNK_SIZE:-16}"
@@ -129,10 +145,6 @@ esac
 case "$TINY_DATA_PARTITION" in
     all|search-dev|final-test) ;;
     *) echo "TINY_DATA_PARTITION must be all, search-dev, or final-test." >&2; exit 2 ;;
-esac
-case "$TSR_PROMPT_MODE" in
-    answer_only|official) ;;
-    *) echo "TSR_PROMPT_MODE must be answer_only or official." >&2; exit 2 ;;
 esac
 case "$HAYSTACK_SPLIT" in
     train|validation|test) ;;
@@ -229,6 +241,7 @@ if suite_selected tsrbench; then
     require_file "TSRBench runner" "$PROJECT_ROOT/scripts/run_chatts_tsrbench.sh"
     require_file "TSRBench evaluator" "$PROJECT_ROOT/scripts/evaluate_tsrbench.py"
     require_file "TSRBench inference module" "$PROJECT_ROOT/chatts/utils/inference_tsrbench_vllm.py"
+    require_file "TSRBench JSON response validator" "$PROJECT_ROOT/chatts/utils/tsrbench_trace.py"
     tsr_probe="$(find "$TSRBENCH_DATASET_ROOT" -type f -name perception.jsonl -print -quit)"
     [[ -n "$tsr_probe" ]] || {
         echo "Cannot find perception.jsonl under $TSRBENCH_DATASET_ROOT" >&2
@@ -503,10 +516,12 @@ suite_artifact() {
                 --protocol-file "$PROJECT_ROOT/scripts/run_chatts_tsrbench.sh"
                 --protocol-file "$PROJECT_ROOT/scripts/evaluate_tsrbench.py"
                 --protocol-file "$PROJECT_ROOT/chatts/utils/inference_tsrbench_vllm.py"
+                --protocol-file "$PROJECT_ROOT/chatts/utils/tsrbench_trace.py"
                 --protocol "datasets=all"
                 --protocol "prompt_mode=$TSR_PROMPT_MODE"
                 --protocol "max_model_len=$TSR_MAX_MODEL_LEN"
                 --protocol "max_new_tokens=$TSR_MAX_NEW_TOKENS"
+                --protocol "max_processed_input_tokens=$((TSR_MAX_MODEL_LEN - TSR_MAX_NEW_TOKENS))"
                 --protocol "batch_size=$TSR_BATCH_SIZE"
                 --protocol "request_chunk_size=$TSR_REQUEST_CHUNK_SIZE"
                 --protocol "temperature=$TSR_TEMPERATURE"

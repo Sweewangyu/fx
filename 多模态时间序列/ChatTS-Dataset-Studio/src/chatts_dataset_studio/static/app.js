@@ -31,6 +31,11 @@ const pathFields = {
   data_root: $("#data-root"),
   output_root: $("#output-root"),
 };
+const tsrPromptDefaults = {
+  answer_only: { maxModelLen: 12288, maxNewTokens: 8, batchSize: 16, requestChunkSize: 128 },
+  official: { maxModelLen: 12288, maxNewTokens: 512, batchSize: 1, requestChunkSize: 128 },
+  json_reasoning: { maxModelLen: 12288, maxNewTokens: 256, batchSize: 1, requestChunkSize: 128 },
+};
 
 class ApiError extends Error {
   constructor(message, status) {
@@ -967,6 +972,17 @@ function evaluationPayload() {
   };
 }
 
+function applyTsrPromptDefaults() {
+  const defaults = tsrPromptDefaults[$("#tsr-prompt-mode").value];
+  if (!defaults) return;
+  $("#tsr-max-model-len").value = defaults.maxModelLen;
+  $("#tsr-max-new-tokens").value = defaults.maxNewTokens;
+  $("#tsr-batch-size").value = defaults.batchSize;
+  $("#tsr-request-chunk-size").value = defaults.requestChunkSize;
+  updateDerivedPaths();
+  renderActionState();
+}
+
 function parseStandaloneModelPaths() {
   const lines = $("#standalone-model-paths").value
     .split(/\r?\n/)
@@ -1709,6 +1725,7 @@ function bindEvents() {
     updateDerivedPaths();
     renderActionState();
   });
+  $("#tsr-prompt-mode").addEventListener("change", applyTsrPromptDefaults);
   $("#standalone-eval-preflight").addEventListener("click", () => startStandaloneEvaluation(true, $("#standalone-eval-preflight")));
   $("#standalone-eval-submit").addEventListener("click", () => startStandaloneEvaluation(false, $("#standalone-eval-submit")));
   $$(".run-button").forEach((button) => button.addEventListener("click", () => startRun(button.dataset.runMode, button)));

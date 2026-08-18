@@ -179,6 +179,11 @@ set -Eeuo pipefail
 [[ "$EVAL_GPUS" == "0,1,2,3,4,5,6,7" ]]
 [[ "$EVAL_NUM_GPUS" == "8" && "$TS_GPUS_PER_PROCESS" == "2" ]]
 [[ "$METRICS_FILE" == "$OUTPUT_ROOT/metrics.json" ]]
+[[ "$TSR_PROMPT_MODE" == "json_reasoning" ]]
+[[ "$TSR_MAX_MODEL_LEN" == "12288" ]]
+[[ "$TSR_MAX_NEW_TOKENS" == "256" ]]
+[[ "$TSR_BATCH_SIZE" == "1" ]]
+[[ "$TSR_REQUEST_CHUNK_SIZE" == "128" ]]
 mkdir -p "$OUTPUT_ROOT"
 printf 'suite\\tstatus\\nall\\tPASS\\n' > "$OUTPUT_ROOT/benchmark_status.tsv"
 printf '# summary\\n' > "$OUTPUT_ROOT/all_benchmarks_summary.md"
@@ -201,6 +206,9 @@ printf '{"status":"pass"}\\n' > "$OUTPUT_ROOT/metrics.json"
         include_slurm=False,
     )
     payload["evaluation"]["script"] = str(evaluator)
+    payload["evaluation"]["tsr_prompt_mode"] = "json_reasoning"
+    payload["evaluation"]["tsr_max_new_tokens"] = 256
+    payload["evaluation"]["tsr_batch_size"] = 1
     payload["pipeline"]["trial_config_hash"] = canonical_hash(
         {
             **payload,

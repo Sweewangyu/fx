@@ -399,7 +399,11 @@ def validate_and_resolve(
         raise ValueError("evaluation.haystack_split is invalid")
     if evaluation["tiny_data_partition"] not in {"all", "search-dev", "final-test"}:
         raise ValueError("evaluation.tiny_data_partition is invalid")
-    if evaluation["tsr_prompt_mode"] not in {"answer_only", "official"}:
+    if evaluation["tsr_prompt_mode"] not in {
+        "answer_only",
+        "official",
+        "json_reasoning",
+    }:
         raise ValueError("evaluation.tsr_prompt_mode is invalid")
 
     integer_fields = (
