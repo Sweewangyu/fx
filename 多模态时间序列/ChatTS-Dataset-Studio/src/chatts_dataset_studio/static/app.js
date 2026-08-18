@@ -31,10 +31,59 @@ const pathFields = {
   data_root: $("#data-root"),
   output_root: $("#output-root"),
 };
-const tsrPromptDefaults = {
-  answer_only: { maxModelLen: 12288, maxNewTokens: 8, batchSize: 16, requestChunkSize: 128 },
-  official: { maxModelLen: 12288, maxNewTokens: 512, batchSize: 1, requestChunkSize: 128 },
-  json_reasoning: { maxModelLen: 12288, maxNewTokens: 256, batchSize: 1, requestChunkSize: 128 },
+const tsrPromptProtocols = {
+  answer_only: {
+    maxModelLen: 12288,
+    maxNewTokens: 8,
+    batchSize: 16,
+    requestChunkSize: 128,
+    purpose: "快速、确定性的选择题评测，只保留答案字母。",
+    outputInstruction: "Return exactly one uppercase option letter (A-G) and no other text.",
+    temperature: "0.0",
+    retries: "0",
+    retriesDetail: "runner 仍执行 1 次生成",
+    inputCutoff: "0 tokens",
+    inputCutoffDetail: "不启用原始文本 cutoff",
+    nativeThinkingDetail: "Qwen3 原生 thinking 不启用",
+  },
+  official: {
+    maxModelLen: 12288,
+    maxNewTokens: 512,
+    batchSize: 1,
+    requestChunkSize: 128,
+    purpose: "严格复现 TSRBench 官方 ChatTS 推理与 XML 输出协议。",
+    outputInstruction: [
+      "[当前样本的选项 A-G]",
+      "Output your reasoning process in <think> tags and final answer as a single letter in <answer> tags. Format:",
+      "<think>Your reasoning here (less than 2048 tokens)</think>",
+      "<answer>A</answer>",
+    ].join("\n"),
+    temperature: "1.0",
+    retries: "10",
+    retriesDetail: "最多执行 10 次格式生成",
+    inputCutoff: "8,000 tokens",
+    inputCutoffDetail: "原始文本 token 上限",
+    nativeThinkingDetail: "关闭；推理由用户 prompt 显式要求",
+  },
+  json_reasoning: {
+    maxModelLen: 12288,
+    maxNewTokens: 256,
+    batchSize: 1,
+    requestChunkSize: 128,
+    purpose: "生成可机器审计的简短理由，并进行严格 JSON 结构校验。",
+    outputInstruction: [
+      "IMPORTANT OUTPUT CONTRACT:",
+      "Return exactly one valid JSON object with exactly two keys, and no Markdown or surrounding text:",
+      '{"reason":"Briefly explain the time-series evidence for your choice.","answer":"A"}',
+      'The value of "reason" must be a non-empty string. The value of "answer" must be exactly one uppercase option letter from A to G. Do not return only the answer letter.',
+    ].join("\n"),
+    temperature: "0.0",
+    retries: "1",
+    retriesDetail: "执行 1 次格式生成",
+    inputCutoff: "8,000 tokens",
+    inputCutoffDetail: "原始文本 token 上限",
+    nativeThinkingDetail: "Qwen3 原生 thinking 不启用",
+  },
 };
 
 class ApiError extends Error {
@@ -180,7 +229,12 @@ function renderActionState() {
   const previewReady = Boolean(state.preview && state.previewFingerprint === selectionFingerprint());
   const hasVersion = Boolean(selectedTrainingVersionName());
   const slurmReady = $("#execution-backend").value !== "slurm" || Boolean($("#slurm-sbatch-path").value);
-  const canRun = hasVersion && state.pipelineEnabled && slurmReady && $("#base-model-path").value.trim().startsWith("/");
+  const evaluationProtocolValid = tsrProtocolValidation().valid;
+  const canRun = hasVersion
+    && state.pipelineEnabled
+    && slurmReady
+    && evaluationProtocolValid
+    && $("#base-model-path").value.trim().startsWith("/");
   $("#scan-button").disabled = !state.defaults || state.busy.has("scan-button");
   $("#rebuild-sources").disabled = !state.defaults || state.busy.has("rebuild-sources");
   $("#preview-button").disabled = !scanned || state.busy.has("preview-button");
@@ -944,20 +998,16 @@ function trainingStagePayload(stageName) {
 }
 
 function evaluationPayload() {
-  return {
-    benchmarks: $$("#benchmark-suites input:checked").map((input) => input.value),
+  const benchmarks = $$("#benchmark-suites input:checked").map((input) => input.value);
+  const payload = {
+    benchmarks,
     max_samples: Number($("#eval-max-samples").value),
     offline: $("#eval-offline").checked,
     force_eval: $("#force-eval").checked,
     haystack_split: $("#haystack-split").value,
     tiny_data_partition: $("#tiny-partition").value,
     tiny_partition_seed: Number($("#tiny-seed").value),
-    tsr_prompt_mode: $("#tsr-prompt-mode").value,
     protocol_hash: $("#eval-protocol-hash").value.trim() || null,
-    tsr_max_model_len: Number($("#tsr-max-model-len").value),
-    tsr_max_new_tokens: Number($("#tsr-max-new-tokens").value),
-    tsr_batch_size: Number($("#tsr-batch-size").value),
-    tsr_request_chunk_size: Number($("#tsr-request-chunk-size").value),
     tiny_max_model_len: Number($("#tiny-max-model-len").value),
     tiny_request_chunk_size: Number($("#tiny-request-chunk-size").value),
     tiny_gpu_memory_utilization: Number($("#tiny-gpu-memory-utilization").value),
@@ -970,15 +1020,126 @@ function evaluationPayload() {
     exam_batch_size: Number($("#exam-batch-size").value),
     exam_request_chunk_size: Number($("#exam-request-chunk-size").value),
   };
+  if (benchmarks.includes("tsrbench")) {
+    Object.assign(payload, {
+      tsr_prompt_mode: $("#tsr-prompt-mode").value,
+      tsr_max_model_len: Number($("#tsr-max-model-len").value),
+      tsr_max_new_tokens: Number($("#tsr-max-new-tokens").value),
+      tsr_batch_size: Number($("#tsr-batch-size").value),
+      tsr_request_chunk_size: Number($("#tsr-request-chunk-size").value),
+    });
+  }
+  return payload;
+}
+
+function tsrbenchSelected() {
+  return Boolean($('#benchmark-suites input[value="tsrbench"]')?.checked);
+}
+
+function tsrProtocolValues() {
+  return {
+    maxModelLen: Number($("#tsr-max-model-len").value),
+    maxNewTokens: Number($("#tsr-max-new-tokens").value),
+    batchSize: Number($("#tsr-batch-size").value),
+    requestChunkSize: Number($("#tsr-request-chunk-size").value),
+  };
+}
+
+function tsrProtocolValidation() {
+  const inputs = [
+    ["#tsr-max-model-len", "Max model length"],
+    ["#tsr-max-new-tokens", "Max new tokens"],
+    ["#tsr-batch-size", "Batch size"],
+    ["#tsr-request-chunk-size", "Request chunk"],
+  ];
+  const selected = tsrbenchSelected();
+  const invalid = new Set();
+  const errors = [];
+  if (selected) {
+    for (const [selector, label] of inputs) {
+      const input = $(selector);
+      const value = Number(input.value);
+      if (input.value.trim() === "" || !Number.isInteger(value) || value < 1) {
+        invalid.add(selector);
+        errors.push(`${label} 必须是正整数`);
+      }
+    }
+    const values = tsrProtocolValues();
+    if (
+      !invalid.has("#tsr-max-model-len")
+      && !invalid.has("#tsr-max-new-tokens")
+      && values.maxModelLen <= values.maxNewTokens
+    ) {
+      invalid.add("#tsr-max-model-len");
+      invalid.add("#tsr-max-new-tokens");
+      errors.push("Max model length 必须大于 Max new tokens");
+    }
+  }
+  for (const [selector] of inputs) {
+    $(selector).setAttribute("aria-invalid", String(invalid.has(selector)));
+  }
+  return { valid: errors.length === 0, errors, values: tsrProtocolValues() };
+}
+
+function renderTsrProtocol() {
+  const mode = $("#tsr-prompt-mode").value;
+  const protocol = tsrPromptProtocols[mode];
+  if (!protocol) return;
+  const selected = tsrbenchSelected();
+  const validation = tsrProtocolValidation();
+  const values = validation.values;
+  const usesRecommendedResources = validation.valid
+    && values.maxModelLen === protocol.maxModelLen
+    && values.maxNewTokens === protocol.maxNewTokens
+    && values.batchSize === protocol.batchSize
+    && values.requestChunkSize === protocol.requestChunkSize;
+
+  $("#tsr-protocol-mode").textContent = mode;
+  $("#tsr-protocol-purpose").textContent = protocol.purpose;
+  $("#tsr-prompt-preview").textContent = protocol.outputInstruction;
+  $("#tsr-fixed-temperature").textContent = protocol.temperature;
+  $("#tsr-fixed-top-p").textContent = "1.0";
+  $("#tsr-fixed-retries").textContent = protocol.retries;
+  $("#tsr-fixed-retries-detail").textContent = protocol.retriesDetail;
+  $("#tsr-fixed-input-cutoff").textContent = protocol.inputCutoff;
+  $("#tsr-fixed-input-cutoff-detail").textContent = protocol.inputCutoffDetail;
+  $("#tsr-fixed-native-thinking").textContent = "关闭";
+  $("#tsr-fixed-native-thinking-detail").textContent = protocol.nativeThinkingDetail;
+
+  const budget = Number.isInteger(values.maxModelLen)
+    && Number.isInteger(values.maxNewTokens)
+    && values.maxModelLen > values.maxNewTokens
+    ? `${countFormatter.format(values.maxModelLen - values.maxNewTokens)} tokens`
+    : "—";
+  $("#tsr-processed-input-budget").textContent = budget;
+
+  const protocolState = $("#tsr-protocol-state");
+  protocolState.textContent = selected ? "本次会执行" : "本次不执行";
+  protocolState.className = `status-chip ${selected ? "active" : "inactive"}`;
+  $("#tsr-protocol-panel").classList.toggle("is-disabled", !selected);
+  $("#tsr-protocol-disabled").hidden = selected;
+  $("#tsr-protocol-body").hidden = !selected;
+
+  const resourceState = $("#tsr-resource-profile-state");
+  resourceState.textContent = validation.valid
+    ? (usesRecommendedResources ? "使用推荐值" : "已自定义")
+    : "参数需修正";
+  resourceState.className = `status-chip ${validation.valid ? (usesRecommendedResources ? "active" : "") : "error"}`.trim();
+  const validationMessage = $("#tsr-protocol-validation");
+  validationMessage.hidden = validation.valid;
+  validationMessage.textContent = validation.valid
+    ? ""
+    : `TSRBench 参数不可提交：${validation.errors.join("；")}。`;
 }
 
 function applyTsrPromptDefaults() {
-  const defaults = tsrPromptDefaults[$("#tsr-prompt-mode").value];
+  const defaults = tsrPromptProtocols[$("#tsr-prompt-mode").value];
   if (!defaults) return;
   $("#tsr-max-model-len").value = defaults.maxModelLen;
   $("#tsr-max-new-tokens").value = defaults.maxNewTokens;
   $("#tsr-batch-size").value = defaults.batchSize;
   $("#tsr-request-chunk-size").value = defaults.requestChunkSize;
+  renderTsrProtocol();
   updateDerivedPaths();
   renderActionState();
 }
@@ -1054,12 +1215,14 @@ function renderStandaloneEvaluationState() {
   const tooMany = parsed.modelPaths.length > maxBatchModels;
   const hasInvalid = parsed.invalid.length > 0;
   const hasBenchmarks = evaluationPayload().benchmarks.length > 0;
+  const protocolValidation = tsrProtocolValidation();
   const slurmReady = !slurm || Boolean($("#standalone-eval-sbatch-path").value);
   const canSubmit = contract.enabled
     && parsed.modelPaths.length > 0
     && !hasInvalid
     && !tooMany
     && hasBenchmarks
+    && protocolValidation.valid
     && slurmReady;
 
   state.standaloneEvaluationEnabled = contract.enabled;
@@ -1074,10 +1237,11 @@ function renderStandaloneEvaluationState() {
   if (parsed.duplicateCount) notes.push(`已忽略 ${parsed.duplicateCount} 条重复路径`);
   if (parsed.modelPaths.length && !hasInvalid && !tooMany) notes.push(`将创建 ${parsed.modelPaths.length} 个独立任务`);
   if (!hasBenchmarks) notes.push("请至少选择一个评测套件");
+  if (!protocolValidation.valid) notes.push("请先修正 TSRBench 协议参数");
   if (slurm && !slurmReady) notes.push("请选择单独评测 Slurm 脚本");
   const summary = $("#standalone-model-summary");
   summary.textContent = notes.join("；");
-  summary.classList.toggle("error", hasInvalid || tooMany);
+  summary.classList.toggle("error", hasInvalid || tooMany || !protocolValidation.valid);
 
   const stateChip = $("#standalone-evaluation-state");
   stateChip.textContent = contract.enabled ? "服务已就绪" : "需要配置";
@@ -1116,6 +1280,8 @@ function validateStandaloneEvaluation() {
   const maxBatchModels = Number(standaloneEvaluationIntegration().evaluationOnly.max_batch_models || 64);
   if (parsed.modelPaths.length > maxBatchModels) throw new Error(`单批最多支持 ${maxBatchModels} 个模型`);
   if (!evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
+  const protocolValidation = tsrProtocolValidation();
+  if (!protocolValidation.valid) throw new Error(protocolValidation.errors[0]);
   const contract = standaloneEvaluationIntegration();
   if (!contract.enabled) throw new Error("当前单独评测后端尚未就绪，请查看配置诊断");
   if (contract.backend === "slurm" && !$("#standalone-eval-sbatch-path").value) {
@@ -1139,6 +1305,13 @@ function standaloneEvaluationPayload() {
 async function startStandaloneEvaluation(preflight, button) {
   let payload;
   try { payload = standaloneEvaluationPayload(); } catch (error) { showToast(error.message, "error"); return; }
+  const submittedProtocol = payload.evaluation.benchmarks.includes("tsrbench")
+    ? {
+      mode: payload.evaluation.tsr_prompt_mode,
+      maxNewTokens: payload.evaluation.tsr_max_new_tokens,
+      batchSize: payload.evaluation.tsr_batch_size,
+    }
+    : null;
   const endpoint = preflight ? "/api/evaluations/preflight" : "/api/evaluations";
   await withBusy(button, preflight ? "提交预检中…" : "批量提交中…", async () => {
     try {
@@ -1153,8 +1326,20 @@ async function startStandaloneEvaluation(preflight, button) {
         ? "已提交到 Slurm，后续由调度器排队"
         : "已加入本地 FIFO，将按提交顺序运行";
       const actionLabel = preflight ? "预检" : "评测";
-      $("#standalone-evaluation-status").textContent = `批次 ${result.batch_id || "—"}：${count} 个${actionLabel}任务${queueLabel}。`;
-      showToast(`${count} 个${actionLabel}任务${queueLabel}`, "success");
+      const protocolIds = new Set(
+        submitted.map((job) => job.derived?.evaluation_protocol_id).filter(Boolean),
+      );
+      const protocolId = protocolIds.size === 1 ? [...protocolIds][0] : "—";
+      const snapshotLabel = submittedProtocol
+        ? `${submittedProtocol.mode} · max new ${submittedProtocol.maxNewTokens} · batch ${submittedProtocol.batchSize}`
+        : "未选择 TSRBench";
+      if (protocolIds.size > 1) {
+        $("#standalone-evaluation-status").textContent = `批次 ${result.batch_id || "—"} 已提交，但服务端返回了不一致的协议 ID：${[...protocolIds].join("、")}。请在任务详情核验冻结配置。`;
+        showToast("批量任务的服务端协议 ID 不一致，请立即核验", "error");
+      } else {
+        $("#standalone-evaluation-status").textContent = `批次 ${result.batch_id || "—"}：${count} 个${actionLabel}任务${queueLabel}。提交快照：${snapshotLabel} · ${protocolId}。`;
+        showToast(`${count} 个${actionLabel}任务已提交 · ${snapshotLabel} · ${protocolId}`, "success");
+      }
       activateTab("jobs");
       await refreshJobs({ quiet: true });
     } catch (error) {
@@ -1199,6 +1384,8 @@ function validateRun(mode) {
   const baseModelPath = $("#base-model-path").value.trim();
   if (!baseModelPath.startsWith("/")) throw new Error("请填写训练容器内可见的基础模型绝对路径");
   if (mode === "train_eval" && !evaluationPayload().benchmarks.length) throw new Error("至少选择一个评测套件");
+  const protocolValidation = tsrProtocolValidation();
+  if (!protocolValidation.valid) throw new Error(protocolValidation.errors[0]);
   if ($("#execution-backend").value === "slurm" && !$("#slurm-sbatch-path").value) throw new Error("请选择可信的 Slurm sbatch 脚本");
 }
 
@@ -1622,6 +1809,7 @@ function applyDefaults(defaults) {
   $("#haystack-root").value = evaluation.ts_haystack_root || "由服务端配置";
   $("#timeseriesexam-root").value = evaluation.timeseriesexam_root || "由服务端配置";
   $("#timeseriesexam-file").value = evaluation.timeseriesexam_data_file || "由服务端配置";
+  renderTsrProtocol();
   refreshTrainingModeUI();
   $("#run-status").textContent = state.pipelineEnabled
     ? "先运行 Preflight；通过后启动当前训练方案。"
@@ -1722,10 +1910,25 @@ function bindEvents() {
     renderActionState();
   });
   $("#benchmark-suites").addEventListener("change", () => {
+    renderTsrProtocol();
     updateDerivedPaths();
     renderActionState();
   });
   $("#tsr-prompt-mode").addEventListener("change", applyTsrPromptDefaults);
+  for (const selector of [
+    "#tsr-max-model-len",
+    "#tsr-max-new-tokens",
+    "#tsr-batch-size",
+    "#tsr-request-chunk-size",
+  ]) {
+    const refreshProtocol = () => {
+      renderTsrProtocol();
+      updateDerivedPaths();
+      renderActionState();
+    };
+    $(selector).addEventListener("input", refreshProtocol);
+    $(selector).addEventListener("change", refreshProtocol);
+  }
   $("#standalone-eval-preflight").addEventListener("click", () => startStandaloneEvaluation(true, $("#standalone-eval-preflight")));
   $("#standalone-eval-submit").addEventListener("click", () => startStandaloneEvaluation(false, $("#standalone-eval-submit")));
   $$(".run-button").forEach((button) => button.addEventListener("click", () => startRun(button.dataset.runMode, button)));

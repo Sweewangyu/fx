@@ -234,10 +234,27 @@ Slurm 使用 `run_chatts_studio_evaluation.sbatch` 立即提交，页面中的 `
 单独评测不需要数据版本、ChatTS-Training 注册记录或训练完成 marker。兼容旧配置时会从
 `evaluation_root/scripts/run_eval_only.sh` 自动找到 Docker 入口；也可显式配置：
 
-TSRBench prompt 可选 `answer_only`、`official` 和 `json_reasoning`。选择
-`json_reasoning` 时页面会使用 256 个生成 token、batch size 1 的推荐值，并把模式及实际资源参数
-一起写入协议哈希；其严格输出格式为 `{"reason":"...","answer":"A"}`。训练后评测与单独评测、
-Docker 与 Slurm 使用同一套设置。
+“评测套件”卡中的“当前 TSRBench 协议”面板会直接展示本次实际提交的 mode、用途、固定尾部
+指令/输出契约和全部资源值。`max model length`、`max new tokens`、`batch size`、
+`request chunk` 可直接编辑；切换 mode 会先载入该模式的推荐值，之后手工输入会标记为“已自定义”。
+固定项由评测 runner 按 mode 决定，页面只读展示：
+
+| mode | max new tokens | batch | temperature | top-p | retries 配置 | 文本 input cutoff | native thinking |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `answer_only` | 8 | 16 | 0.0 | 1.0 | 0（仍生成 1 次） | 0 | 关闭 |
+| `official` | 512 | 1 | 1.0 | 1.0 | 10（最多生成 10 次） | 8000 | 关闭；prompt 显式要求推理 |
+| `json_reasoning` | 256 | 1 | 0.0 | 1.0 | 1（生成 1 次） | 8000 | 关闭 |
+
+`json_reasoning` 的严格输出格式为 `{"reason":"...","answer":"A"}`。面板预览的是固定输出要求，
+不是完整 prompt；问题、选项和 `<ts><ts/>` 内容按样本动态生成。取消勾选 TSRBench 后，面板会明确
+显示“本次不会执行 TSRBench”，重新勾选会恢复之前的 mode 和输入值。
+
+这套设置同时用于训练后评测与单独评测、Docker 与 Slurm；批量模型共享提交瞬间的协议快照，但
+每个模型生成独立任务。提交后可在任务详情的 `evaluation_config.resolved.yaml` 核验单独评测冻结
+参数（训练后评测对应 `pipeline_config.resolved.yaml`），运行完成后再核验输出目录中的
+`tsrbench/.chatts_benchmark_manifest.json`。选中 TSRBench 时，模式和实际资源值会一起进入协议哈希，
+不会误复用其他 prompt 或参数的缓存；未选中时这些隐藏字段不会提交，也不会改变协议身份。
+采样 seed 方面，单独评测固定为 42，训练后评测沿用本次训练 seed。
 
 ```yaml
 integration:

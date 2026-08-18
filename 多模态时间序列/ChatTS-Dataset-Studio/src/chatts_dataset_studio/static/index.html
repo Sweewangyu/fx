@@ -233,7 +233,7 @@
           <div class="card-heading">
             <div>
               <h2 id="standalone-evaluation-title">单独评测已有模型</h2>
-              <p>无需启动训练；每行填写一个评测容器或计算节点可见的模型绝对路径，批量提交后每个模型都是独立任务。</p>
+              <p>无需启动训练；每行填写一个评测容器或计算节点可见的模型绝对路径，批量提交后每个模型都是独立任务。提交前请在紧接本卡的 <a class="inline-link" href="#evaluation-config-card">评测数据集与协议</a> 中选择数据集并确认全部参数。</p>
             </div>
             <span class="status-chip" id="standalone-evaluation-state">检查中</span>
           </div>
@@ -273,43 +273,89 @@
             <ul id="standalone-evaluation-missing"></ul>
           </div>
           <div class="standalone-evaluation-actions">
-            <p id="standalone-evaluation-status" aria-live="polite">输入模型路径并选择下方评测套件；Docker 使用本地 FIFO，Slurm 由调度器排队。</p>
+            <p id="standalone-evaluation-status" aria-live="polite">输入模型路径并选择下方评测套件；本批使用下方当前评测协议。Docker 使用本地 FIFO，Slurm 由调度器排队。</p>
             <div class="button-row">
               <button class="button secondary" id="standalone-eval-preflight" type="button">批量预检</button>
               <button class="button primary" id="standalone-eval-submit" type="button">批量提交评测</button>
             </div>
           </div>
         </section>
-        <section class="launch-guide" aria-labelledby="launch-guide-title">
-          <div class="launch-guide-heading">
-            <div><h2 id="launch-guide-title">训练后自动评测</h2><p>训练与评测按同一数据版本连续执行。</p><p class="execution-topology" id="execution-topology">宿主机控制面 → 训练容器 → 评测容器</p></div>
-            <span class="status-chip" id="integration-state">检查中</span>
-          </div>
-          <ol class="launch-steps">
-            <li id="launch-step-version"><span>1</span><div><strong>选择训练数据版本</strong><small>在“训练”页选择任一已发布版本；未注册版本会在启动时自动注册。</small></div></li>
-            <li id="launch-step-training"><span>2</span><div><strong>配置训练参数</strong><small>在“训练”页确认基础模型、GPU 和两阶段参数。</small></div></li>
-            <li id="launch-step-preflight"><span>3</span><div><strong>运行 Preflight</strong><small>检查服务端路径、容器、GPU 与脚本。</small></div></li>
-            <li id="launch-step-run"><span>4</span><div><strong>一键训练 + 评测</strong><small>有任务运行时自动排队，完成后按提交顺序启动。</small></div></li>
-          </ol>
-          <div class="integration-diagnostic" id="integration-diagnostic" role="status" aria-live="polite" hidden>
-            <strong>一键启动暂不可用</strong>
-            <p id="integration-summary"></p>
-            <ul id="integration-missing"></ul>
-            <p>请在服务端 YAML 中补齐当前后端的 <code>integration</code> 配置并重启；Docker 需容器与训练/评测脚本，Slurm 需控制命令和带 Studio marker 的可信 sbatch。</p>
-          </div>
-        </section>
-        <section class="card" id="evaluation-config-card">
-          <div class="card-heading"><div><h2>评测套件</h2><p>以下参数同时用于单独评测和训练后自动评测。</p></div><span id="suite-count">4 项</span></div>
+        <section class="card" id="evaluation-config-card" aria-labelledby="evaluation-config-title">
+          <div class="card-heading"><div><h2 id="evaluation-config-title">评测数据集与协议</h2><p>单独评测和训练后自动评测共用这一整套选择与参数；上方批量提交会读取这里的当前值。</p></div><span id="suite-count">4 项</span></div>
           <fieldset class="suite-grid" id="benchmark-suites"><legend class="sr-only">选择评测套件</legend>
             <label><input type="checkbox" value="tsrbench" checked><span><strong>TSRBench</strong><small>时序推理</small></span></label>
             <label><input type="checkbox" value="tinybenchmarks" checked><span><strong>TinyBenchmarks</strong><small>轻量基准</small></span></label>
             <label><input type="checkbox" value="ts_haystack" checked><span><strong>TS-Haystack</strong><small>长上下文</small></span></label>
             <label><input type="checkbox" value="timeseriesexam" checked><span><strong>TimeSeriesExam</strong><small>综合能力</small></span></label>
           </fieldset>
+          <section class="tsr-protocol-panel" id="tsr-protocol-panel" aria-labelledby="tsr-protocol-title">
+            <div class="tsr-protocol-heading">
+              <div>
+                <p class="tsr-protocol-kicker">当前 TSRBench 协议</p>
+                <h3 id="tsr-protocol-title"><code id="tsr-protocol-mode">answer_only</code></h3>
+                <p id="tsr-protocol-purpose">快速、确定性的选择题评测，只保留答案字母。</p>
+              </div>
+              <span class="status-chip active" id="tsr-protocol-state">本次会执行</span>
+            </div>
+            <div class="tsr-protocol-disabled" id="tsr-protocol-disabled" role="status" aria-live="polite" hidden>
+              <strong>本次不会执行 TSRBench</strong>
+              <p>当前 prompt 模式和参数仅保留在页面中，不会随本次任务生效；重新勾选上方 TSRBench 后会原样恢复。</p>
+            </div>
+            <div id="tsr-protocol-body">
+              <div class="tsr-protocol-layout">
+                <div class="tsr-protocol-editor">
+                  <div class="tsr-section-heading">
+                    <div><h4>本次可编辑参数</h4><p>切换模式会载入该模式的推荐资源值，之后仍可手动覆盖。</p></div>
+                    <span class="status-chip active" id="tsr-resource-profile-state">使用推荐值</span>
+                  </div>
+                  <label class="field tsr-mode-field">
+                    <span>Prompt mode</span>
+                    <select id="tsr-prompt-mode" aria-describedby="tsr-mode-help">
+                      <option value="answer_only">answer_only</option>
+                      <option value="official">official</option>
+                      <option value="json_reasoning">json_reasoning</option>
+                    </select>
+                    <small class="field-help" id="tsr-mode-help">这是本次实际提交的 <code>tsr_prompt_mode</code>。</small>
+                  </label>
+                  <div class="tsr-resource-grid">
+                    <label class="field"><span>Max model length</span><input id="tsr-max-model-len" type="number" min="1" step="1" value="12288" aria-describedby="tsr-max-model-len-help tsr-protocol-validation"><small class="field-help" id="tsr-max-model-len-help">展开时序 token 后的总上下文</small></label>
+                    <label class="field"><span>Max new tokens</span><input id="tsr-max-new-tokens" type="number" min="1" step="1" value="8" aria-describedby="tsr-max-new-tokens-help tsr-protocol-validation"><small class="field-help" id="tsr-max-new-tokens-help">为模型输出预留的 token</small></label>
+                    <label class="field"><span>Batch size</span><input id="tsr-batch-size" type="number" min="1" step="1" value="16" aria-describedby="tsr-batch-size-help tsr-protocol-validation"><small class="field-help" id="tsr-batch-size-help">单次送入推理引擎的样本数</small></label>
+                    <label class="field"><span>Request chunk</span><input id="tsr-request-chunk-size" type="number" min="1" step="1" value="128" aria-describedby="tsr-request-chunk-size-help tsr-protocol-validation"><small class="field-help" id="tsr-request-chunk-size-help">每轮组织的请求数量</small></label>
+                  </div>
+                  <p class="tsr-protocol-validation" id="tsr-protocol-validation" role="status" aria-live="polite" hidden></p>
+                </div>
+                <div class="tsr-output-contract">
+                  <div class="tsr-section-heading">
+                    <div><h4>固定输出指令 / 契约</h4><p>由 runner 追加或构建到每条样本 prompt。</p></div>
+                  </div>
+                  <pre id="tsr-prompt-preview" tabindex="0">Return exactly one uppercase option letter (A-G) and no other text.</pre>
+                  <p>这里只预览输出要求，并不是完整 prompt；实际问题、选项和 <code>&lt;ts&gt;&lt;ts/&gt;</code> 时序内容会按每条样本生成。</p>
+                </div>
+              </div>
+              <div class="tsr-fixed-section">
+                <div class="tsr-section-heading"><div><h4>模式固定参数</h4><p>以下值由 runner 按 mode 锁定，不能在 Studio 中单独覆盖。</p></div></div>
+                <div class="tsr-fixed-grid">
+                  <div><span>Temperature</span><strong id="tsr-fixed-temperature">0.0</strong><small>采样温度</small></div>
+                  <div><span>Top-p</span><strong id="tsr-fixed-top-p">1.0</strong><small>三种模式均固定</small></div>
+                  <div><span>Retries 配置</span><strong id="tsr-fixed-retries">0</strong><small id="tsr-fixed-retries-detail">runner 仍执行 1 次生成</small></div>
+                  <div><span>文本 input cutoff</span><strong id="tsr-fixed-input-cutoff">0 tokens</strong><small id="tsr-fixed-input-cutoff-detail">不启用原始文本 cutoff</small></div>
+                  <div><span>处理后输入预算</span><strong id="tsr-processed-input-budget">12,280 tokens</strong><small>max model length − max new tokens</small></div>
+                  <div><span>Native thinking</span><strong id="tsr-fixed-native-thinking">关闭</strong><small id="tsr-fixed-native-thinking-detail">Qwen3 原生 thinking 不启用</small></div>
+                </div>
+              </div>
+              <div class="tsr-protocol-scope">
+                <strong>这一份协议用于哪些任务？</strong>
+                <p>同时用于上方“单独评测”和训练完成后的自动评测。批量填写多个模型时，所有模型共享此刻显示的 mode 与参数，但每个模型仍会生成独立任务和输出目录。</p>
+                <p>采样 seed：单独评测固定为 42；训练后评测沿用本次训练 seed。</p>
+                <p>提交后可在每个单独评测任务详情核验 <code>evaluation_config.resolved.yaml</code>；运行完成后再核验评测输出中的 <code>tsrbench/.chatts_benchmark_manifest.json</code>。训练后评测的冻结配置文件名为 <code>pipeline_config.resolved.yaml</code>。</p>
+              </div>
+            </div>
+          </section>
           <div class="form-grid form-grid-2">
             <label class="field"><span>最大样本数（0 为全部）</span><input id="eval-max-samples" type="number" min="0" value="0"></label>
             <label class="field check-field"><input id="eval-offline" type="checkbox" checked><span>离线模式</span></label>
-            <label class="field field-span-2 readonly-field"><span>模型路径（由版本派生）</span><input id="eval-model-path" type="text" readonly aria-readonly="true" spellcheck="false" placeholder="由当前版本训练结果派生"></label>
+            <label class="field field-span-2 readonly-field"><span>训练后评测模型路径（由版本派生）</span><input id="eval-model-path" type="text" readonly aria-readonly="true" spellcheck="false" placeholder="由当前版本训练结果派生"></label>
             <label class="field field-span-2 readonly-field"><span>评测输出目录（由版本派生）</span><input id="eval-output-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
           </div>
           <details><summary>高级参数</summary><div class="form-grid form-grid-2 advanced-fields">
@@ -317,12 +363,7 @@
             <label class="field"><span>Tiny partition</span><select id="tiny-partition"><option value="all">all</option><option value="search-dev">search-dev</option><option value="final-test">final-test</option></select></label>
             <label class="field"><span>Tiny seed</span><input id="tiny-seed" type="number" min="0" value="42"></label>
             <label class="field check-field"><input id="force-eval" type="checkbox"><span>强制重新评测</span></label>
-            <label class="field"><span>TSR prompt</span><select id="tsr-prompt-mode"><option value="answer_only">answer_only</option><option value="official">official</option><option value="json_reasoning">json_reasoning</option></select><small class="field-help">json_reasoning 要求严格输出 {"reason":"...","answer":"A"}。</small></label>
             <label class="field"><span>期望协议 Hash（可留空）</span><input id="eval-protocol-hash" type="text" maxlength="64" placeholder="服务端自动计算" spellcheck="false"><small class="field-help">填写时只用于一致性校验，不能覆盖服务端计算结果。</small></label>
-            <label class="field"><span>TSR 最大长度</span><input id="tsr-max-model-len" type="number" min="1" value="12288"></label>
-            <label class="field"><span>TSR 新 token</span><input id="tsr-max-new-tokens" type="number" min="1" value="8"></label>
-            <label class="field"><span>TSR Batch</span><input id="tsr-batch-size" type="number" min="1" value="16"></label>
-            <label class="field"><span>TSR 请求块</span><input id="tsr-request-chunk-size" type="number" min="1" value="128"></label>
             <label class="field"><span>Tiny 最大长度</span><input id="tiny-max-model-len" type="number" min="1" value="6000"></label>
             <label class="field"><span>Tiny 请求块</span><input id="tiny-request-chunk-size" type="number" min="1" value="16"></label>
             <label class="field"><span>Tiny GPU 利用率</span><input id="tiny-gpu-memory-utilization" type="number" min="0.01" max="0.99" step="0.01" value="0.7"></label>
@@ -341,6 +382,24 @@
             <label class="field field-span-2 readonly-field"><span>TimeSeriesExam（服务端配置）</span><input id="timeseriesexam-root" type="text" readonly aria-readonly="true" spellcheck="false"></label>
             <label class="field field-span-2 readonly-field"><span>TimeSeriesExam 文件（服务端配置）</span><input id="timeseriesexam-file" type="text" readonly aria-readonly="true" spellcheck="false"></label>
           </div></details>
+        </section>
+        <section class="launch-guide" aria-labelledby="launch-guide-title">
+          <div class="launch-guide-heading">
+            <div><h2 id="launch-guide-title">训练后自动评测</h2><p>训练与评测按同一数据版本连续执行，并复用上方当前评测数据集与协议。</p><p class="execution-topology" id="execution-topology">宿主机控制面 → 训练容器 → 评测容器</p></div>
+            <span class="status-chip" id="integration-state">检查中</span>
+          </div>
+          <ol class="launch-steps">
+            <li id="launch-step-version"><span>1</span><div><strong>选择训练数据版本</strong><small>在“训练”页选择任一已发布版本；未注册版本会在启动时自动注册。</small></div></li>
+            <li id="launch-step-training"><span>2</span><div><strong>配置训练参数</strong><small>在“训练”页确认基础模型、GPU 和两阶段参数。</small></div></li>
+            <li id="launch-step-preflight"><span>3</span><div><strong>运行 Preflight</strong><small>检查服务端路径、容器、GPU 与脚本。</small></div></li>
+            <li id="launch-step-run"><span>4</span><div><strong>一键训练 + 评测</strong><small>有任务运行时自动排队，完成后按提交顺序启动。</small></div></li>
+          </ol>
+          <div class="integration-diagnostic" id="integration-diagnostic" role="status" aria-live="polite" hidden>
+            <strong>一键启动暂不可用</strong>
+            <p id="integration-summary"></p>
+            <ul id="integration-missing"></ul>
+            <p>请在服务端 YAML 中补齐当前后端的 <code>integration</code> 配置并重启；Docker 需容器与训练/评测脚本，Slurm 需控制命令和带 Studio marker 的可信 sbatch。</p>
+          </div>
         </section>
         <section class="card run-bar" aria-labelledby="run-title">
           <div><h2 id="run-title">训练后评测 / 排队</h2><p id="run-status" aria-live="polite">先发布并注册数据版本；运行期间可继续提交下一版本。</p></div>
