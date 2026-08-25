@@ -1,0 +1,17 @@
+title,year,venue_or_status,paper_type,primary_source,relevance,evidence_strength,reproducibility,quality_label,role_in_report
+"Large Language Models for Time Series: A Survey",2024,"IJCAI 2024",survey,"https://arxiv.org/abs/2402.01801",4,4,4,B,"taxonomy"
+"Time-LLM: Time Series Forecasting by Reprogramming Large Language Models",2024,"ICLR 2024",pure_method,"https://arxiv.org/abs/2310.01728",5,5,4,A,"encoder route"
+"TEST: Text Prototype Aligned Embedding to Activate LLM's Ability for Time Series",2024,"ICLR 2024",pure_method,"https://proceedings.iclr.cc/paper_files/paper/2024/hash/a4352e2c9d93582898a2a20e1f514e8f-Abstract-Conference.html",5,5,4,A,"encoder alignment"
+"ChatTS: Aligning Time Series with LLMs via Synthetic Data for Enhanced Understanding and Reasoning",2025,"PVLDB 2025",method_and_benchmark,"https://arxiv.org/abs/2412.03104",5,4,4,A,"encoder reasoning baseline"
+"AutoTimes: Autoregressive Time Series Forecasters via Large Language Models",2024,"NeurIPS 2024",pure_method,"https://proceedings.neurips.cc/paper_files/paper/2024/hash/dcf88cbc8d01ce7309b83d0ebaeb9d29-Abstract-Conference.html",4,5,4,A,"segment-token projection"
+"Large Language Models Are Zero-Shot Time Series Forecasters",2023,"NeurIPS 2023",pure_method,"https://arxiv.org/abs/2310.07820",5,5,4,A,"raw numeric text"
+"PromptCast: A New Prompt-based Learning Paradigm for Time Series Forecasting",2023,"TKDE 2023",method_and_benchmark,"https://arxiv.org/abs/2210.08964",4,4,3,B,"prompt baseline"
+"LSTPrompt: Large Language Models as Zero-Shot Time Series Forecasters by Long-Short-Term Prompting",2024,"Findings of ACL 2024",pure_method,"https://aclanthology.org/2024.findings-acl.466/",4,4,3,B,"prompt enhancement"
+"Are Language Models Actually Useful for Time Series Forecasting?",2024,"NeurIPS 2024",empirical_audit,"https://proceedings.neurips.cc/paper_files/paper/2024/hash/6ed5bf446f59e2c6646d23058c86424b-Abstract-Conference.html",5,5,5,Risk,"negative evidence"
+"Revisiting LLMs as Zero-Shot Time-Series Forecasters: Small Noise Can Break Large Models",2025,"ACL 2025",empirical_audit,"https://aclanthology.org/2025.acl-short.71/",5,5,5,Risk,"robustness evidence"
+"ChatTime: A Unified Multimodal Time Series Foundation Model Bridging Numerical and Textual Data",2025,"AAAI 2025",method_and_benchmark,"https://ojs.aaai.org/index.php/AAAI/article/view/33384",5,5,4,A,"numeric vocabulary"
+"Continuity and Ordinality Matter",2026,"arXiv preprint",pure_method,"https://arxiv.org/abs/2605.28866",5,3,4,"A/Risk","ordered token geometry"
+"TimeOmni-1: Incentivizing Complex Reasoning with Time Series in Large Language Models",2026,"ICLR 2026",method_and_benchmark,"https://arxiv.org/abs/2509.24803",5,5,4,A,"text-vs-encoder crossover"
+"OpenTSLM: Time-Series Language Models for Reasoning over Multivariate Medical Text- and Time-Series Data",2026,"arXiv preprint",pure_method,"https://arxiv.org/abs/2510.02410",5,3,4,"A/Risk","short-vs-long architecture evidence"
+"TSRouter: Dynamic Modality-Model Selection for Time Series Reasoning",2026,"COLM 2026",pure_method,"https://arxiv.org/abs/2607.08940",5,4,4,Risk,"direct novelty collision"
+
