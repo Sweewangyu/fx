@@ -1,5 +1,7 @@
 # MADI：从跨模态一致性走向互补性
 
+> 时间有限请使用：[10 分钟技术分享版](./MADI_10分钟技术分享.md)
+
 > 论文：*From Consistency to Complementarity: Aligned and Disentangled Multi-modal Learning for Time Series Understanding and Reasoning*  
 > 作者：Hang Ni, Weijia Zhang, Fei Wang, Zezhi Shao, Hao Liu  
 > 版本：arXiv:2601.21436v2，2026-02-05  
@@ -679,4 +681,3 @@ VQ 使用有限 codebook，对 shared feature 施加了信息瓶颈，使其倾�
 1. Ni, H., Zhang, W., Wang, F., Shao, Z., & Liu, H. *From Consistency to Complementarity: Aligned and Disentangled Multi-modal Learning for Time Series Understanding and Reasoning*. arXiv:2601.21436, 2026.
 2. 本文档中的图 1-图 7、图 10、图 13及表 1-表 2均截取自论文原文，仅用于学术技术分享。
 3. 论文使用的训练与评测数据来自 ChatTS：Xie et al., 2025。
-
